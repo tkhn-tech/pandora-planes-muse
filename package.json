@@ -1,0 +1,22 @@
+{
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "0.21.0",
+    "simplex-noise": "4.0.3",
+    "three": "0.160.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.160.0",
+    "typescript": "5.9.3",
+    "vite": "5.4.21"
+  },
+  "name": "pandora-planes-vite",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite",
+    "embed-models": "node scripts/embed_models.mjs",
+    "preview": "vite preview"
+  },
+  "type": "module",
+  "version": "3.0.0"
+}

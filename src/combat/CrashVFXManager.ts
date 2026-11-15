@@ -1,0 +1,256 @@
+// CrashVFXManager — pooled explosion sprites, smoke/fire plumes, tumbling
+// debris and ground scorch marks. Ported from the v2 template
+// (pandora-template.html ~1620–1704 playExplosion/updateBooms/makeSmokePlume
+// and ~1178–1214 spawnDebris/updateDebris/detachWing), with one v2 change:
+// detached segments are now independent tumbling *Rapier* bodies instead of
+// hand-integrated meshes, so they bounce/roll against the physics world.
+//
+// Texture note: the template builds its glow textures from canvas radial
+// gradients (boomTex, flareTex, cloudTex). Same approach here — no assets.
+
+import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+
+export interface CrashVFXOptions {
+  /** Ground height at (x, z) — used to rest scorch decals and kill debris. */
+  groundHeight?: (x: number, z: number) => number;
+  /** Camera-shake hook (main.ts feeds this into the chase camera). */
+  onShake?: (amount: number) => void;
+}
+
+interface Boom {
+  sprite: THREE.Sprite;
+  t: number;
+  scale: number;
+}
+
+interface Plume {
+  group: THREE.Group;
+  life: number;
+  maxLife: number;
+}
+
+interface DebrisPiece {
+  mesh: THREE.Object3D;
+  body: RAPIER.RigidBody;
+  life: number;
+}
+
+function radialTexture(stops: [number, string][]): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d')!;
+  const grd = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+  for (const [at, col] of stops) grd.addColorStop(at, col);
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+
+const BOOM_STOPS: [number, string][] = [
+  [0, 'rgba(255,255,220,1)'],
+  [0.35, 'rgba(255,140,40,0.9)'],
+  [1, 'rgba(120,20,0,0)'],
+];
+const SMOKE_STOPS: [number, string][] = [
+  [0, 'rgba(255,255,255,0.85)'],
+  [0.6, 'rgba(255,255,255,0.35)'],
+  [1, 'rgba(255,255,255,0)'],
+];
+
+export class CrashVFXManager {
+  private readonly scene: THREE.Scene;
+  private readonly opts: CrashVFXOptions;
+  private readonly boomTex: THREE.CanvasTexture;
+  private readonly smokeTex: THREE.CanvasTexture;
+  private readonly booms: Boom[] = [];
+  private readonly plumes: Plume[] = [];
+  private readonly debris: DebrisPiece[] = [];
+  private debrisWorld: RAPIER.World | null = null;
+  private readonly flash = new THREE.PointLight(0xffaa33, 0, 120);
+
+  constructor(scene: THREE.Scene, opts: CrashVFXOptions = {}) {
+    this.scene = scene;
+    this.opts = opts;
+    this.boomTex = radialTexture(BOOM_STOPS);
+    this.smokeTex = radialTexture(SMOKE_STOPS);
+    scene.add(this.flash);
+  }
+
+  /** Pooled explosion sprite burst + light flash + camera-shake hook.
+   *  Template timing: scale = s * (6 + t*55), opacity 1 - t/0.9, life 0.9 s. */
+  spawnExplosion(pos: THREE.Vector3, scale = 1): void {
+    let b = this.booms.find((x) => !x.sprite.visible);
+    if (!b) {
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: this.boomTex,
+          transparent: true,
+          depthWrite: false,
+        }),
+      );
+      sprite.visible = false;
+      this.scene.add(sprite);
+      b = { sprite, t: 0, scale: 1 };
+      this.booms.push(b);
+    }
+    b.sprite.position.copy(pos);
+    b.sprite.visible = true;
+    b.t = 0;
+    b.scale = scale;
+    // Light flash at the blast, decaying in update().
+    this.flash.position.copy(pos);
+    this.flash.intensity = 60 * scale;
+    this.opts.onShake?.(0.8 * scale);
+  }
+
+  /** Smoke/fire plume parented to a moving object (e.g. a damaged jet).
+   *  Template: 5 sprites trailing behind/below, colour 0x555555 smoke or
+   *  0xff7722 fire. Returns the group so the caller can remove it. */
+  spawnSmoke(pos: THREE.Vector3, colour: number): THREE.Group {
+    const group = new THREE.Group();
+    for (let i = 0; i < 5; i++) {
+      const s = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: this.smokeTex,
+          color: colour,
+          transparent: true,
+          opacity: 0.55,
+          depthWrite: false,
+        }),
+      );
+      s.scale.set(6 + i * 2, 6 + i * 2, 1);
+      s.position.set((Math.random() - 0.5) * 2, -i * 1.2, -4 - i * 1.5);
+      group.add(s);
+    }
+    group.position.copy(pos);
+    this.scene.add(group);
+    this.plumes.push({ group, life: 6, maxLife: 6 });
+    return group;
+  }
+
+  /** Detach a wing/tail/engine segment: the supplied mesh becomes an
+   *  independent tumbling Rapier body (v2 behaviour; template ~1178–1204
+   *  hand-integrated a box). The segment is removed from its parent and
+   *  added to the scene. Returns the Rapier body so the caller can track
+   *  or remove it. Falls back to a 4 x 0.5 x 2.5 m box when no segment is
+   *  supplied. Life 10 s, removed on ground contact or expiry. */
+  spawnDebris(
+    segment: THREE.Object3D | null,
+    world: RAPIER.World,
+    pos: THREE.Vector3,
+    vel: THREE.Vector3,
+  ): RAPIER.RigidBody {
+    let mesh: THREE.Object3D;
+    let half: THREE.Vector3;
+    if (segment) {
+      mesh = segment;
+      if (mesh.parent) mesh.parent.remove(mesh);
+      const box = new THREE.Box3().setFromObject(mesh);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      half = size.multiplyScalar(0.5);
+      half.x = Math.max(half.x, 0.25);
+      half.y = Math.max(half.y, 0.25);
+      half.z = Math.max(half.z, 0.25);
+      // Re-centre the mesh on its own origin so the body tracks it cleanly.
+      const centre = new THREE.Vector3();
+      box.getCenter(centre);
+      mesh.position.sub(centre);
+      const holder = new THREE.Group();
+      holder.add(mesh);
+      mesh = holder;
+    } else {
+      mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(4, 0.5, 2.5),
+        new THREE.MeshLambertMaterial({ color: 0x8a97a3 }),
+      );
+      half = new THREE.Vector3(2, 0.25, 1.25);
+    }
+    mesh.position.copy(pos);
+    this.scene.add(mesh);
+
+    this.debrisWorld = world;
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(pos.x, pos.y, pos.z)
+        .setLinvel(vel.x, vel.y, vel.z)
+        .setAngvel({
+          x: (Math.random() - 0.5) * 4,
+          y: (Math.random() - 0.5) * 4,
+          z: (Math.random() - 0.5) * 4,
+        }),
+    );
+    world.createCollider(RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z), body);
+    this.debris.push({ mesh, body, life: 10 });
+    return body;
+  }
+
+  /** Cheap ground scorch mark: a dark circle lying on the terrain. */
+  scorchDecal(pos: THREE.Vector3, radius = 8): THREE.Mesh {
+    const gh = this.opts.groundHeight
+      ? this.opts.groundHeight(pos.x, pos.z)
+      : pos.y;
+    const decal = new THREE.Mesh(
+      new THREE.CircleGeometry(radius, 24),
+      new THREE.MeshBasicMaterial({
+        color: 0x0a0a0a,
+        transparent: true,
+        opacity: 0.55,
+        depthWrite: false,
+      }),
+    );
+    decal.rotation.x = -Math.PI / 2;
+    decal.position.set(pos.x, gh + 0.15, pos.z);
+    this.scene.add(decal);
+    return decal;
+  }
+
+  update(dt: number): void {
+    // Explosion sprites: grow + fade over 0.9 s (template updateBooms).
+    for (const b of this.booms) {
+      if (!b.sprite.visible) continue;
+      b.t += dt;
+      const s = b.scale * (6 + b.t * 55);
+      b.sprite.scale.set(s, s, 1);
+      b.sprite.material.opacity = Math.max(0, 1 - b.t / 0.9);
+      if (b.t > 0.9) b.sprite.visible = false;
+    }
+    // Light flash decays fast.
+    if (this.flash.intensity > 0) {
+      this.flash.intensity = Math.max(0, this.flash.intensity - dt * 220);
+    }
+    // Plumes drift up and fade out.
+    for (let i = this.plumes.length - 1; i >= 0; i--) {
+      const p = this.plumes[i];
+      p.life -= dt;
+      p.group.position.y += dt * 1.5;
+      const fade = Math.max(0, p.life / p.maxLife);
+      for (const child of p.group.children) {
+        const spr = child as THREE.Sprite;
+        spr.material.opacity = 0.55 * fade;
+      }
+      if (p.life <= 0) {
+        this.scene.remove(p.group);
+        this.plumes.splice(i, 1);
+      }
+    }
+    // Debris: sync mesh from its Rapier body; remove on ground/expiry.
+    for (let i = this.debris.length - 1; i >= 0; i--) {
+      const d = this.debris[i];
+      d.life -= dt;
+      const p = d.body.translation();
+      const q = d.body.rotation();
+      d.mesh.position.set(p.x, p.y, p.z);
+      d.mesh.quaternion.set(q.x, q.y, q.z, q.w);
+      const gh = this.opts.groundHeight
+        ? this.opts.groundHeight(p.x, p.z)
+        : -Infinity;
+      if (d.life <= 0 || p.y < gh + 0.5) {
+        this.scene.remove(d.mesh);
+        this.debrisWorld?.removeRigidBody(d.body);
+        this.debris.splice(i, 1);
+      }
+    }
+  }
+}
