@@ -316,17 +316,22 @@ const deckProvider: DeckProvider = {
 };
 const groundHeight = (x: number, z: number): number =>
   worldGen.groundHeight(x, z);
-/** Sampled mesh/collider height — the surface actually rendered. The
- *  chase camera is clamped above THIS, not the analytic heightAt(), which
- *  can sit ~13 m below the mesh at plateau edges (the old clamp let the
- *  camera clip into terrain after the runway ended in a hill). */
-const sampledGroundHeight = (x: number, z: number): number =>
-  worldGen.sampledHeightAt(x, z);
+/** Exact Rapier-heightfield surface height (triangle interpolation —
+ *  see heightfieldHeightAt in PandoraTerrainWorker). The bilinear
+ *  sampled height sits up to ~7.4 m below the collider surface
+ *  at the steepest spots, and the analytic groundHeight up to ~107 m
+ *  below it. Anything that must agree with where a jet physically
+ *  rests — the controller's ground detection, crash VFX, weapon
+ *  ground impacts, the camera clamp — uses THIS. (The v2 hang: a jet
+ *  resting on the collider while the analytic height put it 90+ m in
+ *  the air, so the controller never saw it land.) */
+const heightfieldGroundHeight = (x: number, z: number): number =>
+  worldGen.heightfieldHeightAt(x, z);
 
 // ---- combat / VFX ----
 let shakeT = 0;
 const vfx = new CrashVFXManager(scene, {
-  groundHeight,
+  groundHeight: heightfieldGroundHeight,
   onShake: (amount) => {
     shakeT = Math.max(shakeT, amount);
   },
@@ -343,7 +348,7 @@ const weapons = new WeaponSystem(scene, rapierWorld, {
     carrier.podObjects.map((p) =>
       p.getWorldPosition(new THREE.Vector3()),
     ),
-  groundHeight,
+  groundHeight: heightfieldGroundHeight,
   deckHeight: (x, z) => carrier.deckHeight(x, z),
 });
 
@@ -676,7 +681,13 @@ function makeAircraft(key: string, isPlayer: boolean): Aircraft {
       onFlares: (a) => weapons.showFlares(a),
     },
   });
-  ac.terrainHeightAt = groundHeight;
+  // The controller's ground logic (ground detection, respawn elevation
+  // clamp) must read the EXACT heightfield surface, not the analytic
+  // heightAt() — the analytic can sit 90+ m below the collider on
+  // steep slopes, and a jet resting there reads as airborne forever
+  // (the v2 respawn hang: grounded=false, G 0.2, no crash, no
+  // respawn). See heightfieldGroundHeight above.
+  ac.terrainHeightAt = heightfieldGroundHeight;
   floatingOrigin.registerBody(ac.body);
   for (const h of ac.colliderHandles()) colliderOwners.set(h, ac);
   return ac;
@@ -718,6 +729,16 @@ function skipSpectate(): void {
   respawnPlayer();
 }
 
+/** Clear every transient warning/banner (restart / respawn) — the
+ *  HUD's #warn / ROTATE cue / toast plus the spectate banner. The
+ *  v2 play-test saw STALL, "YOU WENT DOWN" and ROTATE survive
+ *  restarts and respawns; the HUD clears them here, and the solver
+ *  reset on respawn clears the underlying stall state. */
+function clearTransientUI(): void {
+  hud.clearTransient();
+  setSpectateBanner(false);
+}
+
 function respawnPlayer(): void {
   if (!player) return;
   // v1.1: Restart inside the 3 s window already revived the jet — but
@@ -728,13 +749,22 @@ function respawnPlayer(): void {
   spectating = false;
   prevPlayerDying = false;
   const r = runwayPlacer.nearest(player.pos);
-  player.resetAt(r.x, r.elev + 2, r.z, r.hdg);
+  // RunwayPlacer.nearest() converts scene -> original-frame coords for
+  // its distance test and returns the runway in ORIGINAL-frame coords —
+  // but resetAt() takes SCENE coords. After any floating-origin shift
+  // (the player flying > 2,000 m from the origin), passing the
+  // original-frame coords straight in respawned the jet up to 2+ km
+  // from the actual runway — in mid-air or inside a mountain — where
+  // it fell, crashed, and the 3 s timer fired again: the death loop
+  // behind the v2 respawn hang. Convert back to scene coords here.
+  const shift = floatingOrigin.cumulativeShift;
+  player.resetAt(r.x - shift.x, r.elev + 2, r.z - shift.z, r.hdg);
   player.thrTarget = 0;
   pcInput.setThrottle(0);
   hud.syncThrottle(0);
   camMode = 0;
   pcInput.setCameraMode(0);
-  setSpectateBanner(false);
+  clearTransientUI();
 }
 
 function clearAircraftList(list: Aircraft[]): void {
@@ -806,6 +836,10 @@ async function startRound(next: SandboxConfig): Promise<void> {
     clearTimeout(respawnTimer);
     respawnTimer = null;
   } // v1.1: no stale respawn mid-round
+  // No stale warnings from the previous round (the v2 play-test saw
+  // STALL survive three restarts — the solver reset on respawn clears
+  // the state, this clears the banners).
+  clearTransientUI();
   clearAircraftList(enemies);
   clearAircraftList(traffic);
   worldGen.resetOrigin();
@@ -1173,7 +1207,7 @@ function updateCamera(dt: number): void {
       .addScaledVector(fwd, -dist)
       .addScaledVector(up, dist * 0.34);
     const floor = Math.max(
-      sampledGroundHeight(want.x, want.z) + 6,
+      heightfieldGroundHeight(want.x, want.z) + 6,
       p.pos.y + 2,
     );
     if (want.y < floor) want.y = floor;
@@ -1196,8 +1230,8 @@ function updateCamera(dt: number): void {
     // at plateau edges, which clipped the camera into terrain.
     const mid = p.pos.clone().addScaledVector(fwd, -camDist * 0.5);
     const floor = Math.max(
-      sampledGroundHeight(want.x, want.z) + 6,
-      sampledGroundHeight(mid.x, mid.z) + 8,
+      heightfieldGroundHeight(want.x, want.z) + 6,
+      heightfieldGroundHeight(mid.x, mid.z) + 8,
       p.pos.y + 2,
     );
     if (want.y < floor) want.y = floor;
@@ -1219,7 +1253,7 @@ function updateCamera(dt: number): void {
     const cz =
       p.pos.z + Math.cos(camOrbit.yaw) * Math.cos(camOrbit.pitch) * camDist;
     const cy = p.pos.y + Math.sin(camOrbit.pitch) * camDist;
-    camera.position.set(cx, Math.max(cy, sampledGroundHeight(cx, cz) + 3), cz);
+    camera.position.set(cx, Math.max(cy, heightfieldGroundHeight(cx, cz) + 3), cz);
     camera.lookAt(p.pos);
   }
 }
@@ -1228,6 +1262,27 @@ function updateCamera(dt: number): void {
 function playerInput(dt: number): void {
   const p = player;
   if (!p) return;
+  // Consume the PC events FIRST, before the alive/dying guard: R and P
+  // must work while the player is dead or dying. R is the spectate
+  // skip ("R to skip" on the banner) and the dead-state respawn — the
+  // old code returned before consuming events when !alive || dying,
+  // so R did NOTHING in exactly the states that need it (the v2
+  // play-test: "pressing R does nothing", only the manual Restart
+  // button recovered the stuck jet).
+  const ev = pcInput.consumeEvents();
+  if (ev.cameraResetPressed) {
+    // During spectate, R skips to an immediate respawn (damage-model
+    // §5) — the camera is following the wreck, so a reset is
+    // meaningless there. When dead (respawn timer pending), R also
+    // respawns now instead of waiting out the timer.
+    if (spectating || !p.alive) {
+      skipSpectate();
+    } else {
+      camOrbit = { yaw: 0, pitch: 0.32 };
+      camDist = 30;
+    }
+  }
+  if (ev.pausePressed) togglePause();
   if (!p.alive || p.dying) {
     // Dead or dying: no control (damage-model §5 — while spectating
     // the player cannot control anything). The controller's stepInternal
@@ -1249,7 +1304,13 @@ function playerInput(dt: number): void {
     px = pcPitch;
     rx = pcRoll;
   } else {
-    px = joy.y; // stick up = pitch up (px<0); stick right = bank right (rx<0)
+    // Touch stick, sim-style: pull BACK (drag down, joy.y > 0) = nose
+    // up (px < 0); stick right = bank right (rx < 0). This matches
+    // the help text ("pull the stick back") and the keyboard (ArrowUp
+    // = nose up). The old mapping had stick up = nose up, which is
+    // why the live tester pulled down and the jet did not rotate —
+    // the pull they expected was the opposite of what the stick did.
+    px = -joy.y;
     rx = -joy.x;
   }
   px += tilt.pitch ?? 0;
@@ -1263,7 +1324,6 @@ function playerInput(dt: number): void {
   // Rudder: Q/E through the PC provider (was hardcoded to 0).
   p.yawIn = pc.yaw ?? 0;
 
-  const ev = pcInput.consumeEvents();
   if (firing || ev.fireHeld) {
     weapons.fireGunAtTargets(p, enemies.concat(traffic), dt);
   }
@@ -1288,18 +1348,6 @@ function playerInput(dt: number): void {
     syncBrkSlider(p.airbrake);
   }
   if (ev.cameraPressed) cycleCam();
-  if (ev.cameraResetPressed) {
-    // During spectate, R skips to an immediate respawn (damage-model
-    // §5) — the camera is following the wreck, so a reset is
-    // meaningless there.
-    if (spectating) {
-      skipSpectate();
-    } else {
-      camOrbit = { yaw: 0, pitch: 0.32 };
-      camDist = 30;
-    }
-  }
-  if (ev.pausePressed) togglePause();
   if (ev.bombPressed) $('bombBtn')?.dispatchEvent(new Event('click'));
   p.brake = ev.brakeHeld || touchBrake;
 
@@ -1590,7 +1638,7 @@ function animate(): void {
       // the below-min-release-alt flag feeds the warn priority.
       const ccip = weapons.computeCcip(
         player,
-        groundHeight(player.pos.x, player.pos.z),
+        heightfieldGroundHeight(player.pos.x, player.pos.z),
         camera,
       );
       if (ccip) hud.showCcip(ccip.x, ccip.y, ccip.belowMinAlt);

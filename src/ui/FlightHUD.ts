@@ -39,6 +39,17 @@ function fmtTime(s: number): string {
   return String(m).padStart(2, '0') + ':' + String(ss).padStart(2, '0');
 }
 
+/** Speed tape (kt): GROUND speed while the gear is on a surface,
+ *  INDICATED airspeed once airborne. IAS is wind-relative (vAir =
+ *  vel − wind), so a parked jet in the default 3 m/s wind reads
+ *  ~6 kt on the tape while standing still — the v2 play-test read
+ *  that as the jet "creeping at 6 kt with 0% throttle". On the
+ *  ground the tape must show what the jet is actually doing: 0. */
+function spdKt(ac: Aircraft): number {
+  if (ac.grounded) return Math.hypot(ac.vel.x, ac.vel.z) * MS2KT;
+  return ac.ias * MS2KT;
+}
+
 export class FlightHUD {
   private readonly el: Record<string, HTMLElement | null> = {};
   private readonly mini: CanvasRenderingContext2D | null;
@@ -63,7 +74,7 @@ export class FlightHUD {
       const e = this.el[id];
       if (e) e.textContent = text;
     };
-    set('hudSpd', String(Math.round(ac.ias * MS2KT)));
+    set('hudSpd', String(Math.round(spdKt(ac))));
     set('hudAlt', String(Math.round(Math.max(0, ac.pos.y) * M2FT)));
     set('hudVsi', String(Math.round(ac.vsi * M2FT * 60)));
     const hdg = ((Math.atan2(ac.fwd().x, ac.fwd().z) * R2D) % 360 + 360) % 360;
@@ -259,6 +270,26 @@ export class FlightHUD {
     t.classList.add('show');
     if (this.toastTimer) clearTimeout(this.toastTimer);
     this.toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+  }
+
+  /** Clear every transient warning/banner (restart / respawn). The
+   *  #warn line is recomputed from live state every update() so it
+   *  clears itself when its condition ends — but a stale STALL
+   *  survived three restarts in the v2 play-test because the solver
+   *  kept the stall state (fixed by solver.reset() on respawn) and
+   *  because the toast re-fires on every death in a respawn loop.
+   *  Belt and braces: hide #warn, the ROTATE cue and the toast, and
+   *  cancel the toast's auto-hide timer (a pending timer would
+   *  otherwise hide a NEW toast early, or a re-fired toast would
+   *  linger). Called from startRound() and respawnPlayer(). */
+  clearTransient(): void {
+    this.el['warn']?.classList.remove('show');
+    this.el['rotateCue']?.classList.remove('show');
+    if (this.toastTimer) {
+      clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
+    this.el['toast']?.classList.remove('show');
   }
 
   /** ?debug=1 panel (v1.1 feature): FPS + sim dt + per-model load status +

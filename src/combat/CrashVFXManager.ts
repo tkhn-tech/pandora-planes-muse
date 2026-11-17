@@ -58,6 +58,10 @@ const SMOKE_STOPS: [number, string][] = [
   [1, 'rgba(255,255,255,0)'],
 ];
 
+/** Max ground scorch decals kept (oldest removed first — see
+ *  scorchDecal). */
+const MAX_SCORCH = 12;
+
 export class CrashVFXManager {
   private readonly scene: THREE.Scene;
   private readonly opts: CrashVFXOptions;
@@ -66,6 +70,8 @@ export class CrashVFXManager {
   private readonly booms: Boom[] = [];
   private readonly plumes: Plume[] = [];
   private readonly debris: DebrisPiece[] = [];
+  /** Scorch decals, oldest first — capped (see scorchDecal). */
+  private readonly scorches: THREE.Mesh[] = [];
   private debrisWorld: RAPIER.World | null = null;
   private readonly flash = new THREE.PointLight(0xffaa33, 0, 120);
 
@@ -186,7 +192,12 @@ export class CrashVFXManager {
     return body;
   }
 
-  /** Cheap ground scorch mark: a dark circle lying on the terrain. */
+  /** Cheap ground scorch mark: a dark circle lying on the terrain.
+   *  CAPPED at the 12 most recent (MAX_SCORCH): scorch decals are
+   *  never removed, so a respawn death-loop piles them up at the
+   *  repeated crash site — a growing black disc the stuck jet sits
+   *  on, which is what the v2 play-test read as a "black disc in the
+   *  sky". Oldest decals are removed from the scene and disposed. */
   scorchDecal(pos: THREE.Vector3, radius = 8): THREE.Mesh {
     const gh = this.opts.groundHeight
       ? this.opts.groundHeight(pos.x, pos.z)
@@ -203,6 +214,13 @@ export class CrashVFXManager {
     decal.rotation.x = -Math.PI / 2;
     decal.position.set(pos.x, gh + 0.15, pos.z);
     this.scene.add(decal);
+    this.scorches.push(decal);
+    while (this.scorches.length > MAX_SCORCH) {
+      const old = this.scorches.shift()!;
+      this.scene.remove(old);
+      old.geometry.dispose();
+      (old.material as THREE.Material).dispose();
+    }
     return decal;
   }
 

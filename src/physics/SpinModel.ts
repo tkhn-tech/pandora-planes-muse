@@ -89,4 +89,10 @@ export class SpinModel {
     if (this.spin <= 0.5) return 0;
     return this.spinDir === 1 ? -1 : 1;
   }
+
+  /** Reset the spin state (respawn — a fresh jet is not spinning). */
+  reset(): void {
+    this.spin = 0;
+    this.spinDir = 1;
+  }
 }

@@ -1087,10 +1087,13 @@ export class Aircraft {
       tvcDeg: S.tvcDeg,
       rollCapSchedule: S.rollCapSchedule,
       // Dying airframe (damage-model §6 step 1): the wing can no
-      // longer hold 1 g — lift is cut to 30% so the jet freefalls
-      // instead of gliding on with zero controls. Drag is untouched
-      // (the solver keeps the full drag on the unscaled CL).
-      liftScale: this.dying ? 0.3 : 1,
+      // longer hold 1 g — lift is cut to 15% so the jet freefalls
+      // instead of gliding on with zero controls. 30% was not
+      // enough: at 427 kt (220 m/s) 30% lift is still ~1 g, and the
+      // live shoot-down glided down gently for 40–60 s instead of
+      // falling as a wreck (probe: 44.4 s from 1,000 m). Drag is
+      // untouched (the solver keeps the full drag on the unscaled CL).
+      liftScale: this.dying ? 0.15 : 1,
       dt,
     });
     this.aoaDeg = result.aoaDeg;
@@ -1115,6 +1118,22 @@ export class Aircraft {
     const gearH = this.gear ? GEAR_HEIGHT : BELLY_HEIGHT;
     const contact = this.pendingContact;
     this.pendingContact = null;
+    // A DYING jet that contacts anything solid while descending has
+    // hit the ground — finish the crash now (fuel-scaled explosion +
+    // debris + scorch at the impact position, then the spectate /
+    // respawn flow). Without this, a wreck that touches down tilted
+    // can bounce on the collider for tens of seconds without ever
+    // entering the ground branch below (its centre sits above
+    // floorY + gearH, and it is too fast/bouncy for the tilted-rest
+    // rule), so the spectate never ends and the respawn never fires
+    // — the v2 shoot-down's wreck glided/bounced for 40–60 s and
+    // then fell into the stuck respawn state. Gated on descending
+    // faster than 3 m/s, so a gentle mid-air bump does not finish a
+    // wreck that is still falling.
+    if (this.dying && contact && contact.impactVy < -3) {
+      this.finishCrash();
+      return;
+    }
     const deckVel =
       isDeck && this.deck && this.deck.alive
         ? this.deck.velocity()
@@ -1136,7 +1155,30 @@ export class Aircraft {
     // released, and the full pitch authority whipped every jet nose-up
     // at 30 kt. 0.15 m still means "on or within a hand's breadth of
     // the ground"; a jet 15 cm up is in ground effect, not flying.
-    if (this.pos.y <= floorY + gearH + 0.15 && newVel.y <= 0.5) {
+    //
+    // Tilted rest (v3): a jet that comes to rest TILTED on a slope
+    // sits with its centre above floorY + gearH — the contact point
+    // (a wingtip, the nose ski) is offset from the centre, and on a
+    // slope the terrain there is higher. The 0.15 m tolerance only
+    // covers a level rest, so a stalled jet that survived onto a
+    // mountainside read as airborne forever (grounded=false, G 0.2,
+    // 6 kt, no crash, no respawn — the v2 stall-down hang). A slow,
+    // essentially stationary jet within 2 m of the surface is
+    // resting, not flying: treat it as on the ground. Gated on low
+    // horizontal speed (< 5 m/s) + no descent, so a fast low pass is
+    // unaffected, and a VTOL hover (above 2 m) is unaffected. The
+    // hard-landing check below still applies — a jet resting banked
+    // past 0.45 rad has crashed, it has not landed.
+    const spdH0 = Math.hypot(newVel.x, newVel.z);
+    const restingTilted =
+      spdH0 < 5 &&
+      newVel.y <= 0.5 &&
+      newVel.y >= -0.5 &&
+      this.pos.y <= floorY + gearH + 2.0;
+    if (
+      (this.pos.y <= floorY + gearH + 0.15 && newVel.y <= 0.5) ||
+      restingTilted
+    ) {
       // Touching a surface. Rapier resolves the penetration — this
       // block only reads the contact, applies roll physics and the
       // v2 runway/deck rules; it never pins pos.y.
@@ -1245,6 +1287,19 @@ export class Aircraft {
     // returns only a torque, recovered here with torqueToRates().
     const rates =
       result.rates ?? torqueToRates(result.torque, m, S.span, S.length);
+    // Dying departure (damage-model §6): a dead jet with zeroed
+    // controls stays trimmed and glides — the live shoot-down held
+    // AoA 10° and G 0.8 all the way down. A wreck does not trim: the
+    // nose is driven DOWN into a spiral dive (0.15 rad/s ≈ 9°/s),
+    // the wing unloads, and the spin model takes over — the jet
+    // falls as a tumbling wreck instead of gliding on. A nose-UP
+    // bias was tried first (0.5, 0.25, 0.1): it held the jet at
+    // ~90° AoA, maximum separation drag, ~30 m/s terminal — a slow
+    // wallow, 42 s from 1,000 m. Nose-down settles it in a steep
+    // spiral at ~60–80 m/s (the research's flat-spin band).
+    if (this.dying) {
+      rates.pitchRate = Math.max(rates.pitchRate, 0.15);
+    }
     // Takeoff rotation (BET report §3): while the gear is on a surface,
     // the nose stays down until the per-spec rotation speed, and even
     // then the rotation rate is capped at ~12 deg/s — the full 55 deg/s
@@ -1406,8 +1461,24 @@ export class Aircraft {
    *  engine → engine-fire roll, wing → detach, tail → controls dead
    *  (dying), fin → tail authority degraded. Severe damage (WT rule:
    *  fuselage / both engines / tail / total) or hp ≤ 0 starts the
-   *  dying fall — the jet does not vanish in mid-air. */
-  applyDamage(amount: number, zone: DamageZone, byPlayer: boolean): void {
+   *  dying fall — the jet does not vanish in mid-air.
+   *
+   *  `deferKill` (WeaponSystem.applyProximityDamage only): a missile
+   *  or bomb hits SEVERAL zones at once, and the kill must be decided
+   *  AFTER all of them are applied — otherwise the first zone's kill
+   *  (fuselage 40 HP destroyed → startDying) aborts the loop before
+   *  the fuel/engine zones are hit and before any ignition roll runs,
+   *  and the jet dies with hp exactly 60, no fire, no smoke, tails
+   *  intact (the v2 live shoot-down: no visible damage at all). With
+   *  deferKill the zone effects still apply (tail detaches, fires
+   *  start) but the dying decision is left to checkKill(), which the
+   *  caller runs once after the whole proximity burst. */
+  applyDamage(
+    amount: number,
+    zone: DamageZone,
+    byPlayer: boolean,
+    deferKill = false,
+  ): void {
     if (!this.alive || this.dying) return;
     this.lastHitByIsPlayer = byPlayer;
     this.lastHitByRecord = { isPlayer: byPlayer };
@@ -1465,9 +1536,15 @@ export class Aircraft {
         this.startFire('engine', lost as DamageZone);
       }
     } else if (lost === 'tail') {
-      // Tail (controls) gone — uncontrollable, start the dying fall.
-      this.startDying('tail destroyed');
-      return;
+      // Tail (controls) gone — the tail section detaches visibly and
+      // the jet is uncontrollable. With deferKill the caller decides
+      // the kill after the whole burst (see above); without it, the
+      // dying fall starts now.
+      this.detachTail();
+      if (!deferKill) {
+        this.startDying('tail destroyed');
+        return;
+      }
     } else if (lost === 'fin') {
       dz.tail = Math.max(dz.tail, 0.6);
     }
@@ -1477,8 +1554,20 @@ export class Aircraft {
     // Severe damage (WT rule) or hp exhausted → the dying fall, not an
     // instant vanish. The kill is credited at this moment (see
     // DamageableEntity.isSeverelyDamaged), not when the wreck hits.
-    if (this.damageEntity.isSeverelyDamaged() || this.hp <= 0) {
+    // Deferred when the caller is applying a multi-zone burst.
+    if (!deferKill && (this.damageEntity.isSeverelyDamaged() || this.hp <= 0)) {
       this.startDying('shot down');
+    }
+  }
+
+  /** Kill evaluation for a deferred multi-zone burst (WeaponSystem
+   *  proximity damage): start the dying fall if the accumulated
+   *  damage is severe (WT rule) or hp is exhausted. A no-op when the
+   *  jet is already dying or dead. */
+  checkKill(reason: string): void {
+    if (!this.alive || this.dying) return;
+    if (this.damageEntity.isSeverelyDamaged() || this.hp <= 0) {
+      this.startDying(reason);
     }
   }
 
@@ -1519,7 +1608,19 @@ export class Aircraft {
    *  NOTE: Rapier gravity stays at scale 0 — the controller already
    *  adds `acc.y -= G`, so setting gravityScale = 1 would double-count
    *  gravity (the report's §6 step 1 assumed gravity lived in the
-   *  solver's force sum; in this port it lives in the controller). */
+   *  solver's force sum; in this port it lives in the controller).
+   *
+   *  A combat kill must be VISIBLE (the v2 live shoot-down showed
+   *  nothing: no fire, no smoke, tails intact, the jet gliding down
+   *  gently). So a dying jet that is not already burning starts a
+   *  fire at once — a fuel fire if the tank is lost or damaged, else
+   *  an engine fire — at 0.7 intensity so flames show immediately
+   *  instead of ramping up from nothing over 12 s. And if the tail
+   *  zone is lost, the tail section detaches here too, so the
+   *  "tail destroyed" text matches the model. The fire state machine
+   *  does not run while dying (it is gated on !dying), so this fire
+   *  burns all the way down — the smoke trail the spectate camera
+   *  follows. */
   startDying(reason: string): void {
     if (!this.alive || this.dying) return;
     this.dying = true;
@@ -1530,6 +1631,21 @@ export class Aircraft {
     this.pitchIn = 0;
     this.rollIn = 0;
     this.yawIn = 0;
+    if (!this.fireKind) {
+      if (
+        this.damageEntity.isZoneLost('fuel') ||
+        this.damageZones.fuel > 0.3
+      ) {
+        this.fireKind = 'fuel';
+        this.fireZone = 'fuel';
+      } else {
+        this.fireKind = 'engine';
+        this.fireZone = 'engineL';
+      }
+      this.fireIntensity = 0.7;
+      this.fireSpreadTimer = 0;
+    }
+    if (this.damageEntity.isZoneLost('tail')) this.detachTail();
     if (this.ai) this.ai.state = 'dead';
     this.events.onDying?.(this, reason);
   }
@@ -1651,6 +1767,11 @@ export class Aircraft {
     this.spin = 0;
     this.spinArrow = 0;
     this.betaDeg = 0;
+    // The solver's own stall/spin hysteresis is NOT on the fields
+    // above — reset it too, or a respawned jet inherits the wreck's
+    // stall state and the STALL warning survives the restart (the
+    // v2 play-test saw it survive three restarts).
+    this.solver.reset?.();
     this._trapped = false;
     this.trapTimer = 0;
     this.wingDetached = false;

@@ -22,7 +22,9 @@ import {
   WORLD_SEED,
   TERRAIN_SEGMENTS,
   heightAt,
+  heightfieldHeightAt,
   runwayBlend,
+  plateauWeight,
   fbm,
   createV2Rand,
   generateHeights,
@@ -32,7 +34,7 @@ import {
 import { RUNWAYS, type Runway } from './RunwayPlacer';
 import type { FloatingOrigin } from './FloatingOrigin';
 
-export { heightAt, runwayBlend, fbm, WORLD_SIZE, WORLD_SEED } from './PandoraTerrainWorker';
+export { heightAt, runwayBlend, plateauWeight, fbm, WORLD_SIZE, WORLD_SEED } from './PandoraTerrainWorker';
 export { RUNWAYS, type Runway } from './RunwayPlacer';
 /** Integrator alias: main.ts imports RunwayDef from this module. */
 export type RunwayDef = Runway;
@@ -175,6 +177,7 @@ export class PandoraWorldGenerator {
     const cB = new THREE.Color(0x8a7a4a);
     const cC = new THREE.Color(0x5a6a72);
     const cD = new THREE.Color(0x2a4a34);
+    const cSnow = new THREE.Color(0xe8eef2);
     const tmp = new THREE.Color();
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i);
@@ -183,7 +186,13 @@ export class PandoraWorldGenerator {
       pos.setY(i, h);
       const n = fbm(x / 240 + 7, z / 240 - 2);
       tmp.copy(cA).lerp(cB, clamp01(n * 1.4 - 0.3));
-      if (h > 120) tmp.lerp(cC, clamp01((h - 120) / 120));
+      // Plateau tops read as grassy mesa tops, not bare rock, however
+      // high they sit (Charlie's is 220 m); rock and snow are for the
+      // mountain slopes above the plateaus.
+      if (plateauWeight(x, z) <= 0.5) {
+        if (h > 120) tmp.lerp(cC, clamp01((h - 120) / 120));
+        if (h > 550) tmp.lerp(cSnow, clamp01((h - 550) / 150));
+      }
       if (h < 5) tmp.lerp(cD, 0.6);
       if (runwayBlend(x, z) > 0.5) tmp.set(0x3a3a3a);
       col[i * 3] = tmp.r;
@@ -256,7 +265,7 @@ export class PandoraWorldGenerator {
     // collider instead: one clean face, no triangles, no boundary, and
     // the contact manifold is stable at any speed. The box covers the
     // full strip plus the 100 m overrun each end (the same flat area
-    // runwayBlend guarantees) and 2 m wider than the strip. Its top sits
+    // the plateau top guarantees) and 2 m wider than the strip. Its top sits
     // 5 cm above the heightfield (elev + 0.05) so the gear touches ONLY
     // the box — coplanar would double-contact the heightfield and the
     // explosion would be back. The jet sits 5 cm higher on the runway;
@@ -281,8 +290,11 @@ export class PandoraWorldGenerator {
   // ---- floating islands (v2 positions) ------------------------------------
 
   private buildIslands(rand: () => number): void {
-    const rockMat = new THREE.MeshLambertMaterial({ color: 0x6a5a4a });
-    const topMat = new THREE.MeshLambertMaterial({ color: 0x3d7a44 });
+    // Lightened (was rock 0x6a5a4a / top 0x3d7a44): the dark Lambert
+    // cones read as pure black faceted discs floating in the sky at
+    // distance (v2 play-test's "black discs"), especially in shadow.
+    const rockMat = new THREE.MeshLambertMaterial({ color: 0x7d6f5e });
+    const topMat = new THREE.MeshLambertMaterial({ color: 0x4a8a52 });
     const rootMat = new THREE.MeshLambertMaterial({ color: 0x4a3a2a });
     for (let i = 0; i < ISLAND_COUNT; i++) {
       const x = (rand() - 0.5) * 4800;
@@ -429,7 +441,13 @@ export class PandoraWorldGenerator {
    *  with — the analytic heightAt() can deviate from it by up to ~13 m
    *  at plateau edges, which is what the chase camera must be clamped
    *  above (the old analytic clamp let the camera clip into terrain).
-   *  Falls back to the analytic heightAt() before heights load. */
+   *  Falls back to the analytic heightAt() before heights load.
+   *  NOTE: bilinear is NOT the heightfield surface — Rapier splits
+   *  each quad along the h10–h01 diagonal, and the bilinear sits up
+   *  to ~7.4 m below the triangle surface at the steepest spots. For
+   *  anything that must agree with where a jet physically rests
+   *  (ground detection, respawn, VFX), use heightfieldHeightAt()
+   *  below, not this. */
   sampledHeightAt(x: number, z: number): number {
     const h = this.heights;
     if (!h) return this.groundHeight(x, z);
@@ -451,6 +469,26 @@ export class PandoraWorldGenerator {
       h10 * fx * (1 - fz) +
       h01 * (1 - fx) * fz +
       h11 * fx * fz
+    );
+  }
+
+  /** Exact Rapier-heightfield surface height (scene frame) — the
+   *  piecewise-linear triangle surface the collider actually is
+   *  (see heightfieldHeightAt in PandoraTerrainWorker for the
+   *  diagonal proof). Scene coords + the cumulative floating-origin
+   *  shift = original-frame coords. Falls back to the analytic
+   *  heightAt() before heights load (same fallback as
+   *  sampledHeightAt). Use this for the aircraft's terrainHeightAt,
+   *  crash-VFX ground height and camera clamps — anything that must
+   *  agree with where a jet physically rests. */
+  heightfieldHeightAt(x: number, z: number): number {
+    const h = this.heights;
+    if (!h) return this.groundHeight(x, z);
+    return heightfieldHeightAt(
+      h,
+      this.resolution,
+      x + this._originShift.x,
+      z + this._originShift.z,
     );
   }
 

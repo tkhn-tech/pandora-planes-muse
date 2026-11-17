@@ -18,6 +18,7 @@ import { SPECS } from '../src/aircraft/AircraftSpec';
 import {
   generateHeights,
   heightAt,
+  heightfieldHeightAt,
   RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
@@ -168,7 +169,11 @@ async function main(): Promise<void> {
     });
     (ac as unknown as { __crash: () => string | null }).__crash = () =>
       crashReason;
-    ac.terrainHeightAt = (x: number, z: number) => heightAt(x, z);
+    // The controller's ground height is the EXACT heightfield surface
+    // (triangle interpolation — main.ts's heightfieldGroundHeight),
+    // not the analytic heightAt() the old driver used.
+    ac.terrainHeightAt = (x: number, z: number) =>
+      heightfieldHeightAt(heights, res, x, z);
     if (process.env['NOCCD'] === '1') ac.body.enableCcd(false);
     for (const h of ac.colliderHandles()) owners.set(h, ac);
     return ac;
@@ -233,12 +238,15 @@ async function main(): Promise<void> {
   const alpha = RUNWAY_TABLE[0]!;
 
   // ---- E. Runway flatness (analytic + sampled grid) ----
+  // Alpha is a plateau runway now (elev 85 m): the strip must be exactly
+  // flat AT the plateau elevation, not at 0 — the check is elev-relative
+  // with the same strictness (exact flatness), only the reference moved.
   let flatWorst = 0;
   for (let d = -425; d <= 425; d += 5) {
     const h = heightAt(alpha.x + d, alpha.z);
-    flatWorst = Math.max(flatWorst, Math.abs(h));
+    flatWorst = Math.max(flatWorst, Math.abs(h - alpha.elev));
   }
-  check('Alpha strip + 100 m overrun flat (heightAt == 0)', flatWorst === 0, `worst |h| = ${flatWorst}`);
+  check('Alpha strip + 100 m overrun flat (heightAt == elev)', flatWorst === 0, `worst |h - elev| = ${flatWorst}`);
   // Sampled grid, bilinear at the exact centreline points the jet rolls
   // over (x -1400..-1050: the takeoff roll — every jet is airborne by
   // ~300 m). Nearest-node sampling would catch feather-zone nodes past
@@ -265,9 +273,9 @@ async function main(): Promise<void> {
   };
   let gridWorst = 0;
   for (let d = 0; d <= 350; d += 5) {
-    gridWorst = Math.max(gridWorst, Math.abs(bilinear(alpha.x + d, alpha.z)));
+    gridWorst = Math.max(gridWorst, Math.abs(bilinear(alpha.x + d, alpha.z) - alpha.elev));
   }
-  check('Alpha roll path flat on the sampled grid too', gridWorst < 0.01, `worst |h| = ${gridWorst.toFixed(4)}`);
+  check('Alpha roll path flat on the sampled grid too', gridWorst < 0.01, `worst |h - elev| = ${gridWorst.toFixed(4)}`);
 
   // ---- F. Carrier bearing from Alpha ----
   const dx = CARRIER_START_POS.x - alpha.x;
@@ -328,7 +336,7 @@ async function main(): Promise<void> {
       }
       const settled =
         ac.alive &&
-        Math.abs(ac.pos.y - 2.2) < 0.15 &&
+        Math.abs(ac.pos.y - (alpha.elev + 2.2)) < 0.15 &&
         ac.vel.length() < 0.5;
       check(
         `${key} flaps ${flaps}: spawn settles, no crash (2 s, no input)`,
@@ -477,7 +485,7 @@ async function main(): Promise<void> {
     }
     check(
       'F-35A climbs vertically at 100% throttle, vector 90',
-      ac.alive && ac.pos.y > 5 && ac.vsi > 0,
+      ac.alive && ac.pos.y > alpha.elev + 5 && ac.vsi > 0,
       `alive=${ac.alive} alt=${ac.pos.y.toFixed(1)} m vsi=${ac.vsi.toFixed(2)} m/s`,
     );
     ac.dispose();
@@ -498,7 +506,7 @@ async function main(): Promise<void> {
     }
     check(
       'F-35A balances at ~94% throttle, vector 90 (weightless on gear)',
-      ac.alive && ac.pos.y < 3.5 && Math.abs(ac.vsi) < 0.5,
+      ac.alive && ac.pos.y - alpha.elev < 3.5 && Math.abs(ac.vsi) < 0.5,
       `alive=${ac.alive} alt=${ac.pos.y.toFixed(2)} m (max ${maxAlt.toFixed(2)}) vsi=${ac.vsi.toFixed(2)} m/s — thrust ~ weight, no sink, no climb`,
     );
     ac.dispose();
@@ -515,7 +523,7 @@ async function main(): Promise<void> {
     for (let i = 0; i < 300; i++) substep(ac, 1 / 60);
     check(
       'F-35A does NOT lift at 74% throttle, vector 90 (combat mass)',
-      ac.alive && ac.pos.y < 3,
+      ac.alive && ac.pos.y - alpha.elev < 3,
       `alt=${ac.pos.y.toFixed(1)} m (stays on the deck, as the supplement predicts)`,
     );
     ac.dispose();
@@ -526,7 +534,7 @@ async function main(): Promise<void> {
     const ac = makeAircraft('fa18');
     ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
     for (let i = 0; i < 40; i++) substep(ac, 0.05); // 2 s at 20 fps
-    const settled = ac.alive && Math.abs(ac.pos.y - 2.2) < 0.3;
+    const settled = ac.alive && Math.abs(ac.pos.y - (alpha.elev + 2.2)) < 0.3;
     ac.flaps = 30;
     ac.thrTarget = 1;
     ac.pitchIn = -1;

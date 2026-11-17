@@ -251,7 +251,11 @@ export class HelicarrierController {
   }
 
   private buildPods(): void {
-    const podMat = new THREE.MeshLambertMaterial({ color: 0x3a4a55 });
+    // Mid grey-blue, not near-black: the old 0x3a4a55 Lambert pods
+    // read as pure black barrels on the deck edge (v2 play-test) —
+    // Lambert goes very dark in shadow/dusk, so the base colour
+    // itself has to be lighter.
+    const podMat = new THREE.MeshLambertMaterial({ color: 0x5a6a75 });
     const discMat = new THREE.MeshBasicMaterial({
       color: 0x9aa8b8,
       transparent: true,
@@ -281,7 +285,10 @@ export class HelicarrierController {
       this.group.add(wire);
     }
     const padMat = new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
-    const padDiscMat = new THREE.MeshBasicMaterial({ color: 0x2a2f36, side: THREE.DoubleSide });
+    // Mid-grey, not near-black: the old 0x2a2f36 pads read as pure
+    // black discs floating in the sky (the v2 play-test's "black
+    // helicarrier props").
+    const padDiscMat = new THREE.MeshBasicMaterial({ color: 0x5a626a, side: THREE.DoubleSide });
     for (const [px, pz] of VTOL_PADS) {
       const disc = new THREE.Mesh(new THREE.CircleGeometry(13, 24), padDiscMat);
       disc.rotation.x = -Math.PI / 2;

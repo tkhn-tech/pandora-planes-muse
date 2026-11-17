@@ -317,7 +317,7 @@ export interface AeroState {
   tvcDeg?: number;
   /** Airspeed roll-authority cap schedule (MiG-29). Absent = no cap. */
   rollCapSchedule?: RollCapSchedule;
-  /** Lift scale, 0..1 (default 1). The controller sets this to ~0.3
+  /** Lift scale, 0..1 (default 1). The controller sets this to 0.15
    *  when the aircraft is DYING (damage-model §6 step 1): the airframe
    *  is breaking up and the wing can no longer hold 1 g, so the jet
    *  freefalls instead of gliding on with zero controls. It scales the
@@ -388,4 +388,7 @@ export interface AeroResult {
  *  hysteresis and spin state live on the instance. */
 export interface IAerodynamicsSolver {
   solve(state: AeroState): AeroResult;
+  /** Reset stall/spin hysteresis (respawn — a fresh jet is not
+   *  stalled and not spinning, whatever the wreck was doing). */
+  reset?(): void;
 }

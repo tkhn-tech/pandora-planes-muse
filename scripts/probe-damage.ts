@@ -16,7 +16,7 @@ import { SPECS } from '../src/aircraft/AircraftSpec';
 import { WeaponSystem } from '../src/combat/WeaponSystem';
 import {
   generateHeights,
-  heightAt,
+  heightfieldHeightAt,
   RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
@@ -49,7 +49,7 @@ async function main(): Promise<void> {
       hfHeights[ix * res + iz] = heights[iz * res + ix];
     }
   }
-  world.createCollider(
+  const terrainCollider = world.createCollider(
     RAPIER.ColliderDesc.heightfield(
       TERRAIN_SEGMENTS,
       TERRAIN_SEGMENTS,
@@ -78,7 +78,11 @@ async function main(): Promise<void> {
     );
   }
   const scene = new THREE.Scene();
-  const groundH = (x: number, z: number): number => heightAt(x, z, heights);
+  // The controller's ground height is the EXACT heightfield surface
+  // (triangle interpolation — main.ts's heightfieldGroundHeight), not
+  // the analytic heightAt() the old driver used.
+  const groundH = (x: number, z: number): number =>
+    heightfieldHeightAt(heights, res, x, z);
   const wind = new THREE.Vector3(0, 0, 0);
   const dt = 1 / 60;
 
@@ -92,18 +96,26 @@ async function main(): Promise<void> {
       events: {},
     });
     ac.terrainHeightAt = groundH;
+    for (const h of ac.colliderHandles()) owners.set(h, ac);
     return ac;
   };
+  // Collider owners, so the drain can feed notifyContact exactly like
+  // main.ts does (the controller's dying-impact rule and hard-landing
+  // check read the contact's impactVy — without it, a dying jet that
+  // touches down tilted never finishes its crash).
+  const owners = new Map<number, Aircraft | 'terrain' | 'deck'>();
+  owners.set(terrainCollider.handle, 'terrain');
   const substep = (ac: Aircraft): void => {
     world.timestep = dt;
     world.step(eq);
     eq.drainCollisionEvents((h1, h2, started) => {
       if (!started) return;
-      // The driver's drain calls notifyContact for the aircraft; here
-      // we only need the ground contact to trigger finishCrash, which
-      // the controller detects via its own pos/terrain check too.
-      void h1;
-      void h2;
+      const a = owners.get(h1);
+      const b = owners.get(h2);
+      const j = a instanceof Aircraft ? a : b instanceof Aircraft ? b : null;
+      if (!j || !j.alive) return;
+      const other = j === a ? b : a;
+      j.notifyContact(j.vel.y, other === 'deck');
     });
     ac.step(dt, wind, null);
   };

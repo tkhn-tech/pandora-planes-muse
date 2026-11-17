@@ -191,6 +191,14 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
   /** Spin as a yaw-rate state (BET §2). */
   private readonly spinModel = new SpinModel();
 
+  /** Reset stall/spin hysteresis (respawn — a fresh jet is not
+   *  stalled and not spinning, whatever the wreck was doing; the
+   *  v2 play-test saw the STALL warning survive three restarts). */
+  reset(): void {
+    this.stalled = false;
+    this.spinModel.reset();
+  }
+
   solve(state: AeroState): AeroResult {
     const dt = state.dt ?? 1 / 60;
     const m = state.mass;

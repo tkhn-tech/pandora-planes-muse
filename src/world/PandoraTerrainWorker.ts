@@ -92,8 +92,125 @@ export function clamp(v: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, v));
 }
 
+/** Smoothstep 0..1 between edges a and b (a < b). */
+export function smoothstep(a: number, b: number, v: number): number {
+  const t = clamp((v - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
 export function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
+}
+
+/** Ridged multifractal (3 octaves of ridge()) — sharp crests, the
+ *  mountain-range building block. Returns ~0..1 (mean ~0.33). */
+export function ridgedFbm(x: number, y: number): number {
+  return ridge(x, y) * 0.6 + ridge(x * 2.1 + 7, y * 2.1 - 3) * 0.28 + ridge(x * 4.3 - 5, y * 4.3 + 9) * 0.12;
+}
+
+// ---------------------------------------------------------------------------
+// Mountain ranges — Himalaya as the reference (see heightAt below).
+// Four parallel bands, like the Himalaya's Sivalik foothills / Lower
+// range / Great range / Tibetan plateau, scaled to the 6 km world:
+// the real relief is ~7,000 m over 20-30 km of horizontal distance
+// (Nanga Parbat region), i.e. ~25-30% grade; the game keeps that
+// proportion at ~700 m of relief over ~2.5 km. Ranges are placed in
+// the outer bands of the map so the central basin — the carrier loop
+// (hull bottom ~329 m) and the runway plateaus — stays clear of them.
+// ---------------------------------------------------------------------------
+
+interface RangeBand {
+  /** 'z': band runs east-west (centreline z = c + arc*sin(coord/scale)). */
+  axis: 'x' | 'z';
+  /** Centreline offset (m) from the world centre on the band's axis. */
+  c: number;
+  /** Arc amplitude (m) of the centreline's sinusoidal bend. */
+  arc: number;
+  /** Arc wavelength (m). */
+  arcScale: number;
+  /** Half-width (m) of the flat core where the mask is 1. */
+  core: number;
+  /** Fade distance (m) from core edge to mask 0. */
+  fade: number;
+  /** Base lift (m) inside the band — the range sits on a high base. */
+  lift: number;
+  /** Peak amplitude (m) of the ridged crests. */
+  amp: number;
+  /** Valley pass through the band (a river-gorge-style gap, like the
+   *  Kali Gandaki gorge through the Himalaya): the band's mask dips
+   *  to ~15% within `halfWidth` of the along-axis coordinate `at`,
+   *  so an airfield plateau sits in a valley mouth with the range
+   *  rising on either side instead of burying the runway. */
+  gap?: { at: number; halfWidth: number };
+}
+
+/** The four range bands. North is the "Great Range" (tallest, with the
+ *  Tibetan-style bench behind it); south/west/east are lower. Each band
+ *  near a runway has a valley pass at that runway's along-coordinate:
+ *  west at Alpha's latitude (z=-900), south at Bravo's longitude
+ *  (x=800), east at Charlie's latitude (z=-350). */
+const RANGE_BANDS: RangeBand[] = [
+  { axis: 'z', c: -2300, arc: 150, arcScale: 1800, core: 350, fade: 450, lift: 130, amp: 720 },
+  { axis: 'z', c: 2300, arc: 150, arcScale: 1600, core: 350, fade: 450, lift: 110, amp: 560, gap: { at: 800, halfWidth: 700 } },
+  { axis: 'x', c: -2300, arc: 150, arcScale: 1700, core: 350, fade: 450, lift: 100, amp: 520, gap: { at: -900, halfWidth: 700 } },
+  { axis: 'x', c: 2450, arc: 100, arcScale: 1700, core: 350, fade: 450, lift: 100, amp: 520, gap: { at: -350, halfWidth: 700 } },
+];
+
+/** Mask 0..1 of one range band at (x, z): 1 in the core, fading to 0
+ *  `fade` metres outside it, and dipping through the valley pass. */
+function rangeMask(b: RangeBand, x: number, z: number): number {
+  const along = b.axis === 'z' ? x : z;
+  const across = b.axis === 'z' ? z : x;
+  const centre = b.c + b.arc * Math.sin(along / b.arcScale);
+  const d = Math.abs(across - centre);
+  let m = 1 - smoothstep(b.core, b.core + b.fade, d);
+  if (b.gap && m > 0) {
+    const gd = Math.abs(along - b.gap.at);
+    m *= 0.15 + 0.85 * smoothstep(b.gap.halfWidth * 0.5, b.gap.halfWidth, gd);
+  }
+  return m;
+}
+
+/**
+ * Base terrain WITHOUT runway plateaus (the mountain/foothill/valley
+ * field the plateaus sit in). Exported for probing / verification —
+ * the game itself only ever calls heightAt().
+ *
+ * - Basin floor: gentle rolling hills, -20..50 m with fine detail.
+ * - Ranges: domain-warped ridged noise, anisotropic so ridgelines run
+ *   ALONG each band (long wavelength along the range, short across it),
+ *   with a low-frequency carve factor that cuts saddles/valleys across
+ *   the range at irregular intervals. Typical crests 350-550 m, peaks
+ *   to ~700 m in the north (Great) range.
+ * - North bench: a broad high bench (330 m) north of the main range,
+ *   the Tibetan-plateau analogue — the Himalaya's asymmetric profile
+ *   (steep south face, high plateau to the north).
+ * Clamped to [-25, 750] m.
+ */
+export function baseHeight(x: number, z: number): number {
+  let h = fbm(x / 900, z / 900) * 70 - 20;
+  h += fbm(x / 300 + 3, z / 300 - 5) * 25;
+  // Low-frequency carve: saddles and valleys across the ranges.
+  const carve = 0.45 + 0.55 * smoothstep(0.32, 0.72, fbm(x / 480 + 11, z / 480 - 7));
+  for (const b of RANGE_BANDS) {
+    const m = rangeMask(b, x, z);
+    if (m <= 0) continue;
+    // Domain warp bends the ridgelines (same warp for every band so
+    // the field stays continuous where bands meet at the corners).
+    const wx = x + (fbm(x / 700 + 5, z / 700 - 3) - 0.5) * 260;
+    const wz = z + (fbm(x / 700 - 9, z / 700 + 4) - 0.5) * 260;
+    // Anisotropic sampling: long wavelength ALONG the range, short
+    // ACROSS it, so crests run parallel to the range axis.
+    const r =
+      b.axis === 'z'
+        ? ridgedFbm(wx / 650, wz / 200)
+        : ridgedFbm(wx / 200, wz / 650);
+    h += m * (b.lift + Math.pow(r, 1.35) * b.amp) * carve;
+  }
+  // Tibetan-style bench north of the main (north) range.
+  const benchT = clamp((-2350 - z) / 400, 0, 1);
+  h += 330 * benchT * benchT * (3 - 2 * benchT);
+  return clamp(h, -25, 750);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,19 +222,58 @@ export interface RunwayData {
   name: string;
   x: number;
   z: number;
-  elev: number; // v2 computes this as groundH(x, z); it comes out 0 for all three
+  /** Plateau-top elevation (m). Each runway sits on its own flat-topped
+   *  plateau: the top is exactly this high, the plateau is the local
+   *  high ground (chosen above the highest base terrain within ~700 m
+   *  of the runway), and the sides slope down to the surrounding
+   *  terrain over the plateau skirt. */
+  elev: number;
   hdg: number; // degrees, heading vector = (sin hdg, 0, cos hdg)
   len: number;
   width: number; // v2 `wid`
   dirt: boolean; // v2 `surf: 'dirt' | 'paved'`
 }
 
-/** Exact v2 RUNWAYS values (template lines ~538-542). */
+/** Plateau elevations — each chosen above the highest base terrain
+ *  within ~50 m of its flat-box boundary (verified by
+ *  scripts/probe-terrain.ts), so every plateau is the local high ground
+ *  and its sides slope down to the surrounding terrain: Alpha 85 m
+ *  (base max 69 m at the ring), Bravo 70 m (base max 55 m), Charlie
+ *  220 m (a high mesa at the foot of the east range; base max 202 m). */
 export const RUNWAY_TABLE: RunwayData[] = [
-  { name: 'Alpha', x: -1400, z: -900, elev: 0, hdg: 90, len: 650, width: 46, dirt: false },
-  { name: 'Bravo', x: 800, z: 1400, elev: 0, hdg: 160, len: 600, width: 42, dirt: true },
-  { name: 'Charlie', x: 1850, z: -350, elev: 0, hdg: 20, len: 650, width: 46, dirt: false },
+  { name: 'Alpha', x: -1400, z: -900, elev: 85, hdg: 90, len: 650, width: 46, dirt: false },
+  { name: 'Bravo', x: 800, z: 1400, elev: 70, hdg: 160, len: 600, width: 42, dirt: true },
+  { name: 'Charlie', x: 1850, z: -350, elev: 220, hdg: 20, len: 650, width: 46, dirt: false },
 ];
+
+/** Plateau geometry (m): the flat top extends past the strip, then the
+ *  skirt slopes down to the base terrain. */
+export const PLATEAU_TOP_ALONG = 160; // flat top past each strip end (overrun is 100)
+export const PLATEAU_TOP_ACROSS = 70; // flat top past each strip edge
+export const PLATEAU_SKIRT = 350; // slope-down distance past the flat top
+
+/**
+ * 0..1 plateau weight at (x, z): 1 on a plateau's flat top, fading to 0
+ * across the skirt. The max over runways (they are far apart, so in
+ * practice at most one is non-zero). Exported for the terrain colouring
+ * (plateau tops read as grass, not rock) and for verification.
+ */
+export function plateauWeight(x: number, z: number): number {
+  let w = 0;
+  for (const r of RUNWAY_TABLE) {
+    const dx = x - r.x;
+    const dz = z - r.z;
+    const sh = Math.sin(r.hdg * D2R);
+    const ch = Math.cos(r.hdg * D2R);
+    const lx = dx * sh + dz * ch;
+    const lz = dx * ch - dz * sh;
+    const ex = Math.max(0, Math.abs(lx) - (r.len / 2 + PLATEAU_TOP_ALONG));
+    const ez = Math.max(0, Math.abs(lz) - (r.width / 2 + PLATEAU_TOP_ACROSS));
+    const d = Math.max(ex, ez);
+    if (d < PLATEAU_SKIRT) w = Math.max(w, 1 - smoothstep(0, PLATEAU_SKIRT, d));
+  }
+  return w;
+}
 
 /**
  * 0..1 how strongly the runway flattens the terrain here — verbatim v2
@@ -126,6 +282,9 @@ export const RUNWAY_TABLE: RunwayData[] = [
  * by -hdg, so the flattened strip ran 90 deg off the runway. The strip stays
  * flat for its full length plus a 100 m overrun, feathering only outside that
  * box (over 90 m along, 70 m across, smoothstepped).
+ * Kept for the strip colouring and flora exclusion; the terrain flattening
+ * itself is now the plateau blend in heightAt() (the plateau flat top
+ * fully contains this strip zone).
  */
 export function runwayBlend(x: number, z: number): number {
   let b = 0;
@@ -145,40 +304,91 @@ export function runwayBlend(x: number, z: number): number {
 }
 
 /**
- * v2 groundH() in ORIGINAL-frame coordinates (no originShift added — the
- * caller adds the floating-origin shift when querying in scene coords).
- * Rolling base + canyon ridges + plateaus, floored at -25 m, then lerped
- * toward the runway elevation (0) by runwayBlend. At a runway centre this
- * returns exactly 0.0.
+ * Ground height in ORIGINAL-frame coordinates (no originShift added —
+ * the caller adds the floating-origin shift when querying in scene
+ * coords). Mountain ranges + plateau runways (see baseHeight and
+ * plateauWeight above). The plateau blend replaces the v2 runway
+ * flattening: where the plateau weight is 1 the height is exactly the
+ * runway's plateau elevation, so the strip is flat for its full length
+ * plus overrun on a flat-topped mesa whose sides slope down to the
+ * surrounding terrain — no hills at the runway ends.
  */
 export function heightAt(x: number, z: number): number {
-  const nx = x / 900;
-  const nz = z / 900;
-  let h = fbm(nx, nz) * 160 - 40; // rolling base
-  h += ridge(nx * 1.7 + 5, nz * 1.7 - 3) * 90 - 30; // canyon ridges
-  h += Math.max(0, fbm(nx * 0.6 + 9, nz * 0.6 + 4) - 0.55) * 420; // plateaus
-  h = Math.max(h, -25);
-  const b = runwayBlend(x, z);
-  if (b > 0) {
-    let elev = 0;
-    let w = 0;
-    for (const r of RUNWAY_TABLE) {
-      const d = Math.hypot(x - r.x, z - r.z);
-      // NOTE — deliberate v2 fix (see header): v2 weighted the runway
-      // elevation over a 400 m radius, but the flat zone is len/2 + 100 =
-      // 425 m from the centre, so at |lx| in [400, 425] every weight was 0,
-      // the lerp was skipped, and raw terrain (up to ~50 m) poked through
-      // the strip mesh at the overrun tips. 600 m covers the whole blend
-      // footprint (max ~523 m at the feather corners), so the strip is 0.0
-      // end to end, as the v1.1 comment promises. All v2 elevations are 0,
-      // so elev/w is 0 either way — only the radius changes.
-      const k = Math.max(0, 1 - d / 600);
-      elev += r.elev * k;
-      w += k;
+  const h = baseHeight(x, z);
+  // Plateau blend: the plateau is the local high ground, so blend the
+  // base terrain toward the plateau elevation by the plateau weight.
+  // Where the weight is 1 (the flat top) this returns exactly elev.
+  let w = 0;
+  let elev = 0;
+  for (const r of RUNWAY_TABLE) {
+    const dx = x - r.x;
+    const dz = z - r.z;
+    const sh = Math.sin(r.hdg * D2R);
+    const ch = Math.cos(r.hdg * D2R);
+    const lx = dx * sh + dz * ch;
+    const lz = dx * ch - dz * sh;
+    const ex = Math.max(0, Math.abs(lx) - (r.len / 2 + PLATEAU_TOP_ALONG));
+    const ez = Math.max(0, Math.abs(lz) - (r.width / 2 + PLATEAU_TOP_ACROSS));
+    const d = Math.max(ex, ez);
+    if (d < PLATEAU_SKIRT) {
+      const wr = 1 - smoothstep(0, PLATEAU_SKIRT, d);
+      if (wr > w) {
+        w = wr;
+        elev = r.elev;
+      }
     }
-    if (w > 0) h = lerp(h, elev / w, b);
   }
+  if (w > 0) return lerp(h, elev, w);
   return h;
+}
+
+/** Height of the RAPIER HEIGHTFIELD surface at (x, z) — the exact
+ *  piecewise-linear triangle surface the physics collider (and the
+ *  visual mesh) actually are, interpolated over the 151x151 sampled
+ *  grid (40 m spacing, x/z from -3000, row-major heights,
+ *  index = iz * res + ix).
+ *
+ *  This is NOT the bilinear interpolation (sampledHeightAt in
+ *  PandoraWorldGenerator): Rapier splits each quad along the
+ *  (i+1,j)–(i,j+1) diagonal (corners h10–h01), and the bilinear
+ *  surface sits up to ~7.4 m away from the triangle surface at the
+ *  steepest spots (measured at the (840..880, -2520..-2480) cell:
+ *  bilinear 572.73 vs raycast 580.17). The ANALYTIC heightAt() is
+ *  worse still (up to ~107 m off the sampled surface where the 46 m
+ *  ridged-fbm features are undersampled by the 40 m grid).
+ *
+ *  The triangle diagonal was verified against Rapier raycasts: 6
+ *  points inside the steep cell above agree with this formula to
+ *  0.000 m; the other diagonal is off by up to 7.44 m.
+ *
+ *  Use this — never heightAt() or the bilinear — for anything that
+ *  must agree with where a jet physically rests: the controller's
+ *  terrainHeightAt (ground detection, respawn elevation clamp), the
+ *  crash-VFX ground height, and the camera terrain clamp. A jet
+ *  resting on a mountainside reads grounded=true and G=1.0 with this
+ *  (the v2 play-test hang was a jet resting on the collider while the
+ *  analytic height put it 90+ m in the air, so the controller never
+ *  saw it land and the respawn never fired). */
+export function heightfieldHeightAt(
+  heights: Float32Array,
+  res: number,
+  x: number,
+  z: number,
+): number {
+  const gx = (x + WORLD_SIZE / 2) / 40;
+  const gz = (z + WORLD_SIZE / 2) / 40;
+  const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
+  const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
+  const fx = Math.max(0, Math.min(1, gx - ix));
+  const fz = Math.max(0, Math.min(1, gz - iz));
+  const h00 = heights[iz * res + ix]!;
+  const h10 = heights[iz * res + ix + 1]!;
+  const h01 = heights[(iz + 1) * res + ix]!;
+  const h11 = heights[(iz + 1) * res + ix + 1]!;
+  // Rapier's heightfield diagonal: (i+1,j)–(i,j+1), i.e. h10–h01.
+  // fx+fz<=1 is the h00/h10/h01 triangle, else h10/h11/h01.
+  if (fx + fz <= 1) return h00 + (h10 - h00) * fx + (h01 - h00) * fz;
+  return h11 + (h01 - h11) * (1 - fx) + (h10 - h11) * (1 - fz);
 }
 
 // ---------------------------------------------------------------------------

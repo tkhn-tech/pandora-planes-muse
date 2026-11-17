@@ -333,6 +333,14 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     this.stations = buildStations(spec);
   }
 
+  /** Reset stall/spin hysteresis and the tailplane-downwash memory
+   *  (respawn — a fresh jet is not stalled and not spinning). */
+  reset(): void {
+    this.stalled = false;
+    this.spinModel.reset();
+    this.prevCL = 0;
+  }
+
   /** Station count (for the driver / debug — supplement §7 totals). */
   get stationCount(): number {
     return this.stations.length;
@@ -560,6 +568,12 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     const cdEff =
       (cdParasitic + (S_lift / S) * inducedK * clTotal * clTotal + cdSep) * geCD;
     let lift = q * S_lift * clEff;
+    // Dying airframe (damage-model §6 step 1, same as the curve
+    // solver): the wing can no longer hold 1 g. The curve solver
+    // applies liftScale; this one ignored it, so a BET dying jet
+    // glided on at full lift. 0.15 (controller) + the dying pitch
+    // bias drive the wreck into the stall and the fall.
+    lift *= state.liftScale ?? 1;
     const drag =
       q * S * cdParasitic * geCD +
       q * S_lift * (inducedK * clTotal * clTotal + cdSep) * geCD;

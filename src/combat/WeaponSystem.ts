@@ -202,7 +202,20 @@ export class WeaponSystem {
    *  immediate fuel explosion (instant kill, big fireball); within
    *  range of an engine, a 15% engine-fire chance; a detonation on a
    *  wing has a 30% spar-break chance (wing separation). This replaces
-   *  the old "always fuselage" proximity hit. */
+   *  the old "always fuselage" proximity hit.
+   *
+   *  DEFERRED KILL: the zone damage is applied with deferKill=true
+   *  and the kill is decided ONCE after the whole burst (checkKill),
+   *  because the old loop aborted after the first zone — the
+   *  fuselage (40 HP) was destroyed by the first hit, startDying
+   *  fired, and the loop returned before the fuel/engine zones were
+   *  hit and before any ignition roll ran. The result was a missile
+   *  kill that left hp exactly 60 with no fire, no smoke, no
+   *  explosion and the tails intact (the v2 live shoot-down showed
+   *  nothing at all). A deferred burst still kills — checkKill runs
+   *  the same severe-damage rule — but every zone is hit and the
+   *  ignition rolls run, so the kill starts a fire (startDying
+   *  lights one when none is burning). */
   applyProximityDamage(
     target: Aircraft,
     detonationPos: THREE.Vector3,
@@ -211,6 +224,7 @@ export class WeaponSystem {
     byPlayer: boolean,
   ): void {
     if (!target.alive || target.dying) return;
+    let killReason: string | null = null;
     for (const a of zoneAnchors(target)) {
       // Anchor in world coordinates.
       const world = a.local.clone().applyQuaternion(target.quat).add(target.pos);
@@ -218,15 +232,17 @@ export class WeaponSystem {
       if (d >= radius) continue;
       const dmg = baseDamage * (1 - d / radius);
       if (dmg <= 0) continue;
-      target.applyDamage(dmg, a.zone, byPlayer);
-      if (!target.alive || target.dying) return;
-      // Ignition / spar-break rolls, per zone.
+      // Deferred: apply the zone damage + its effects (tail
+      // detaches, fires start) but do NOT decide the kill yet.
+      target.applyDamage(dmg, a.zone, byPlayer, true);
+      // Ignition / spar-break rolls, per zone — all of them run now,
+      // not just the first zone's.
       if (a.zone === 'fuel' && d <= 3 && Math.random() < 0.25) {
-        // Immediate fuel explosion: the jet is destroyed now (big
-        // fireball), and it falls as a burning wreck.
+        // Immediate fuel explosion: the jet is destroyed (big
+        // fireball) and falls as a burning wreck. The kill is
+        // recorded, not applied — the loop finishes first.
         this.hooks.onExplosion?.(target.pos.clone(), 2.5);
-        target.startDying('fuel explosion');
-        return;
+        killReason = 'fuel explosion';
       }
       if (
         (a.zone === 'engine' || a.zone === 'engineL' || a.zone === 'engineR') &&
@@ -236,9 +252,12 @@ export class WeaponSystem {
       }
       if ((a.zone === 'wingL' || a.zone === 'wingR') && d <= 5 && Math.random() < 0.3) {
         // Spar break: the wing separates (damage-model §2, §6 step 4).
-        target.applyDamage(60, a.zone, byPlayer);
+        target.applyDamage(60, a.zone, byPlayer, true);
       }
     }
+    // One kill decision for the whole burst.
+    if (killReason) target.startDying(killReason);
+    else target.checkKill('shot down');
   }
 
   /** Fire one hitscan round at a single target (or dry-fire downrange when

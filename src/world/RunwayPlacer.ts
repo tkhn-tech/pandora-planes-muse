@@ -4,9 +4,10 @@
 // (v1.1 fix) and the runway mesh block (lines ~595-622). The runway DATA
 // lives in PandoraTerrainWorker.ts (plain data, no THREE) so the pure height
 // function can use it; this module re-exports it as RUNWAYS and owns the
-// meshes. The flattening itself is inside heightAt() (runwayBlend) — this
-// placer exposes the same blend as flattenAt() and the flattened height as
-// groundHeight() for the world generator to use.
+// meshes. The terrain flattening is the plateau blend inside heightAt()
+// (plateauWeight) — each runway sits on a flat-topped plateau at its own
+// elevation; runwayBlend survives for the strip colouring / flora
+// exclusion and as the flattenAt() query.
 
 import * as THREE from 'three';
 import { RUNWAY_TABLE, runwayBlend } from './PandoraTerrainWorker';
@@ -186,9 +187,9 @@ export class RunwayPlacer {
   /**
    * Flattened ground height at (x, z) in ORIGINAL-frame coordinates — the
    * height the world generator must use so the terrain is flattened at the
-   * runways. This is just heightAt(), which already lerps toward the runway
-   * elevation by runwayBlend; it is exposed here so the generator has one
-   * obvious call site for "ground height with runways flattened".
+   * runways. This is just heightAt(), which returns the plateau elevation
+   * wherever the plateau weight is 1; it is exposed here so the generator
+   * has one obvious call site for "ground height with runways flattened".
    * Must be called after build().
    */
   groundHeight(x: number, z: number): number {

@@ -57,7 +57,13 @@ const DEFAULT_SHAPING: StickShaping = {
 
 /** Keyboard stick slew, units/s — the arrow-key stick ramps to its
  *  target instead of jumping, so it moves like a real stick. */
-const STICK_SLEW = 3;
+/** Keyboard stick slew rate (per second): how fast the virtual stick
+ *  moves toward the held key's target. 5/s (was 3/s): at 3/s a 0.1 s
+ *  tap only reached 0.3 of full pull and the live F-18 did not
+ *  rotate from a tap at 142 kt; 5/s gives a meaningful pull from a
+ *  short hold while a tap still does not rotate the jet by itself
+ *  (rotation needs a SUSTAINED pull — the ROTATE cue says so). */
+const STICK_SLEW = 5;
 
 const DEADZONE = 0.12;
 
