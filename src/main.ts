@@ -278,6 +278,9 @@ worldGen.registerWithFloatingOrigin(floatingOrigin);
 {
   const th = worldGen.terrainColliderHandle;
   if (th !== null) colliderOwners.set(th, 'terrain');
+  // Runway boxes are ground too — the gear rests on them, not on the
+  // heightfield, so they must be recognised as terrain for contact.
+  for (const h of worldGen.runwayColliderHandles) colliderOwners.set(h, 'terrain');
 }
 const runwayPlacer = new RunwayPlacer(scene);
 {
@@ -313,6 +316,12 @@ const deckProvider: DeckProvider = {
 };
 const groundHeight = (x: number, z: number): number =>
   worldGen.groundHeight(x, z);
+/** Sampled mesh/collider height — the surface actually rendered. The
+ *  chase camera is clamped above THIS, not the analytic heightAt(), which
+ *  can sit ~13 m below the mesh at plateau edges (the old clamp let the
+ *  camera clip into terrain after the runway ended in a hill). */
+const sampledGroundHeight = (x: number, z: number): number =>
+  worldGen.sampledHeightAt(x, z);
 
 // ---- combat / VFX ----
 let shakeT = 0;
@@ -350,6 +359,11 @@ const menu = new SandboxMenu((next) => {
       startBtn.textContent = 'Loading…';
       startBtn.disabled = true;
     }
+    // Carrier build errors are the Ford's fault; startRound errors are
+    // not. Split the two so a bad jet key (or any round-setup failure)
+    // never gets reported as a carrier failure — and never leaves the
+    // game in the dead state the F-35A/F-15E key mismatch caused (menu
+    // hidden, started=true, no player, no way back except reload).
     try {
       await carrier.build();
       carrier.registerWithFloatingOrigin(floatingOrigin);
@@ -358,13 +372,26 @@ const menu = new SandboxMenu((next) => {
         if (dc) colliderOwners.set(dc.handle, 'deck');
       }
       modelStatus['ford'] = { state: 'ok' };
-      await startRound(next);
     } catch (e) {
       modelStatus['ford'] = {
         state: 'FAILED',
         error: e instanceof Error ? e.message : String(e),
       };
-      if (loadErr) loadErr.textContent = 'Load error: ' + (e instanceof Error ? e.message : String(e));
+      if (loadErr) loadErr.textContent = 'Carrier load error: ' + (e instanceof Error ? e.message : String(e));
+      if (startBtn) {
+        startBtn.textContent = 'Take Off 🛫';
+        startBtn.disabled = false;
+      }
+      return;
+    }
+    try {
+      await startRound(next);
+    } catch (e) {
+      // Recovery: back to the pre-flight menu with the error visible.
+      started = false;
+      paused = false;
+      menu.show();
+      if (loadErr) loadErr.textContent = 'Could not start round: ' + (e instanceof Error ? e.message : String(e));
       if (startBtn) {
         startBtn.textContent = 'Take Off 🛫';
         startBtn.disabled = false;
@@ -375,6 +402,14 @@ const menu = new SandboxMenu((next) => {
 
 // ---- game state ----
 let cfg: SandboxConfig = menu.read();
+// Stick shaping from the (possibly stored) setup, so the keyboard
+// answers the way the menu says before the first round starts.
+pcInput.setStickShaping({
+  invertPitch: cfg.invertPitch,
+  invertRoll: cfg.invertRoll,
+  pitchSens: cfg.pitchSens,
+  rollSens: cfg.rollSens,
+});
 let player: Aircraft | null = null;
 let playerKey = '';
 const enemies: Aircraft[] = [];
@@ -391,6 +426,16 @@ let kills = 0;
 let traps = 0;
 let vtolLandings = 0;
 let respawnTimer: ReturnType<typeof setTimeout> | null = null;
+/** Spectate state (damage-model §5): true while the player's wreck is
+ *  falling (player.dying) and for 2 s after impact, until respawn.
+ *  The camera follows the wreck; R (or the Respawn button) skips to
+ *  an immediate respawn. */
+let spectating = false;
+let prevPlayerDying = false;
+/** Damage-visual timer: spawn a smoke/fire plume every 0.5 s per
+ *  damaged aircraft (the plume lives 6 s, so this keeps a continuous
+ *  trail without flooding the VFX pool). */
+let smokeT = 0;
 let failAt = 0;
 let failDone = false;
 let failScenario: string = 'none';
@@ -521,6 +566,21 @@ bindSlider('vecSl', 'vecVal', (v) => v + '°', (v) => {
   if (player) player.vector = v;
 });
 
+/** Set the flaps / airbrake panel sliders from code (keyboard [ ] / X)
+ *  so the touch UI and the keyboard agree. */
+function syncFlapSlider(v: number): void {
+  const input = $('flapSl') as HTMLInputElement | null;
+  if (input) input.value = String(v);
+  const val = $('flapVal');
+  if (val) val.textContent = v + '°';
+}
+function syncBrkSlider(v01: number): void {
+  const input = $('brkSl') as HTMLInputElement | null;
+  if (input) input.value = String(Math.round(v01 * 100));
+  const val = $('brkVal');
+  if (val) val.textContent = Math.round(v01 * 100) + '%';
+}
+
 let firing = false;
 let touchBrake = false;
 function toggleBtn(id: string, fn: () => void): void {
@@ -618,7 +678,7 @@ function makeAircraft(key: string, isPlayer: boolean): Aircraft {
   });
   ac.terrainHeightAt = groundHeight;
   floatingOrigin.registerBody(ac.body);
-  colliderOwners.set(ac.body.collider(0).handle, ac);
+  for (const h of ac.colliderHandles()) colliderOwners.set(h, ac);
   return ac;
 }
 
@@ -629,9 +689,44 @@ function addScore(n: number, kind: 'kill' | 'trap' | 'vtol'): void {
   if (kind === 'vtol') vtolLandings++;
 }
 
+/** Show/hide the spectate banner ("SHOT DOWN — watching the wreck ·
+ *  R to skip"). The banner is a DOM element (#spectate) so it stays
+ *  up for the whole fall, unlike a 3.2 s toast. */
+function setSpectateBanner(show: boolean, reason?: string, killer?: string): void {
+  const el = document.getElementById('spectate');
+  const tx = document.getElementById('spectateText');
+  if (!el) return;
+  if (show) {
+    const who = killer ? ` — shot down by ${killer}` : '';
+    if (tx) tx.textContent = `SHOT DOWN${who} · watching the wreck`;
+    if (reason) el.title = reason;
+    el.classList.add('show');
+  } else {
+    el.classList.remove('show');
+  }
+}
+
+/** Skip the spectate (R key or the Respawn button): respawn now. */
+function skipSpectate(): void {
+  if (!spectating && !respawnTimer) return;
+  if (respawnTimer) {
+    clearTimeout(respawnTimer);
+    respawnTimer = null;
+  }
+  spectating = false;
+  setSpectateBanner(false);
+  respawnPlayer();
+}
+
 function respawnPlayer(): void {
-  if (!player || player.alive) return; // v1.1: Restart inside the 3 s window already revived the jet
+  if (!player) return;
+  // v1.1: Restart inside the 3 s window already revived the jet — but
+  // a DYING player (alive, falling) must still respawn on skip (R /
+  // Respawn button), so only return early when alive AND not dying.
+  if (player.alive && !player.dying) return;
   respawnTimer = null;
+  spectating = false;
+  prevPlayerDying = false;
   const r = runwayPlacer.nearest(player.pos);
   player.resetAt(r.x, r.elev + 2, r.z, r.hdg);
   player.thrTarget = 0;
@@ -639,6 +734,7 @@ function respawnPlayer(): void {
   hud.syncThrottle(0);
   camMode = 0;
   pcInput.setCameraMode(0);
+  setSpectateBanner(false);
 }
 
 function clearAircraftList(list: Aircraft[]): void {
@@ -646,7 +742,7 @@ function clearAircraftList(list: Aircraft[]): void {
     const ai = aiControllers.get(a);
     if (ai) floatingOrigin.unregisterVector(ai.navTarget);
     floatingOrigin.unregisterBody(a.body);
-    colliderOwners.delete(a.body.collider(0).handle);
+    for (const h of a.colliderHandles()) colliderOwners.delete(h);
     a.dispose();
     aiControllers.delete(a);
     prevAlive.delete(a);
@@ -663,6 +759,17 @@ function weatherLabel(c: SandboxConfig): string {
 }
 
 async function startRound(next: SandboxConfig): Promise<void> {
+  // Validate the aircraft key BEFORE hiding the menu or touching state:
+  // an unknown key used to throw after menu.hide() + started=true, which
+  // left the game with no player and no way back (the F-35A/F-15E freeze).
+  if (!SPECS[next.aircraftKey]) {
+    hud.toast(
+      'UNKNOWN JET',
+      'No aircraft "' + next.aircraftKey + '" — pick another jet.',
+    );
+    menu.show();
+    return;
+  }
   cfg = next;
   menu.hide();
   $('pauseScreen')?.classList.add('hidden');
@@ -674,16 +781,27 @@ async function startRound(next: SandboxConfig): Promise<void> {
   vtolLandings = 0;
   elapsed = 0;
   failDone = false;
-  // Failure timing: a named scenario hits at 3 s; 'random' picks a random
-  // scenario at a random 30–90 s (template segFailWhen).
-  if (cfg.failure === 'random') {
-    failScenario =
-      FAIL_CHOICES[Math.floor(Math.random() * FAIL_CHOICES.length)]!;
-    failAt = 30 + Math.random() * 60;
+  // Failure timing: 'none' never fires. A named scenario fires at 3 s
+  // when failWhen is 'start', or at a random 30–90 s when failWhen is
+  // 'random'. 'random' as the scenario picks a random scenario; the
+  // timing still comes from failWhen.
+  if (cfg.failure === 'none') {
+    failScenario = 'none';
+    failAt = Infinity;
   } else {
-    failScenario = cfg.failure;
-    failAt = 3;
+    failScenario =
+      cfg.failure === 'random'
+        ? FAIL_CHOICES[Math.floor(Math.random() * FAIL_CHOICES.length)]!
+        : cfg.failure;
+    failAt = cfg.failWhen === 'random' ? 30 + Math.random() * 60 : 3;
   }
+  // Stick shaping (inversion + sensitivity) from the setup menu.
+  pcInput.setStickShaping({
+    invertPitch: cfg.invertPitch,
+    invertRoll: cfg.invertRoll,
+    pitchSens: cfg.pitchSens,
+    rollSens: cfg.rollSens,
+  });
   if (respawnTimer) {
     clearTimeout(respawnTimer);
     respawnTimer = null;
@@ -716,7 +834,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
   if (!player || playerKey !== cfg.aircraftKey) {
     if (player) {
       floatingOrigin.unregisterBody(player.body);
-      colliderOwners.delete(player.body.collider(0).handle);
+      for (const h of player.colliderHandles()) colliderOwners.delete(h);
       player.dispose();
     }
     player = makeAircraft(cfg.aircraftKey, true);
@@ -744,18 +862,42 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.spec.vtol ? 'vtol' : 'fixed-wing',
   );
 
+  // Carrier — dead ahead of Alpha (900 m east on the takeoff heading),
+  // so it is in the portrait-phone view at round start (the old spot was
+  // 38 deg left of the nose — outside a phone's ~±17 deg horizontal FOV).
+  // Reset BEFORE the player spawns: a deck spawn needs the carrier's
+  // current position / heading / cruise velocity.
+  carrier.reset(
+    new THREE.Vector3(-500, 350, -900),
+    Math.atan2(1400 - -500, -900 - -900),
+  );
+
+  // Player spawn: Alpha runway, or the helicarrier deck.
   const r0: RunwayDef = worldGen.runways[0]!;
-  player.resetAt(r0.x, r0.elev + 2, r0.z, r0.hdg);
+  if (cfg.spawn === 'carrier') {
+    // Deck spawn: 120 m aft of the deck centre (the full deck ahead for
+    // the roll), facing the bow at the carrier's heading, inheriting the
+    // carrier's cruise velocity so the jet rides the deck instead of
+    // sliding off the stern (the deck moves at 40 m/s from the first
+    // update; a zero-velocity spawn would be left behind). Works for all
+    // four jets — the F-35A's VTOL home is the deck. The arresting-wire
+    // logic applies on landing exactly as for a carrier trap.
+    const fwd = new THREE.Vector3(
+      Math.sin(carrier.yaw),
+      0,
+      Math.cos(carrier.yaw),
+    );
+    const sx = carrier.pos.x - fwd.x * 120;
+    const sz = carrier.pos.z - fwd.z * 120;
+    player.resetAt(sx, carrier.deckTopY + 2.2, sz, carrier.yaw * R2D);
+    const dv = fwd.clone().multiplyScalar(carrier.speed);
+    player.body.setLinvel({ x: dv.x, y: 0, z: dv.z }, true);
+    player.vel.copy(dv);
+  } else {
+    player.resetAt(r0.x, r0.elev + 2, r0.z, r0.hdg);
+  }
   player.gear = true;
   $('gearBtn')?.classList.add('on');
-
-  // Carrier — v1.1: starts ~1.1 km from Alpha, in the player's forward
-  // view (v1 parked it 2.5 km away heading away — invisible). First
-  // waypoint is east, with the takeoff direction.
-  carrier.reset(
-    new THREE.Vector3(-500, 350, -200),
-    Math.atan2(1400 - -500, 0 - -200),
-  );
 
   // Enemies: mix of MiG-29 and Su-34.
   for (let i = 0; i < cfg.enemies; i++) {
@@ -776,8 +918,9 @@ async function startRound(next: SandboxConfig): Promise<void> {
     let ez: number;
     if (i < 2) {
       // v1.1: first two enemies start in the player's forward view,
-      // 450–600 m out and 120–180 m up.
-      const fwd = r0.dir;
+      // 450–600 m out and 120–180 m up. Forward is the player's own
+      // heading, so this holds for a deck spawn too.
+      const fwd = player.fwd();
       const rgt = new THREE.Vector3(fwd.z, 0, -fwd.x);
       const along = 450 + i * 150;
       const side = i === 0 ? 120 : -150;
@@ -793,6 +936,10 @@ async function startRound(next: SandboxConfig): Promise<void> {
       ez = player.pos.z + Math.sin(a) * d;
     }
     e.resetAt(ex, ey, ez, Math.random() * 360);
+    // Air spawn: the jet is flying, not hovering at 0 kt (setAirspeed —
+    // below stall speed the wing cannot hold 1 g and no steering law
+    // can turn it).
+    e.setAirspeed(150);
     e.gear = false;
     e.grounded = false;
     e.thrTarget = 0.8;
@@ -824,9 +971,11 @@ async function startRound(next: SandboxConfig): Promise<void> {
       const r = worldGen.runways[i % worldGen.runways.length]!;
       if (key === 'heli') {
         t.resetAt(r.x, r.elev + 150, r.z, r.hdg);
+        t.setAirspeed(60);
         t.thrTarget = 0.55;
       } else {
         t.resetAt(r.x, r.elev + 220, r.z, r.hdg);
+        t.setAirspeed(130);
         t.thrTarget = 0.7;
       }
       t.gear = false;
@@ -843,11 +992,31 @@ async function startRound(next: SandboxConfig): Promise<void> {
     }
   }
 
-  hud.toast('TAKE OFF', jetName + ' · ' + cfg.enemies + ' enemies · ' + weatherLabel(cfg) + ' weather');
+  hud.toast(
+    'TAKE OFF',
+    jetName +
+      ' · ' +
+      (cfg.enemies === 0 ? 'no enemies' : cfg.enemies + ' enemies') +
+      ' · ' +
+      (cfg.spawn === 'carrier' ? 'deck spawn' : 'Alpha') +
+      ' · ' +
+      weatherLabel(cfg) +
+      ' weather',
+  );
 }
 
 function restartRound(): void {
-  void startRound(menu.read());
+  void startRound(menu.read()).catch((e) => {
+    // Same recovery as the menu path: never leave a dead screen.
+    started = false;
+    paused = false;
+    menu.show();
+    const loadErr = $('loadErr');
+    if (loadErr) {
+      loadErr.textContent =
+        'Could not restart round: ' + (e instanceof Error ? e.message : String(e));
+    }
+  });
 }
 
 function togglePause(): void {
@@ -883,11 +1052,49 @@ function cycleCam(): void {
 }
 
 $('pauseBtn')?.addEventListener('click', togglePause);
+$('respawnBtn')?.addEventListener('click', skipSpectate);
 $('restartBtn')?.addEventListener('click', () => {
   if (started) restartRound();
 });
 $('restartBtn2')?.addEventListener('click', restartRound);
 $('resumeBtn')?.addEventListener('click', togglePause);
+// Pause-menu Setup: open the same SandboxMenu drawer over the paused
+// game. "Apply & Restart" restarts the round with the new setup (via
+// startRound — the carrier is reset, never rebuilt, so no double hull);
+// "Resume" (the menu's own button) closes the drawer and unpauses with
+// the old settings. The pre-flight and in-game menus share the one
+// component and the one config, so settings stay consistent.
+$('setupBtn')?.addEventListener('click', () => {
+  if (!started) return;
+  menu.applyLive(cfg);
+  menu.setMode(
+    'ingame',
+    (next) => {
+      menu.setMode('preflight');
+      void startRound(next).catch((e) => {
+        started = false;
+        paused = false;
+        menu.setMode('preflight');
+        menu.show();
+        const loadErr = $('loadErr');
+        if (loadErr) {
+          loadErr.textContent =
+            'Could not restart round: ' +
+            (e instanceof Error ? e.message : String(e));
+        }
+      });
+    },
+    () => {
+      // Resume with the old settings: close the drawer, unpause.
+      menu.setMode('preflight');
+      menu.hide();
+      $('pauseScreen')?.classList.add('hidden');
+      paused = false;
+    },
+  );
+  $('pauseScreen')?.classList.add('hidden');
+  menu.show();
+});
 $('camBtn')?.addEventListener('click', cycleCam);
 $('soundBtn')?.addEventListener('click', () => {
   soundOn = !soundOn;
@@ -953,17 +1160,44 @@ function updateCamera(dt: number): void {
   const p = player;
   const fwd = p.fwd();
   const up = p.up();
+  // Spectate (damage-model §5): while the player's wreck is falling
+  // (dying) or in the 2 s after impact, the camera stays with the
+  // wreck — chase math at a longer distance (40-45 m) so the fire and
+  // the tumble read clearly. C may cycle to free-orbit around the
+  // wreck (handled by cycleCam, which still works — camMode 2 orbits
+  // p.pos, i.e. the wreck).
+  if (spectating) {
+    const dist = 42;
+    const want = p.pos
+      .clone()
+      .addScaledVector(fwd, -dist)
+      .addScaledVector(up, dist * 0.34);
+    const floor = Math.max(
+      sampledGroundHeight(want.x, want.z) + 6,
+      p.pos.y + 2,
+    );
+    if (want.y < floor) want.y = floor;
+    camera.position.lerp(want, 1 - Math.pow(0.001, dt));
+    if (shakeT > 0) {
+      camera.position.x += (Math.random() - 0.5) * shakeT * 4;
+      camera.position.y += (Math.random() - 0.5) * shakeT * 4;
+    }
+    camera.lookAt(p.pos.clone().addScaledVector(fwd, 40));
+    return;
+  }
   if (camMode === 0) {
     const want = p.pos
       .clone()
       .addScaledVector(fwd, -camDist)
       .addScaledVector(up, camDist * 0.34);
     // v1.1: keep the sightline clear — clear not just the ground under the
-    // camera but the terrain between it and the jet.
+    // camera but the terrain between it and the jet. Sampled mesh height:
+    // the analytic heightAt() can sit ~13 m below the rendered surface
+    // at plateau edges, which clipped the camera into terrain.
     const mid = p.pos.clone().addScaledVector(fwd, -camDist * 0.5);
     const floor = Math.max(
-      groundHeight(want.x, want.z) + 6,
-      groundHeight(mid.x, mid.z) + 8,
+      sampledGroundHeight(want.x, want.z) + 6,
+      sampledGroundHeight(mid.x, mid.z) + 8,
       p.pos.y + 2,
     );
     if (want.y < floor) want.y = floor;
@@ -985,7 +1219,7 @@ function updateCamera(dt: number): void {
     const cz =
       p.pos.z + Math.cos(camOrbit.yaw) * Math.cos(camOrbit.pitch) * camDist;
     const cy = p.pos.y + Math.sin(camOrbit.pitch) * camDist;
-    camera.position.set(cx, Math.max(cy, groundHeight(cx, cz) + 3), cz);
+    camera.position.set(cx, Math.max(cy, sampledGroundHeight(cx, cz) + 3), cz);
     camera.lookAt(p.pos);
   }
 }
@@ -994,7 +1228,10 @@ function updateCamera(dt: number): void {
 function playerInput(dt: number): void {
   const p = player;
   if (!p) return;
-  if (!p.alive) {
+  if (!p.alive || p.dying) {
+    // Dead or dying: no control (damage-model §5 — while spectating
+    // the player cannot control anything). The controller's stepInternal
+    // also zeroes the controls, but the input merge must not fight it.
     p.pitchIn = 0;
     p.rollIn = 0;
     return;
@@ -1023,7 +1260,8 @@ function playerInput(dt: number): void {
     p.thrTarget = pc.throttle;
     hud.syncThrottle(pc.throttle);
   }
-  p.yawIn = 0;
+  // Rudder: Q/E through the PC provider (was hardcoded to 0).
+  p.yawIn = pc.yaw ?? 0;
 
   const ev = pcInput.consumeEvents();
   if (firing || ev.fireHeld) {
@@ -1035,10 +1273,31 @@ function playerInput(dt: number): void {
   if (ev.flarePressed) weapons.fireFlares(p);
   if (ev.gearPressed) $('gearBtn')?.dispatchEvent(new Event('click'));
   if (ev.hookPressed) $('hookBtn')?.dispatchEvent(new Event('click'));
+  // Flaps [ / ] step 10 deg, X toggles the airbrake — and the right
+  // panel sliders follow so the touch UI and the keyboard agree.
+  if (ev.flapsDownPressed) {
+    p.flaps = clamp(p.flaps + 10, 0, 30);
+    syncFlapSlider(p.flaps);
+  }
+  if (ev.flapsUpPressed) {
+    p.flaps = clamp(p.flaps - 10, 0, 30);
+    syncFlapSlider(p.flaps);
+  }
+  if (ev.airbrakePressed) {
+    p.airbrake = p.airbrake > 0.5 ? 0 : 1;
+    syncBrkSlider(p.airbrake);
+  }
   if (ev.cameraPressed) cycleCam();
   if (ev.cameraResetPressed) {
-    camOrbit = { yaw: 0, pitch: 0.32 };
-    camDist = 30;
+    // During spectate, R skips to an immediate respawn (damage-model
+    // §5) — the camera is following the wreck, so a reset is
+    // meaningless there.
+    if (spectating) {
+      skipSpectate();
+    } else {
+      camOrbit = { yaw: 0, pitch: 0.32 };
+      camDist = 30;
+    }
   }
   if (ev.pausePressed) togglePause();
   if (ev.bombPressed) $('bombBtn')?.dispatchEvent(new Event('click'));
@@ -1075,10 +1334,11 @@ function playerInput(dt: number): void {
   prevTrapped = p.trapped;
 
   // Missile lock (G6): hold the target inside the 15 deg cone, < 2500 m.
+  // A dying (falling) jet is untargetable — the lock breaks.
   let best: Aircraft | null = null;
   let bd = 2500;
   for (const e of enemies) {
-    if (!e.alive) continue;
+    if (!e.alive || e.dying) continue;
     const to = e.pos.clone().sub(p.pos);
     const d = to.length();
     if (d < bd && p.fwd().angleTo(to.normalize()) * R2D < 15) {
@@ -1108,12 +1368,41 @@ function handleDeaths(): void {
   for (const a of all) {
     const was = prevAlive.get(a) ?? true;
     if (was && !a.alive) {
-      vfx.spawnExplosion(a.pos.clone(), 1);
+      // Ground-impact explosion, scaled by the remaining fuel
+      // (damage-model §4/§6 step 5): a wreck with fuel left fireballs;
+      // without fuel it crumples. The position is the IMPACT position
+      // (finishCrash runs at ground contact), not where the jet was
+      // shot down.
+      vfx.spawnExplosion(a.pos.clone(), 1 + a.fuel);
       sfx('boom');
       vfx.scorchDecal(a.pos.clone());
+      // Debris scatter for a dying crash (5-10 Rapier bodies thrown
+      // outward at 10-30 m/s — the box fallback when no segment mesh).
+      if (a.crashedFromDying) {
+        for (let i = 0; i < 4; i++) {
+          const ang = Math.random() * Math.PI * 2;
+          const sp = 10 + Math.random() * 20;
+          vfx.spawnDebris(
+            null,
+            rapierWorld,
+            a.pos.clone(),
+            new THREE.Vector3(
+              Math.cos(ang) * sp,
+              5 + Math.random() * 10,
+              Math.sin(ang) * sp,
+            ),
+          );
+        }
+      }
       if (a.isPlayer) {
         hud.toast('YOU WENT DOWN', 'Respawning at the nearest runway.');
-        respawnTimer = setTimeout(respawnPlayer, 3000);
+        // A dying crash (shot down, fell, impacted) respawns 2 s after
+        // impact (the spectate already showed the fall); an instant
+        // crash (hard landing / terrain) keeps the 3 s window.
+        respawnTimer = setTimeout(
+          respawnPlayer,
+          a.crashedFromDying ? 2000 : 3000,
+        );
       } else {
         // v1.1: only PLAYER-caused kills score.
         if (a.lastHitBy && a.lastHitBy.isPlayer) addScore(100, 'kill');
@@ -1170,6 +1459,7 @@ function stepAi(ac: Aircraft, dt: number, turbAcc: THREE.Vector3 | null): void {
     const ctrl = ai.update(dt, player, carrier, elapsed);
     if (ai.fireGun) weapons.aiGunShot(ac, player, ai.skill.err);
     if (ai.fireMissile) weapons.launchMissile(ac, player);
+    if (ai.dropBomb) weapons.dropBomb(ac);
     ac.step(dt, ctrl, windVec, groundHeight, turbAcc);
   } else {
     ac.step(dt, windVec, turbAcc);
@@ -1209,6 +1499,12 @@ function animate(): void {
     // this step; then Rapier integrates, contacts are dispatched into
     // notifyContact(), and the aero steps read fresh body state.
     carrier.update(dt);
+    // Rapier's step length MUST match this substep's dt. world.timestep
+    // was never set, so Rapier integrated a fixed 1/60 s while the
+    // controller's substep dt could be 0.05 s — a 3x velocity/position
+    // desync at low frame rates (the spawn-crash candidate: the
+    // controller's velocity grew 3x faster than Rapier moved the body).
+    rapierWorld.timestep = dt;
     rapierWorld.step(eventQueue);
     drainCollisionEvents();
     if (player) player.step(dt, windVec, turbAcc);
@@ -1224,10 +1520,64 @@ function animate(): void {
     vfx.update(dt);
     handleDeaths();
   }
+  // Spectate detection (damage-model §5): when the player starts the
+  // dying fall, the camera follows the wreck until impact + 2 s (or
+  // until the player presses R / the Respawn button). The banner shows
+  // the killer when lastHitBy is known.
+  if (player) {
+    if (player.dying && !prevPlayerDying) {
+      spectating = true;
+      const killer =
+        player.lastHitBy?.isPlayer === false ? 'an enemy' : undefined;
+      setSpectateBanner(true, player.dyingReason ?? undefined, killer);
+    }
+    prevPlayerDying = player.dying;
+    // If the player respawned (alive again), spectate is over.
+    if (player.alive && !player.dying && spectating && !respawnTimer) {
+      spectating = false;
+      setSpectateBanner(false);
+    }
+  }
+  // Fire / smoke visuals (damage-model §6 step 6): getDamageFx() was
+  // dead code — it is now called every frame for the player and every
+  // enemy/traffic jet, and drives CrashVFXManager.spawnSmoke. Orange
+  // flame + black smoke for a fuel fire, grey smoke for engine damage
+  // / light damage, white for light damage. A plume every 0.5 s per
+  // damaged aircraft keeps a continuous trail (plume life 6 s).
+  smokeT += rawDt;
+  if (smokeT >= 0.5) {
+    smokeT = 0;
+    const allFx: Aircraft[] = [
+      ...(player ? [player] : []),
+      ...enemies,
+      ...traffic,
+    ];
+    for (const a of allFx) {
+      if (!a.alive) continue;
+      const fx = a.getDamageFx();
+      if (fx.fire) {
+        // Fuel fire: orange flame + black smoke; engine fire: orange
+        // flame; low-hp fire (no state machine): orange flame.
+        const colour =
+          fx.fireKind === 'fuel' ? 0x1a1a1a : fx.fireKind === 'engine' ? 0xff7722 : 0xff7722;
+        vfx.spawnSmoke(a.pos.clone(), colour);
+        if (fx.fireKind === 'fuel') {
+          vfx.spawnSmoke(a.pos.clone(), 0xff7722);
+        }
+      } else if (fx.smoke) {
+        vfx.spawnSmoke(a.pos.clone(), 0x888888);
+      }
+    }
+  }
   worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
   worldGen.update(rawDt, windVec);
-  // Survival score: +1 per second alive.
-  if (player?.alive && Math.floor(elapsed) !== Math.floor(prevElapsed)) {
+  // Survival score: +1 per second alive AND AIRBORNE (research §6 — the
+  // old version paid +1/s while the jet sat stuck on the runway).
+  if (
+    player?.alive &&
+    !player.grounded &&
+    Math.floor(elapsed) !== Math.floor(prevElapsed)
+  ) {
     score += 1;
   }
   if (shakeT > 0) shakeT = Math.max(0, shakeT - rawDt);
@@ -1236,12 +1586,22 @@ function animate(): void {
   if (hudT > 0.1) {
     hudT = 0;
     if (player) {
+      // CCIP (bomb impact point) is computed before the HUD update so
+      // the below-min-release-alt flag feeds the warn priority.
+      const ccip = weapons.computeCcip(
+        player,
+        groundHeight(player.pos.x, player.pos.z),
+        camera,
+      );
+      if (ccip) hud.showCcip(ccip.x, ccip.y, ccip.belowMinAlt);
+      else hud.hideCcip();
       hud.update(player, {
         score,
         kills,
         traps,
         elapsed,
         lockTarget: player.lockTarget,
+        belowMinReleaseAlt: ccip?.belowMinAlt ?? false,
       });
       const pipper = weapons.computeLeadPipper(
         player,
@@ -1292,6 +1652,7 @@ function updateDebugPanel(): void {
     `PANDORA ${VERSION_FOOTER} ?debug — FPS ${fpsEMA.toFixed(0)} · sim dt ${lastDt.toFixed(3)}s · rapier: on`,
     ...modelLines,
     `origin shift: ${worldGen.originShift.x.toFixed(0)}, ${worldGen.originShift.z.toFixed(0)} · gamepad: ${pcInput.gamepadName || 'none'} · tilt: ${tiltInput.isEnabled ? 'on' : 'off'}`,
+    `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · spawn ${cfg.spawn} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
     debugLog.length
       ? '--- warnings ---\n' + debugLog.slice(-8).join('\n')
       : '(no warnings yet)',

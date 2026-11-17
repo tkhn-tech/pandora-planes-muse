@@ -1,12 +1,14 @@
 // AircraftSpec — per-aircraft constants for Pandora Planes (Vite port).
 // Values are the v2 HTML template's SPECS
 // (pandora-template.html ~473–495), sanity-checked against real figures
-// 16 Nov 2026. Changes vs v1.1, carried over verbatim:
-//   F-35A 18200 -> 14500 kg (real empty 13,290 kg; at 14,500 kg T/W is
-//   1.32 and a vector-90 hover needs ~74% throttle, as it should).
-//   F-22 22000 -> 19700 kg (the task's figure; real empty 19,700 kg).
-//   F-15E 22000 -> 14300 kg (real empty 14,379 kg).
-//   Stalls: F-35A 60, F-22 65, F-15E 62 m/s (F-18 62, MiG-29 60, Su-34 65).
+// 16 Nov 2026, then corrected to COMBAT MASSES 17 Nov 2026 per
+// Docs/flight-behaviour-per-model.md §7/§8 (the sim had mixed empty and
+// combat masses — F-22 flew at T/W 1.61, F-15E at 1.84, while the F-18
+// flew at 0.99). Su-34 thrustMax was a hard bug: 166 kN is ~63% of the
+// real AL-31FM1 afterburner total (264 kN) and below even the dry total.
+// Stall speeds and rotation gates are re-derived at combat mass; hover
+// for the F-35A at combat mass is ~94% throttle, which is the honest
+// F-35B number — do not tune it down.
 //
 // `mass` is the SIM flying mass (the v2 operating mass — the number the
 // lift equation must beat). `fuelMass` is the fuel load carried inside
@@ -27,6 +29,41 @@ export type ModelKey =
   | 'su34'
   | 'ford'
   | 'heli';
+
+/** Per-model lift curve (BET report §2 + per-model supplement §1–§6).
+ *  Piecewise-linear through three anchors, all in degrees / CL:
+ *    (0°, cl0) → (linearEndAoA, linearEndCL) → (peakAoA, peak)
+ *  then a linear post-stall fall at `postSlope` per degree, floored at
+ *  `floor`. The section stall is at linearEndAoA; the vortex-lift
+ *  region (linearEndAoA → peakAoA) is what keeps the Hornet / F-22
+ *  flying far past the section stall, and the F-15E's steep postSlope
+ *  (0.06/deg) is its sharp stall break — no single shared curve can
+ *  reproduce both, so each model carries its own. `cdSep` is the
+ *  separation-drag coefficient: CD_sep = cdSep·max(0,(α−20)/15)². */
+export interface ClCurve {
+  /** AoA (deg) where the linear region ends (wing-section stall). */
+  linearEndAoA: number;
+  /** CL at the end of the linear region. */
+  linearEndCL: number;
+  /** Peak CL. */
+  peak: number;
+  /** AoA (deg) of the peak CL. */
+  peakAoA: number;
+  /** CL floor at very high AoA. */
+  floor: number;
+  /** Post-stall CL fall, per degree past the peak. */
+  postSlope: number;
+  /** Separation-drag coefficient (see above). */
+  cdSep: number;
+}
+
+/** Airspeed roll-authority cap (MiG-29 supplement §5): the current
+ *  q-scaling gives MORE roll authority at more speed, but the Fulcrum's
+ *  weak aileron actuators give LESS at high speed / low altitude and
+ *  near the stall. Breakpoints are [airspeed m/s, max roll rate deg/s],
+ *  linearly interpolated, clamped at the ends. Absent = no cap (the
+ *  spec.rollDeg is the only limit). */
+export type RollCapSchedule = Array<[number, number]>;
 
 /** Rotary-wing parameters (collective / cyclic / autorotation). Only
  *  used when archetype is 'rotary'. */
@@ -62,8 +99,28 @@ export interface AircraftSpec {
   length: number;
   /** Max thrust, N. */
   thrustMax: number;
-  /** Stall speed, m/s (0 for the heli — it has no wing stall). */
+  /** Stall speed, m/s (0 for the heli — it has no wing stall). At combat
+   *  mass (per-model supplement §7). */
   stallSpeed: number;
+  /** Induced-drag factor k = 1/(pi*e*AR), per model (supplement §7).
+   *  The curve solver uses this instead of a shared constant. */
+  inducedK: number;
+  /** Oswald efficiency factor e (supplement §7). */
+  e: number;
+  /** Rotation speed, kt, at combat mass (supplement §7; main report §3).
+   *  The HUD shows a ROTATE cue at this speed. 0 for the heli. */
+  rotateSpeedKt: number;
+  /** Thrust-vectoring nozzle deflection, deg (F-22 TVC ±20 deg pitch
+   *  only). Absent = no vectoring. */
+  tvcDeg?: number;
+  /** Effective lifting area, m^2 (MiG-29: 45 — the blended fuselage +
+   *  LERX generate ~40% of total lift, so lift uses 45 m^2 while drag
+   *  uses wingArea 38 m^2). Absent = wingArea. */
+  wingAreaEffective?: number;
+  /** Per-model lift curve (BET report §2 + supplement §1–§6). */
+  clCurve: ClCurve;
+  /** Airspeed roll-authority cap (MiG-29 only — supplement §5). */
+  rollCapSchedule?: RollCapSchedule;
   /** Structural G limit. Over-G damage starts at maxG + 1.5 (v2). */
   maxG: number;
   /** Tailhook fitted (carrier traps). */
@@ -105,7 +162,19 @@ export const SPECS: Record<string, AircraftSpec> = {
     span: 13.62,
     length: 18.79,
     thrustMax: 196000,
-    stallSpeed: 62,
+    stallSpeed: 66,
+    inducedK: 0.1,
+    e: 0.8,
+    rotateSpeedKt: 126,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.6,
+      peakAoA: 35,
+      floor: 0.8,
+      postSlope: 0.05,
+      cdSep: 0.35,
+    },
     maxG: 9,
     tailhook: true,
     vtol: false,
@@ -124,20 +193,32 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'F-35A VTOL',
     short: 'F-35A',
     archetype: 'vtol',
-    mass: 14500,
+    mass: 18270,
     fuelMass: 8278,
     wingArea: 42.7,
     span: 10.7,
     length: 15.69,
     thrustMax: 191000,
-    stallSpeed: 60,
+    stallSpeed: 68,
+    inducedK: 0.149,
+    e: 0.8,
+    rotateSpeedKt: 150,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.5,
+      peakAoA: 30,
+      floor: 0.9,
+      postSlope: 0.02,
+      cdSep: 0.3,
+    },
     maxG: 9,
     tailhook: true,
     vtol: true,
     maxVectorDeg: 90,
     tint: 0x6b7a86,
     modelKey: 'f35a',
-    turn: 1.05,
+    turn: 0.9,
     rollDeg: 160,
     pitch: 1.05,
     carrier: true,
@@ -149,21 +230,34 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'F-22 Raptor',
     short: 'F-22',
     archetype: 'fixed-wing',
-    mass: 19700,
+    mass: 24883,
     fuelMass: 8200,
     wingArea: 78.0,
     span: 13.56,
     length: 19.0,
     thrustMax: 312000,
-    stallSpeed: 65,
+    stallSpeed: 54,
+    inducedK: 0.159,
+    e: 0.85,
+    rotateSpeedKt: 140,
+    tvcDeg: 20,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.75,
+      peakAoA: 35,
+      floor: 1.0,
+      postSlope: 0.015,
+      cdSep: 0.3,
+    },
     maxG: 9.5,
     tailhook: false,
     vtol: false,
     maxVectorDeg: 0,
     tint: 0x7d8a99,
     modelKey: 'f22',
-    turn: 1.15,
-    rollDeg: 180,
+    turn: 1.05,
+    rollDeg: 200,
     pitch: 1.15,
     carrier: false,
     gunRpm: 6000,
@@ -174,21 +268,33 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'F-15E Strike Eagle',
     short: 'F-15E',
     archetype: 'fixed-wing',
-    mass: 14300,
+    mass: 20400,
     fuelMass: 6103,
     wingArea: 56.5,
     span: 13.05,
     length: 19.41,
     thrustMax: 258000,
     stallSpeed: 62,
+    inducedK: 0.132,
+    e: 0.8,
+    rotateSpeedKt: 150,
+    clCurve: {
+      linearEndAoA: 14,
+      linearEndCL: 1.3,
+      peak: 1.36,
+      peakAoA: 25,
+      floor: 0.7,
+      postSlope: 0.06,
+      cdSep: 0.4,
+    },
     maxG: 9,
     tailhook: false,
     vtol: false,
     maxVectorDeg: 0,
     tint: 0x9aa0a3,
     modelKey: 'f15e',
-    turn: 0.95,
-    rollDeg: 140,
+    turn: 1.0,
+    rollDeg: 180,
     pitch: 0.95,
     carrier: false,
     gunRpm: 6000,
@@ -199,20 +305,43 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'MiG-29 Fulcrum',
     short: 'MiG-29',
     archetype: 'fixed-wing',
-    mass: 15000,
+    mass: 15300,
     fuelMass: 4300,
     wingArea: 38.0,
+    wingAreaEffective: 45,
     span: 11.36,
     length: 17.32,
-    thrustMax: 162000,
-    stallSpeed: 60,
+    thrustMax: 163000,
+    stallSpeed: 59,
+    inducedK: 0.11,
+    e: 0.85,
+    rotateSpeedKt: 130,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.58,
+      peakAoA: 30,
+      floor: 0.9,
+      postSlope: 0.02,
+      cdSep: 0.3,
+    },
+    // MiG-29 roll authority is speed-scheduled (supplement §5): 160 deg/s
+    // max, but ~20 deg/s just above the stall (~145 kt), 105 deg/s at
+    // Mach 0.4, <60 deg/s at high speed / low altitude, 40 deg/s
+    // supersonic. The q-scaling alone gets the top end backwards.
+    rollCapSchedule: [
+      [71, 20],
+      [137, 105],
+      [200, 60],
+      [340, 40],
+    ],
     maxG: 9,
     tailhook: false,
     vtol: false,
     maxVectorDeg: 0,
     tint: 0x7a7f72,
     modelKey: 'mig29',
-    turn: 1.0,
+    turn: 1.1,
     rollDeg: 155,
     pitch: 1.0,
     carrier: false,
@@ -224,13 +353,25 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'Su-34 Fullback',
     short: 'Su-34',
     archetype: 'fixed-wing',
-    mass: 22000,
+    mass: 30000,
     fuelMass: 12100,
     wingArea: 62.0,
     span: 14.7,
     length: 23.3,
-    thrustMax: 166000,
-    stallSpeed: 65,
+    thrustMax: 264000,
+    stallSpeed: 71,
+    inducedK: 0.114,
+    e: 0.8,
+    rotateSpeedKt: 140,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.53,
+      peakAoA: 30,
+      floor: 0.8,
+      postSlope: 0.04,
+      cdSep: 0.35,
+    },
     maxG: 7,
     tailhook: false,
     vtol: false,
@@ -242,7 +383,7 @@ export const SPECS: Record<string, AircraftSpec> = {
     pitch: 0.85,
     carrier: false,
     gunRpm: 1800,
-    bombs: false,
+    bombs: true,
   },
   heli: {
     key: 'heli',
@@ -256,6 +397,18 @@ export const SPECS: Record<string, AircraftSpec> = {
     length: 19.8,
     thrustMax: 110000,
     stallSpeed: 0,
+    inducedK: 0.1,
+    e: 0.8,
+    rotateSpeedKt: 0,
+    clCurve: {
+      linearEndAoA: 15,
+      linearEndCL: 1.35,
+      peak: 1.5,
+      peakAoA: 15,
+      floor: 0,
+      postSlope: 0.045,
+      cdSep: 0,
+    },
     maxG: 3,
     tailhook: false,
     vtol: false,

@@ -26,6 +26,7 @@ import {
   fbm,
   createV2Rand,
   generateHeights,
+  RUNWAY_TABLE,
   type TerrainChunkRequest,
 } from './PandoraTerrainWorker';
 import { RUNWAYS, type Runway } from './RunwayPlacer';
@@ -65,6 +66,8 @@ export class PandoraWorldGenerator {
   private terrainMesh: THREE.Mesh | null = null;
   private terrainBody: RAPIER.RigidBody | null = null;
   private terrainCollider: RAPIER.Collider | null = null;
+  /** Flat box colliders, one per runway (see buildHeightfieldCollider). */
+  private runwayColliders: RAPIER.Collider[] = [];
   private heights: Float32Array | null = null;
   /** Samples per side of the terrain grid (151 = 150 segments + 1). */
   readonly resolution = TERRAIN_SEGMENTS + 1;
@@ -227,11 +230,52 @@ export class PandoraWorldGenerator {
       hfHeights,
       new RAPIER.Vector3(WORLD_SIZE, 1, WORLD_SIZE),
     )
-      .setFriction(0.9)
+      // Friction 0 (was 0.9): Rapier Coulomb friction on the terrain
+      // averaged with the aircraft's 0.6 to ~0.75 and ate ~149 kN of the
+      // F-18's 196 kN thrust — the takeoff killer (issue 1). The
+      // controller owns all ground physics (rolling resistance, brakes,
+      // steering, traps, deck transfer), so no collider in the game
+      // should add friction. Min combine rule on both sides.
+      .setFriction(0)
+      .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min)
       .setRestitution(0)
       // Collision events feed the integrator's notifyContact() dispatch.
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     this.terrainCollider = this.world.createCollider(desc, this.terrainBody);
+
+    // ---- runway boxes (flat, single-face ground for the gear) ----------
+    // The heightfield is piecewise-linear over a 40 m grid, and a gear
+    // ski crossing a cell boundary can make Rapier's contact solver
+    // explode: probed on the F-35A flaps-0 roll, one world.step at
+    // x=-1326.8 (nose ski crossing the -1320 cell boundary at 38 m/s)
+    // changed the body velocity by 35 m/s — (38.1,-0.2) to (4.6,+9.8) —
+    // throwing the jet 5 m up and killing 33 m/s of forward speed, so it
+    // hung in a deep stall and never lifted off. The gear skis spread the
+    // contact but cannot span a 40 m cell, so the boundary is still there.
+    // A runway is a flat man-made surface, so it gets a flat cuboid
+    // collider instead: one clean face, no triangles, no boundary, and
+    // the contact manifold is stable at any speed. The box covers the
+    // full strip plus the 100 m overrun each end (the same flat area
+    // runwayBlend guarantees) and 2 m wider than the strip. Its top sits
+    // 5 cm above the heightfield (elev + 0.05) so the gear touches ONLY
+    // the box — coplanar would double-contact the heightfield and the
+    // explosion would be back. The jet sits 5 cm higher on the runway;
+    // the controller's ground checks (grounded < 2.4 m) are unaffected.
+    // The box is invisible (collider only, no mesh). Off the strip the
+    // gear falls back to the heightfield, as before.
+    for (const r of RUNWAY_TABLE) {
+      const along = r.len / 2 + 100;
+      const across = r.width / 2 + 2;
+      const hdg = (r.hdg * Math.PI) / 180;
+      const box = RAPIER.ColliderDesc.cuboid(across, 0.5, along)
+        .setTranslation(r.x, r.elev - 0.45, r.z)
+        .setRotation({ x: 0, y: Math.sin(hdg / 2), z: 0, w: Math.cos(hdg / 2) })
+        .setFriction(0)
+        .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min)
+        .setRestitution(0)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+      this.runwayColliders.push(this.world.createCollider(box, this.terrainBody));
+    }
   }
 
   // ---- floating islands (v2 positions) ------------------------------------
@@ -377,6 +421,37 @@ export class PandoraWorldGenerator {
    */
   groundHeight(x: number, z: number): number {
     return heightAt(x + this._originShift.x, z + this._originShift.z);
+  }
+
+  /** Sampled terrain height: bilinear interpolation over the 151x151
+   *  heights grid (40 m spacing, x/z from -3000). This is the surface
+   *  the visual mesh and the Rapier heightfield actually render/collide
+   *  with — the analytic heightAt() can deviate from it by up to ~13 m
+   *  at plateau edges, which is what the chase camera must be clamped
+   *  above (the old analytic clamp let the camera clip into terrain).
+   *  Falls back to the analytic heightAt() before heights load. */
+  sampledHeightAt(x: number, z: number): number {
+    const h = this.heights;
+    if (!h) return this.groundHeight(x, z);
+    const ox = x + this._originShift.x;
+    const oz = z + this._originShift.z;
+    const res = this.resolution;
+    const gx = (ox + WORLD_SIZE / 2) / 40;
+    const gz = (oz + WORLD_SIZE / 2) / 40;
+    const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
+    const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
+    const fx = Math.max(0, Math.min(1, gx - ix));
+    const fz = Math.max(0, Math.min(1, gz - iz));
+    const h00 = h[iz * res + ix];
+    const h10 = h[iz * res + ix + 1];
+    const h01 = h[(iz + 1) * res + ix];
+    const h11 = h[(iz + 1) * res + ix + 1];
+    return (
+      h00 * (1 - fx) * (1 - fz) +
+      h10 * fx * (1 - fz) +
+      h01 * (1 - fx) * fz +
+      h11 * fx * fz
+    );
   }
 
   /**
@@ -563,6 +638,11 @@ export class PandoraWorldGenerator {
   /** Heightfield collider handle for the integrator's contact registry. */
   get terrainColliderHandle(): number | null {
     return this.terrainCollider ? this.terrainCollider.handle : null;
+  }
+  /** Runway box collider handles — register as 'terrain' alongside the
+   *  heightfield so ground contact on a runway is recognised. */
+  get runwayColliderHandles(): number[] {
+    return this.runwayColliders.map((c) => c.handle);
   }
   get terrainBodyRef(): RAPIER.RigidBody | null {
     return this.terrainBody;

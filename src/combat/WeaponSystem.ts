@@ -14,7 +14,10 @@
 
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { Aircraft } from '../physics/FlightPhysicsController';
+import type {
+  Aircraft,
+  DamageZone,
+} from '../physics/FlightPhysicsController';
 import { CrashVFXManager } from './CrashVFXManager';
 
 export const GUN_RANGE = 1200;
@@ -35,6 +38,60 @@ export const BOMB_BLAST_RADIUS = 70;
 export const BOMB_MAX_DAMAGE = 60;
 export const BOMB_POD_RADIUS = 45;
 export const BOMB_POD_DAMAGE = 40;
+/** Missile fragment-damage radius: the proximity fuse fires within
+ *  8 m, but fragments reach further — zones within 15 m take damage
+ *  with falloff (damage-model §2). */
+export const MISSILE_DAMAGE_RADIUS = 15;
+
+/** Zone anchor points on an airframe, in body coordinates (+Z = nose,
+ *  +X = right, +Y = up). Used to map a hit point to the nearest zone
+ *  (gun hits) and to apply proximity damage with falloff (missile /
+ *  bomb). The fuel tank sits in the centre fuselage, slightly forward;
+ *  the engines are aft; the tail and fin are at the rear. */
+function zoneAnchors(
+  target: Aircraft,
+): { zone: DamageZone; local: THREE.Vector3 }[] {
+  const S = target.spec;
+  const L = S.length;
+  const span = S.span;
+  const anchors: { zone: DamageZone; local: THREE.Vector3 }[] = [
+    { zone: 'fuselage', local: new THREE.Vector3(0, 0, 0) },
+    { zone: 'wingL', local: new THREE.Vector3(-span / 4, 0, 0) },
+    { zone: 'wingR', local: new THREE.Vector3(span / 4, 0, 0) },
+    { zone: 'tail', local: new THREE.Vector3(0, 0, -L / 2) },
+    { zone: 'fin', local: new THREE.Vector3(0, 1.5, -L / 2) },
+    { zone: 'fuel', local: new THREE.Vector3(0, 0, L / 6) },
+  ];
+  // Twin-engine jets have engineL/engineR; the F-35A is single-engine.
+  if (S.key === 'f35a') {
+    anchors.push({ zone: 'engine', local: new THREE.Vector3(0, 0, -L / 4) });
+  } else {
+    anchors.push({ zone: 'engineL', local: new THREE.Vector3(-1.2, 0, -L / 4) });
+    anchors.push({ zone: 'engineR', local: new THREE.Vector3(1.2, 0, -L / 4) });
+  }
+  return anchors;
+}
+
+/** Map a world-space hit point to the nearest zone on the target
+ *  (damage-model §2 — the hit resolver stops picking a random zone).
+ *  The point is converted to the target's body frame and the nearest
+ *  zone anchor wins. */
+function zoneForHitPoint(target: Aircraft, hitPoint: THREE.Vector3): DamageZone {
+  const local = hitPoint
+    .clone()
+    .sub(target.pos)
+    .applyQuaternion(target.quat.clone().invert());
+  let best: DamageZone = 'fuselage';
+  let bestD = Infinity;
+  for (const a of zoneAnchors(target)) {
+    const d = local.distanceTo(a.local);
+    if (d < bestD) {
+      bestD = d;
+      best = a.zone;
+    }
+  }
+  return best;
+}
 
 export interface WeaponHooks {
   sfx?: (name: 'gun' | 'gunFar' | 'boom' | 'msl' | 'flare' | 'hit') => void;
@@ -138,11 +195,60 @@ export class WeaponSystem {
 
   // ---- gun (hitscan) ------------------------------------------------
 
+  /** Proximity damage (damage-model §2): a missile/bomb detonation
+   *  applies damage to ALL zones within `radius` of the detonation
+   *  point, with linear falloff, plus the ignition rolls — a
+   *  detonation within 3 m of the fuel tank has a 25% chance of an
+   *  immediate fuel explosion (instant kill, big fireball); within
+   *  range of an engine, a 15% engine-fire chance; a detonation on a
+   *  wing has a 30% spar-break chance (wing separation). This replaces
+   *  the old "always fuselage" proximity hit. */
+  applyProximityDamage(
+    target: Aircraft,
+    detonationPos: THREE.Vector3,
+    baseDamage: number,
+    radius: number,
+    byPlayer: boolean,
+  ): void {
+    if (!target.alive || target.dying) return;
+    for (const a of zoneAnchors(target)) {
+      // Anchor in world coordinates.
+      const world = a.local.clone().applyQuaternion(target.quat).add(target.pos);
+      const d = detonationPos.distanceTo(world);
+      if (d >= radius) continue;
+      const dmg = baseDamage * (1 - d / radius);
+      if (dmg <= 0) continue;
+      target.applyDamage(dmg, a.zone, byPlayer);
+      if (!target.alive || target.dying) return;
+      // Ignition / spar-break rolls, per zone.
+      if (a.zone === 'fuel' && d <= 3 && Math.random() < 0.25) {
+        // Immediate fuel explosion: the jet is destroyed now (big
+        // fireball), and it falls as a burning wreck.
+        this.hooks.onExplosion?.(target.pos.clone(), 2.5);
+        target.startDying('fuel explosion');
+        return;
+      }
+      if (
+        (a.zone === 'engine' || a.zone === 'engineL' || a.zone === 'engineR') &&
+        Math.random() < 0.15
+      ) {
+        target.startFire('engine', a.zone);
+      }
+      if ((a.zone === 'wingL' || a.zone === 'wingR') && d <= 5 && Math.random() < 0.3) {
+        // Spar break: the wing separates (damage-model §2, §6 step 4).
+        target.applyDamage(60, a.zone, byPlayer);
+      }
+    }
+  }
+
   /** Fire one hitscan round at a single target (or dry-fire downrange when
    *  target is null). Caller enforces shooter.gunCd; this method sets it to
    *  GUN_COOLDOWN (0.075 s, 800 rpm). Damage goes through
    *  target.applyDamage(amount, zone, byPlayer) with byPlayer =
-   *  shooter.isPlayer. */
+   *  shooter.isPlayer. The zone comes from the hit point
+   *  (zoneForHitPoint), not a random roll — a gun hit on the wing
+   *  damages the wing, on the engine damages the engine
+   *  (damage-model §2). */
   fireGun(shooter: Aircraft, target: Aircraft | null, dt: number): void {
     void dt;
     if (!shooter.alive || shooter.gunCd > 0) return;
@@ -153,7 +259,7 @@ export class WeaponSystem {
     const dir = shooter.fwd();
     let end: THREE.Vector3;
     let hit: Aircraft | null = null;
-    if (target && target.alive && target !== shooter) {
+    if (target && target.alive && !target.dying && target !== shooter) {
       const to = _v1.copy(target.pos).sub(from);
       const along = to.dot(dir);
       if (along > 0 && along < GUN_RANGE) {
@@ -175,8 +281,7 @@ export class WeaponSystem {
     }
     this.showTracer(from, end);
     if (hit) {
-      const r = Math.random();
-      const zone = r < 0.25 ? 'wing' : r < 0.55 ? 'engine' : 'fuselage';
+      const zone = zoneForHitPoint(hit, end);
       hit.applyDamage(GUN_DAMAGE, zone, shooter.isPlayer);
       if (shooter.isPlayer) this.hooks.sfx?.('hit');
     }
@@ -198,7 +303,7 @@ export class WeaponSystem {
     let best: Aircraft | null = null;
     let bd = GUN_RANGE;
     for (const t of targets) {
-      if (!t.alive || t === shooter) continue;
+      if (!t.alive || t.dying || t === shooter) continue;
       const to = _v1.copy(t.pos).sub(from);
       const along = to.dot(dir);
       if (along < 0 || along > GUN_RANGE) continue;
@@ -219,7 +324,7 @@ export class WeaponSystem {
   /** AI gun pass with a skill error cone (template aiGunShot): aim at the
    *  lead point (target pos + vel * range/900), perturb by `err`, fire. */
   aiGunShot(shooter: Aircraft, target: Aircraft, err: number): void {
-    if (!shooter.alive || shooter.gunCd > 0 || !target.alive) return;
+    if (!shooter.alive || shooter.dying || shooter.gunCd > 0 || !target.alive || target.dying) return;
     const from = shooter.pos.clone().addScaledVector(shooter.fwd(), 12);
     const range = shooter.pos.distanceTo(target.pos);
     const lead = target.pos
@@ -248,8 +353,7 @@ export class WeaponSystem {
     const end = from.clone().addScaledVector(dir, best ? bd : GUN_RANGE);
     this.showTracer(from, end);
     if (best) {
-      const r = Math.random();
-      const zone = r < 0.25 ? 'wing' : r < 0.55 ? 'engine' : 'fuselage';
+      const zone = zoneForHitPoint(best, end);
       best.applyDamage(GUN_DAMAGE, zone, shooter.isPlayer);
       if (shooter.isPlayer) this.hooks.sfx?.('hit');
     }
@@ -319,6 +423,48 @@ export class WeaponSystem {
     };
   }
 
+  /** CCIP (continuously computed impact point) for bombs: project where
+   *  a bomb released NOW would hit, using the same initial velocity as
+   *  dropBomb (shooter vel + fwd * 8) and a ballistic fall (g = 9.81).
+   *  Also reports whether the jet is below the minimum-release
+   *  altitude for the current dive: the 4 g level pull-out radius is
+   *  R = V^2 / (g (n-1)), n = 4, and the altitude lost in the pull-out
+   *  is dH = R (1 - cos theta), theta = dive angle. If the current AGL
+   *  is below dH there is no room to pull out — the pipper turns red
+   *  and the HUD shows PULL UP. Returns null when the jet has no
+   *  bombs, is on the ground, or the impact point is behind the
+   *  camera. */
+  computeCcip(
+    shooter: Aircraft,
+    groundHeight: number,
+    camera: THREE.Camera,
+  ): { x: number; y: number; belowMinAlt: boolean } | null {
+    if (!shooter.alive || !shooter.spec.bombs || shooter.bombs <= 0) return null;
+    if (shooter.grounded) return null;
+    const vel0 = shooter.vel.clone().addScaledVector(shooter.fwd(), 8);
+    const h = shooter.pos.y - groundHeight;
+    if (h <= 0) return null;
+    // Ballistic time to the ground: h + vy*t - (g/2) t^2 = 0.
+    const g = 9.81;
+    const vy = vel0.y;
+    const t = (vy + Math.sqrt(vy * vy + 2 * g * h)) / g;
+    const impact = shooter.pos.clone().addScaledVector(vel0, t);
+    impact.y = groundHeight;
+    const v = impact.clone().project(camera);
+    if (v.z >= 1) return null;
+    // Min-release altitude for the current dive (4 g level pull-out);
+    // zero when not diving (climbing or level needs no pull-out).
+    const V = Math.max(shooter.vel.length(), 1);
+    const theta = shooter.vsi < 0 ? Math.asin(Math.min(1, -shooter.vsi / V)) : 0;
+    const R = (V * V) / (g * (4 - 1));
+    const dH = R * (1 - Math.cos(theta));
+    return {
+      x: (v.x * 0.5 + 0.5) * window.innerWidth,
+      y: (-v.y * 0.5 + 0.5) * window.innerHeight,
+      belowMinAlt: h < dH,
+    };
+  }
+
   // ---- missiles ------------------------------------------------------
 
   /** Launch a missile at `target`: Rapier dynamic body (gravity scale 0),
@@ -327,7 +473,7 @@ export class WeaponSystem {
    *  (15 deg cone, < 2500 m, 1.2 s) — main.ts tracks the lock and only
    *  calls this when lockT > LOCK_TIME. Consumes one shooter.msl. */
   launchMissile(shooter: Aircraft, target: Aircraft): void {
-    if (!shooter.alive || shooter.msl <= 0 || !target.alive) return;
+    if (!shooter.alive || shooter.dying || shooter.msl <= 0 || !target.alive || target.dying) return;
     shooter.msl--;
     const start = shooter.pos
       .clone()
@@ -482,6 +628,11 @@ export class WeaponSystem {
       const pos = m.body.translation();
       const meshPos = _v1.set(pos.x, pos.y, pos.z);
       if (!dead && m.target && m.target.alive) {
+        // A dying target is untargetable — the missile goes dumb
+        // (flies straight, no PN) instead of chasing a wreck.
+        if (m.target.dying) m.target = null;
+      }
+      if (!dead && m.target && m.target.alive) {
         const speed = MISSILE_SPEED;
         const tGo = Math.max(
           0.1,
@@ -503,7 +654,15 @@ export class WeaponSystem {
           m.target = null;
         }
         if (m.target && meshPos.distanceTo(m.target.pos) < MISSILE_PROXIMITY) {
-          m.target.applyDamage(MISSILE_DAMAGE, 'fuselage', m.shooter.isPlayer);
+          // Proximity detonation (damage-model §2): damage to ALL zones
+          // with falloff + ignition rolls — not a flat fuselage hit.
+          this.applyProximityDamage(
+            m.target,
+            meshPos.clone(),
+            MISSILE_DAMAGE,
+            MISSILE_DAMAGE_RADIUS,
+            m.shooter.isPlayer,
+          );
           this.hooks.onExplosion?.(m.target.pos.clone(), 1.4);
           dead = true;
         }
@@ -551,9 +710,13 @@ export class WeaponSystem {
           if (!e.alive) continue;
           const d = e.pos.distanceTo(blastPos);
           if (d < BOMB_BLAST_RADIUS) {
-            e.applyDamage(
-              BOMB_MAX_DAMAGE * (1 - d / BOMB_BLAST_RADIUS),
-              'fuselage',
+            // Bomb blast (damage-model §2): damage to ALL zones with
+            // falloff + ignition rolls — not a flat fuselage hit.
+            this.applyProximityDamage(
+              e,
+              blastPos,
+              BOMB_MAX_DAMAGE,
+              BOMB_BLAST_RADIUS,
               b.shooter.isPlayer,
             );
           }

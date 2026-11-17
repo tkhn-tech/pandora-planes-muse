@@ -92,6 +92,30 @@ export class DamageableEntity {
     return this.lostZones.has(zone);
   }
 
+  /** War Thunder "severe damage" (damage-model §1) — the kill-credit
+   *  threshold: destruction of all engines (or the only one), destruction
+   *  of the tail (controls gone), destruction of the fuselage, or total
+   *  hp exhausted. This is the right kill-credit rule: credit the kill
+   *  the moment severe damage is inflicted, not when the wreck hits
+   *  the ground. Single-engine jets (F-35A) have an `engine` zone
+   *  instead of engineL/engineR; losing it is severe damage. */
+  isSeverelyDamaged(): boolean {
+    if (this.destroyedFlag) return true;
+    if ((this.zoneHp['fuselage'] ?? 1) <= 0) return true;
+    if ((this.zoneHp['tail'] ?? 1) <= 0) return true;
+    const hasTwin = 'engineL' in this.zoneHp && 'engineR' in this.zoneHp;
+    if (hasTwin) {
+      if (
+        (this.zoneHp['engineL'] ?? 1) <= 0 &&
+        (this.zoneHp['engineR'] ?? 1) <= 0
+      )
+        return true;
+    } else if ((this.zoneHp['engine'] ?? 1) <= 0 && 'engine' in this.zoneHp) {
+      return true;
+    }
+    return this.hp <= 0;
+  }
+
   isDestroyed(): boolean {
     return this.destroyedFlag;
   }

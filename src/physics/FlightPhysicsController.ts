@@ -66,12 +66,14 @@ import {
   CurveAerodynamicsSolver,
   torqueToRates,
 } from './CurveAerodynamicsSolver';
+import { BladeElementSolver } from './BladeElementSolver';
 import {
   NOSE_ROT_Y,
   type AircraftSpec,
   type ModelKey,
 } from '../aircraft/AircraftSpec';
 import { AircraftRigBindings } from '../aircraft/AircraftRigBindings';
+import { DamageableEntity } from '../combat/DamageableEntity';
 
 const D2R = Math.PI / 180;
 const G = 9.81;
@@ -86,7 +88,11 @@ const GEAR_HEIGHT = 2.2; // gear-down ride height above the surface
 const BELLY_HEIGHT = 1.2; // gear-up ride height
 const HARD_LANDING_VS = 9; // m/s vertical speed that breaks the jet
 const HARD_LANDING_BANK = 0.45; // rad of bank that breaks the jet
-const GROUND_FRICTION = 1.2; // m/s^2 rolling friction
+const GROUND_FRICTION = 0.3; // m/s^2 rolling friction (research §6:
+// real rolling resistance is ~0.02-0.03 g; 1.2 ate ~12% of takeoff accel)
+const ROTATION_RATE_MAX = 12 * D2R; // rad/s nose-up while the gear is on
+// a surface (BET report §3: rotation needs ~10-15 deg/s, not the 55 deg/s
+// max authority — the full rate whips the nose up and tail-strikes)
 const BRAKE_DECEL = 6; // m/s^2 with wheel brakes
 const STEER_RATE = 0.9; // nose-wheel steering, rad/s at full stick
 const TRAP_MAX_SPEED = 72; // m/s — faster snaps the wire
@@ -102,16 +108,79 @@ const WIRE_LOCAL_X = 26;
 const FUEL_BURN_BASE = 0.02; // per second, template units (fuel 0..100)
 const FUEL_BURN_THR = 0.11; // per second at full throttle
 const FUEL_LEAK_EXTRA = 0.25; // per second with a fuel leak
-const FIRE_BURN_DPS = 1.5; // hp per second while on fire
 const WING_LOSS_DMG = 0.75; // wing damage that detaches the wing
 const WING_DETACH_FATAL = 0.4; // wing damage that detaches on crash
 const SMOKE_HP = 60; // smoke below this hp
 const FIRE_HP = 35; // fire below this hp
 const LOAD_TIMEOUT_MS = 9000; // v2 loadGLB timeout
 
+// ---- Damage model (War Thunder report §3, §7) ----
+// Fire: a fuel-tank fire ramps to full intensity in ~12 s (game pace;
+// WT's 40-60 s scaled down), an engine fire ramps faster (~4 s) but
+// stays localised. Fuel fire 2.0 hp/s at full intensity, engine fire
+// 1.2 hp/s. A fuel fire spreads to one adjacent zone per ~8 s; a wing
+// fire burning long enough destroys the spar (wing separation).
+const FUEL_FIRE_RAMP_S = 12; // seconds to full intensity
+const ENGINE_FIRE_RAMP_S = 4;
+const FUEL_FIRE_DPS = 2.0; // hp/s at full intensity
+const ENGINE_FIRE_DPS = 1.2;
+const FIRE_SPREAD_S = 8; // fuel fire spreads to an adjacent zone
+// Extinguish: a fuel fire's self-extinguish chance rises with airspeed
+// (slipstream) — 2%/s below 150 m/s IAS, 8%/s above 300 m/s. An
+// engine fire has a 15%/s chance to go out when that engine's throttle
+// is cut to 0 (fuel starvation). Diving fast with the throttle cut is
+// the correct player response.
+const FUEL_FIRE_EXT_LO = 0.02; // per second, IAS < 150 m/s
+const FUEL_FIRE_EXT_HI = 0.08; // per second, IAS > 300 m/s
+const ENGINE_FIRE_EXT_THR0 = 0.15; // per second, throttle cut to 0
+
+/** Component HP per zone (damage-model §7, tuned to gun 12/hit,
+ *  missile 40, bomb ≤60). `destroyed` = fuselage 0, OR both engines 0,
+ *  OR tail 0 (controls gone), OR total 0 — the WT severe-damage rule.
+ *  Wing 0 = wing detaches → dying spin. Fuel 0 = fuel fire starts.
+ *  F-35A is single-engine (one `engine` zone, not engineL/engineR);
+ *  losing it is a severe-damage kill (all engines destroyed). */
+function zoneHpFor(specKey: string): Record<string, number> {
+  switch (specKey) {
+    case 'f35a':
+      return {
+        fuselage: 40, wingL: 25, wingR: 25, tail: 20, fin: 15,
+        engine: 25, fuel: 20,
+      };
+    case 'f22':
+      return {
+        fuselage: 45, wingL: 30, wingR: 30, tail: 22, fin: 15,
+        engineL: 22, engineR: 22, fuel: 22,
+      };
+    case 'f15e':
+      return {
+        fuselage: 42, wingL: 28, wingR: 28, tail: 20, fin: 15,
+        engineL: 22, engineR: 22, fuel: 22,
+      };
+    case 'mig29':
+      return {
+        fuselage: 38, wingL: 25, wingR: 25, tail: 18, fin: 15,
+        engineL: 20, engineR: 20, fuel: 18,
+      };
+    case 'su34':
+      return {
+        fuselage: 45, wingL: 30, wingR: 30, tail: 22, fin: 15,
+        engineL: 22, engineR: 22, fuel: 25,
+      };
+    case 'fa18':
+    default:
+      return {
+        fuselage: 40, wingL: 25, wingR: 25, tail: 20, fin: 15,
+        engineL: 20, engineR: 20, fuel: 20,
+      };
+  }
+}
+
 /** Damage zone names accepted by applyDamage(). 'wing' / 'engine' are
  *  the v2 template zones (WeaponSystem passes these); the per-side
- *  variants let callers hit one side only. */
+ *  variants let callers hit one side only. 'fuel' is the fuel tank
+ *  (damage-model §3 — a hit can start a fuel fire); 'fin' is the
+ *  vertical fin (damage-model §7). */
 export type DamageZone =
   | 'wing'
   | 'wingL'
@@ -120,6 +189,8 @@ export type DamageZone =
   | 'engineL'
   | 'engineR'
   | 'tail'
+  | 'fin'
+  | 'fuel'
   | 'fuselage';
 
 /** Spawn point: runway centre, elevation and heading (deg). */
@@ -162,6 +233,10 @@ export interface AircraftEvents {
   /** Aircraft went down (reason: 'shot down' | 'hard landing' |
    *  'terrain' | 'engine fire' | ...). Main plays the explosion. */
   onCrash?: (ac: Aircraft, reason: string) => void;
+  /** Aircraft entered the dying fall (damage-model §6 step 1) — shot
+   *  down but still falling, not yet dead. Main starts the spectate
+   *  camera for the player and shows the "SHOT DOWN" banner. */
+  onDying?: (ac: Aircraft, reason: string) => void;
   /** A wing/tail segment was detached by fatal damage. Main hands the
    *  mesh to CrashVFXManager.spawnDebris() as a tumbling Rapier body.
    *  `segment` is null when the model had no such node (box fallback). */
@@ -193,6 +268,19 @@ export interface AircraftOptions {
   rig?: AircraftRigBindings;
   /** Carrier deck surface (optional; no deck interaction without it). */
   deck?: DeckProvider;
+  /** Use the blade-element solver (BET §5) instead of the curve
+   *  solver. Default false: the curve solver carries all of the BET
+   *  §0–§4 corrections (per-model CL curves, coordinated yaw, spin
+   *  state, adverse yaw, thrust lapse, qAuth floor, MiG roll cap,
+   *  F-22 TVC) and is the verified default. The BET solver is built
+   *  and wired (BladeElementSolver, same IAerodynamicsSolver
+   *  contract) but still needs its hover-FCS trim and elevator/lift
+   *  calibration pass before it becomes the default — with it on, the
+   *  F-35A tumbles in hover (the fan/nozzle thrust split has a large
+   *  nose-down moment with no FCS to trim it) and jets over-rotate
+   *  on takeoff (elevator authority vs pitch damping gives a ~92°/s
+   *  equilibrium pitch rate). Enable per-aircraft for testing. */
+  useBet?: boolean;
   events?: AircraftEvents;
 }
 
@@ -381,6 +469,10 @@ export class Aircraft {
   readonly group: THREE.Group;
   /** Rapier dynamic body. Rapier owns position; read it via pos/vel/quat. */
   readonly body: RAPIER.RigidBody;
+  /** All colliders on the body (fuselage + 3 gear posts). main.ts
+   *  registers every handle in colliderOwners so contacts on the gear
+   *  posts dispatch into notifyContact() like fuselage contacts. */
+  private readonly colliders: RAPIER.Collider[] = [];
   /** Loaded model (null until attachModel resolves). */
   model: THREE.Group | null = null;
   modelReady = false;
@@ -414,11 +506,26 @@ export class Aircraft {
   alive = true;
   grounded = false;
   onDeck = false;
+  /** True while the gear is in physical contact with a surface (set
+   *  in stepInternal — NOT the `grounded` flag, whose 0.85×stall gate
+   *  flips far too early). The rotation clamp and the ROTATE HUD cue
+   *  read this. */
+  onSurface = false;
   aoaDeg = 0;
   ias = 0;
   gload = 1;
   vsi = 0;
   stalled = false;
+  /** Spin amount 0..1 (BET §2 — the solver's spin state). */
+  spin = 0;
+  /** Spin command-arrow direction for the HUD: −1 = stick left,
+   *  +1 = stick right, 0 = no arrow. */
+  spinArrow: -1 | 0 | 1 = 0;
+  /** Spin direction: +1 = yawing right, −1 = yawing left. The AI's
+   *  spin recovery feeds rudder opposite this. */
+  spinDir: 1 | -1 = 1;
+  /** Sideslip β, deg (BET §1 — the solver's weathercock input). */
+  betaDeg = 0;
   /** Fuel 0..1 (fraction). */
   fuel = 1;
   /** Spooled throttle 0..1 (HUD / solver input). */
@@ -436,6 +543,27 @@ export class Aircraft {
   hp = 100;
   /** Per-zone structural damage 0..1. */
   readonly damageZones: DamageZones = { ...ZERO_DAMAGE };
+  /** Single source of truth for per-zone HP (damage-model §6 step 2).
+   *  Built from the §7 table for this spec; applyDamage routes through
+   *  it, and its severe-damage rule (fuselage / both engines / tail /
+   *  total) is what starts the dying fall. */
+  readonly damageEntity: DamageableEntity;
+  /** Fire state machine (damage-model §3). `fireKind` null = no fire.
+   *  `fireIntensity` 0..1 ramps up (fuel 12 s, engine 4 s) and drives
+   *  the burn rate and the visuals. `fireZone` is the zone burning. */
+  fireKind: 'fuel' | 'engine' | null = null;
+  fireIntensity = 0;
+  fireZone: DamageZone | null = null;
+  /** `dying` (damage-model §6 step 1): the jet is shot down and
+   *  falling, but not yet dead — alive stays true for physics, the
+   *  solver steps degraded (throttle 0, controls zeroed), and the
+   *  ground impact becomes finishCrash(). Untargetable while dying. */
+  dying = false;
+  dyingReason: string | null = null;
+  /** True once finishCrash() has run (ground impact after a dying
+   *  fall) — handleDeaths uses it to scale the explosion by the
+   *  remaining fuel and scatter debris. */
+  crashedFromDying = false;
   lockT = 0;
   lockTarget: Aircraft | null = null;
   /** Gun cooldown, s (WeaponSystem sets it; GUN_COOLDOWN 0.075). */
@@ -451,11 +579,27 @@ export class Aircraft {
   private readonly world: RAPIER.World;
   private readonly deck?: DeckProvider;
   private readonly events: AircraftEvents;
-  private readonly solver = new CurveAerodynamicsSolver();
+  /** Aerodynamics solver (BET §5): the curve solver is the default —
+   *  it carries all of the BET §0–§4 corrections (per-model CL
+   *  curves, coordinated yaw, spin state, adverse yaw, thrust lapse,
+   *  qAuth floor, MiG roll cap, F-22 TVC). The blade-element solver
+   *  (opt-in via AircraftOptions.useBet) is the §5 moment model —
+   *  its rates are emergent from the station moments — kept for the
+   *  calibration pass (hover-FCS trim, elevator authority). The
+   *  rotary archetype always uses the curve solver (the report keeps
+   *  the scalar rotor model until BET lands for helis). Both
+   *  implement IAerodynamicsSolver, so the controller treats them
+   *  identically. */
+  private readonly solver: CurveAerodynamicsSolver | BladeElementSolver;
+  /** Body-frame angular velocity (rad/s), read from the Rapier body
+   *  in syncFromBody and fed to the BET solver as AeroState.angVel. */
+  private readonly angVelBody = new THREE.Vector3();
   private simTime = 0;
   private _trapped = false;
   private trapTimer = 0;
   private wingDetached = false;
+  private tailDetached = false;
+  private fireSpreadTimer = 0;
   private lastHitByRecord: { isPlayer: boolean } | null = null;
   private pendingContact: { impactVy: number; isDeck: boolean } | null = null;
   private static readonly modelCache = new Map<
@@ -471,21 +615,59 @@ export class Aircraft {
     this.world = opts.world;
     this.deck = opts.deck;
     this.events = opts.events ?? {};
+    this.solver =
+      opts.useBet && opts.spec.archetype !== 'rotary'
+        ? new BladeElementSolver(opts.spec)
+        : new CurveAerodynamicsSolver();
     this.rig = opts.rig ?? null;
     this.bombs = opts.spec.bombs ? 4 : 0;
+    this.damageEntity = new DamageableEntity(zoneHpFor(opts.spec.key));
 
     this.group = new THREE.Group();
     opts.scene.add(this.group);
 
-    // Cuboid approx from the spec: half-span narrowed (the fuselage is
-    // far narrower than the wingspan), 1.6 m half-height, half-length.
+    // Four colliders, not one big box — the takeoff fix (issues 1 + 2).
+    //
+    // The old single cuboid spanned the whole fuselage (hy 1.6, centre 0),
+    // so its bottom corners sat in the runway and Rapier's contact solver
+    // cancelled any pitch rotation: the jet could not rotate at all, and
+    // its 0.6 friction (0.75 combined with the 0.9 terrain, Rapier's
+    // average combine rule) ate ~149 kN of the 196 kN thrust — the
+    // observed ~1.3 m/s^2 instead of ~7-9 m/s^2.
+    //
+    // Now the fuselage rides CLEAR of the ground (belly -0.8 m, i.e. 1.4 m
+    // above the surface when parked) and the jet stands on three gear
+    // posts whose feet touch the surface (bottom -2.2 m = gear height).
+    // Rotation pivots on the main gear: at 12 deg nose-up the tail belly
+    // drops 0.30*length*sin(12 deg) ~ 1.17 m for the F-18 and still clears
+    // by ~0.2 m, so pitch authority is no longer fought by the ground.
+    // Friction is 0 on every collider with the Min combine rule — the
+    // controller owns all ground physics (rolling resistance 0.3 m/s^2,
+    // brakes, steering, traps, deck-velocity transfer) and Rapier
+    // Coulomb friction must not eat thrust a second time.
+    //
     // Density is set so the Rapier mass equals spec.mass — the solver
     // divides forces by the same mass, so the two agree.
-    const hx = Math.max(opts.spec.span * 0.28, 1.2);
-    const hy = 1.6;
-    const hz = opts.spec.length / 2;
-    const volume = 8 * hx * hy * hz;
-    const density = opts.spec.mass / volume;
+    const s = opts.spec;
+    const hx = Math.max(s.span * 0.28, 1.2);
+    const hzFuse = s.length * 0.45;
+    const vFuse = 8 * hx * 1.4 * hzFuse;
+    // Gear "skis": each post is a 3 m long skid (hz 1.5) rather than a
+    // 1 m stub. The posts are physics-only (invisible — the visual gear
+    // is part of the GLB), and a long skid spreads the ground contact
+    // over several heightfield triangles instead of balancing the whole
+    // jet on three 0.7 x 1.0 m pads. That matters because Rapier's
+    // heightfield contact solver produces a spurious up-and-back
+    // impulse when a small pad straddles a cell boundary / diagonal:
+    // measured in the node driver, one world.step changed the F-35A's
+    // Rapier velocity from (4.89, -0.16) to (1.30, +1.12) m/s at
+    // t=1.35 s / 4.9 m/s on flat ground (flaps 30), launching it into
+    // a tumble (AoA -129 deg); the F-15E did the same at 21 m/s and
+    // read as a 40 m/s lift-off. A 3 m skid keeps face contacts
+    // dominant so a single edge contact cannot dominate the manifold.
+    const vMain = 2 * (0.7 * 0.8 * 3.0); // two main skids
+    const vNose = 0.6 * 0.8 * 3.0; // one nose skid
+    const density = s.mass / (vFuse + vMain + vNose);
     this.body = this.world.createRigidBody(
       RAPIER.RigidBodyDesc.dynamic()
         .setTranslation(0, 0, 0)
@@ -495,15 +677,42 @@ export class Aircraft {
         .setGravityScale(0) // gravity is inside the solver's force sum
         .setEnabled(false), // respawn() enables + places the aircraft
     );
-    this.world.createCollider(
-      RAPIER.ColliderDesc.cuboid(hx, hy, hz)
-        .setDensity(density)
-        .setFriction(0.6)
-        .setRestitution(0)
-        // Collision events feed the integrator's notifyContact() dispatch.
-        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
-      this.body,
-    );
+    const minRule = RAPIER.CoefficientCombineRule.Min;
+    const mk = (
+      hx2: number,
+      hy2: number,
+      hz2: number,
+      x: number,
+      y: number,
+      z: number,
+    ): void => {
+      this.colliders.push(
+        this.world.createCollider(
+          RAPIER.ColliderDesc.cuboid(hx2, hy2, hz2)
+            .setTranslation(x, y, z)
+            .setDensity(density)
+            .setFriction(0)
+            .setFrictionCombineRule(minRule)
+            .setRestitution(0)
+            // Collision events feed the integrator's notifyContact() dispatch.
+            .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
+          this.body,
+        ),
+      );
+    };
+    // Fuselage: belly -0.8 m, top +2.0 m (hy 1.4, centre +0.6).
+    mk(hx, 1.4, hzFuse, 0, 0.6, 0);
+    // Main gear: two skids at z = -0.15*length, feet at -2.2 m.
+    mk(0.35, 0.4, 1.5, -1.6, -1.8, -s.length * 0.15);
+    mk(0.35, 0.4, 1.5, 1.6, -1.8, -s.length * 0.15);
+    // Nose gear: z = +0.35*length, feet at -2.2 m.
+    mk(0.3, 0.4, 1.5, 0, -1.8, s.length * 0.35);
+  }
+
+  /** Handles of every collider on this aircraft's body, for the
+   *  integrator's colliderOwners registry (fuselage + gear posts). */
+  colliderHandles(): number[] {
+    return this.colliders.map((c) => c.handle);
   }
 
   /** Remove the Rapier body and the visual group (round restart). */
@@ -519,6 +728,20 @@ export class Aircraft {
   /** Sim clock, seconds since construction. */
   get time(): number {
     return this.simTime;
+  }
+
+  /** ROTATE cue (BET §3): the HUD shows "ROTATE" when the gear is on
+   *  a surface and the speed has reached the per-spec rotation speed.
+   *  Gated on onSurface (physical contact), not `grounded` — the
+   *  flag's 0.85×stall gate flips far too early (F-22: 46 m/s vs its
+   *  72 m/s Vr). */
+  get rotateCue(): boolean {
+    return (
+      this.alive &&
+      this.onSurface &&
+      this.spec.rotateSpeedKt > 0 &&
+      this.ias >= this.spec.rotateSpeedKt * 0.514444
+    );
   }
 
   /** v1.1 spawn protection, seconds REMAINING (template spawnProt). */
@@ -633,11 +856,22 @@ export class Aircraft {
 
   /** Smoke / fire state for the damage visuals (v2: smoke < 60 hp,
    *  fire < 35 hp). The controller never spawns the plumes itself —
-   *  main.ts reads this and drives CrashVFXManager. */
-  getDamageFx(): { smoke: boolean; fire: boolean } {
+   *  main.ts reads this every frame and drives CrashVFXManager.
+   *  The fire state machine (damage-model §3) overrides the hp
+   *  thresholds: a burning jet shows fire at any hp, with the kind
+   *  (fuel = orange flame + black smoke, engine = localised fire)
+   *  and the ramped intensity for the visuals. */
+  getDamageFx(): {
+    smoke: boolean;
+    fire: boolean;
+    fireKind: 'fuel' | 'engine' | null;
+    fireIntensity: number;
+  } {
     return {
-      smoke: this.alive && this.hp < SMOKE_HP,
-      fire: this.alive && this.hp < FIRE_HP,
+      smoke: this.alive && (this.hp < SMOKE_HP || this.fireKind !== null),
+      fire: this.alive && (this.hp < FIRE_HP || this.fireKind !== null),
+      fireKind: this.fireKind,
+      fireIntensity: this.fireIntensity,
     };
   }
 
@@ -773,6 +1007,16 @@ export class Aircraft {
     if (this.flareCd > 0) this.flareCd -= dt;
     this.syncFromBody();
 
+    // Dying: the jet is falling, not flying — all controls are zeroed
+    // and the throttle is cut (damage-model §6 step 1). The solver
+    // steps degraded (stall/spin + drag) so the tumble and the
+    // terminal velocity emerge naturally. This override is
+    // authoritative: even if main.ts or the AI keeps writing
+    // pitchIn/rollIn/yawIn, the solver sees zero.
+    if (this.dying) {
+      controls = { pitch: 0, roll: 0, yaw: 0, throttle: 0 };
+    }
+
     const pitchIn = controlPitch(controls);
     const rollIn = controlRoll(controls);
     const thr = resolveThrottleTarget(controls);
@@ -814,6 +1058,7 @@ export class Aircraft {
       quat: this.quat,
       mass: m,
       wingArea: S.wingArea,
+      wingAreaLift: S.wingAreaEffective ?? S.wingArea,
       span: S.span,
       chord: S.wingArea / S.span,
       length: S.length,
@@ -835,11 +1080,26 @@ export class Aircraft {
         engineSide: this.failures.engineSide,
         hydroDegraded: this.failures.hydroDegraded,
       },
+      // BET per-model data (report §0/§2, supplement §1–§6).
+      inducedK: S.inducedK,
+      clCurve: S.clCurve,
+      angVel: this.angVelBody,
+      tvcDeg: S.tvcDeg,
+      rollCapSchedule: S.rollCapSchedule,
+      // Dying airframe (damage-model §6 step 1): the wing can no
+      // longer hold 1 g — lift is cut to 30% so the jet freefalls
+      // instead of gliding on with zero controls. Drag is untouched
+      // (the solver keeps the full drag on the unscaled CL).
+      liftScale: this.dying ? 0.3 : 1,
       dt,
     });
     this.aoaDeg = result.aoaDeg;
     this.gload = result.gLoad;
     this.stalled = result.stalled;
+    this.spin = result.spin;
+    this.spinArrow = result.spinArrow;
+    this.spinDir = result.spinDir;
+    this.betaDeg = result.betaDeg;
 
     // Forces -> acceleration -> new velocity (semi-implicit Euler, v2).
     const acc = result.lift
@@ -861,10 +1121,33 @@ export class Aircraft {
         : new THREE.Vector3();
     let steerYawRate = 0;
     let deckYawRate = 0;
-    if (this.pos.y <= floorY + gearH + 0.05 && newVel.y <= 0.5) {
+    // Physical ground contact this step — NOT the `grounded` flag. The
+    // flag's 0.85xstall rotation gate flips far too early (F-22: 46 m/s
+    // vs its 72 m/s Vr), which released the pitch clamp mid-roll and let
+    // the full 55 deg/s authority whip the nose into a tail strike.
+    let onSurface = false;
+    // Ground-relative horizontal velocity (deck-relative on the carrier).
+    let relH = new THREE.Vector3();
+    // Tolerance 0.15 m (was 0.05): the runway box colliders sit 5 cm
+    // above the analytic height (their top is elev + 0.05, so the gear
+    // rests at floorY + gearH + 0.05), which put a resting jet EXACTLY
+    // on the old 0.05 threshold — floating-point flicker read it as
+    // airborne, grounded/onSurface went false, the rotation clamp
+    // released, and the full pitch authority whipped every jet nose-up
+    // at 30 kt. 0.15 m still means "on or within a hand's breadth of
+    // the ground"; a jet 15 cm up is in ground effect, not flying.
+    if (this.pos.y <= floorY + gearH + 0.15 && newVel.y <= 0.5) {
       // Touching a surface. Rapier resolves the penetration — this
       // block only reads the contact, applies roll physics and the
       // v2 runway/deck rules; it never pins pos.y.
+      // A dying jet touching the ground is the impact — finishCrash
+      // (fuel-scaled explosion + debris + scorch), not a landing.
+      if (this.dying) {
+        this.finishCrash();
+        return;
+      }
+      onSurface = true;
+      this.onSurface = true;
       this.grounded = true;
       this.onDeck = isDeck;
       const vs = contact
@@ -880,7 +1163,7 @@ export class Aircraft {
       // Ground roll, relative to the deck when on it: friction +
       // brakes + nose-wheel steering (v2). Deck velocity passes
       // through untouched (subtracted before friction, added back).
-      const relH = new THREE.Vector3(newVel.x - deckVel.x, 0, newVel.z - deckVel.z);
+      relH = new THREE.Vector3(newVel.x - deckVel.x, 0, newVel.z - deckVel.z);
       const sp = relH.length();
       const fr = this.brake ? BRAKE_DECEL : GROUND_FRICTION;
       if (sp > 0.5) {
@@ -934,12 +1217,21 @@ export class Aircraft {
     } else {
       this.grounded = false;
       this.onDeck = false;
+      onSurface = false;
+      this.onSurface = false;
     }
     // Terrain collision safety net: only when actually penetrating.
+    // A dying jet penetrating the terrain is the impact — finishCrash.
     if (this.pos.y < terrainH - 0.5) {
-      this.crash('terrain');
+      if (this.dying) this.finishCrash();
+      else this.crash('terrain');
       return;
     }
+
+    // G-load on the ground is 1.0, not the solver's 0.2 floor (research
+    // §6; the play-test saw 0.2 g on a parked jet). The solver's floor
+    // stays — this override is the controller's ground truth.
+    if (this.grounded) this.gload = 1;
 
     // G-load + structural limit (v2): over-G damages the airframe.
     if (this.gload > S.maxG + OVER_G_MARGIN && this.ias > OVER_G_MIN_SPEED) {
@@ -948,7 +1240,27 @@ export class Aircraft {
     }
 
     // Rotation: solver torque -> v2 rates -> Rapier angular velocity.
-    const rates = torqueToRates(result.torque, m, S.span, S.length);
+    // The BET solver returns `rates` directly (integrated from the
+    // real moment model, ω̇ = I⁻¹(M − ω × Iω)); the curve solver
+    // returns only a torque, recovered here with torqueToRates().
+    const rates =
+      result.rates ?? torqueToRates(result.torque, m, S.span, S.length);
+    // Takeoff rotation (BET report §3): while the gear is on a surface,
+    // the nose stays down until the per-spec rotation speed, and even
+    // then the rotation rate is capped at ~12 deg/s — the full 55 deg/s
+    // authority whips the nose up, the fuselage tail strikes the runway,
+    // and Rapier resolves the penetration by launching the jet, which
+    // read as a 40 m/s "lift-off" (F-18 flaps 30, F-15E flaps 30) or a
+    // tumble (F-35A flaps 0, AoA -129 deg). Gated on physical contact
+    // (onSurface), not the grounded flag — the flag's 0.85xstall gate
+    // flips far too early for this (F-22: 46 m/s vs its 72 m/s Vr).
+    // Pitch-down is left alone (the nose gear stops it). Speed is
+    // deck-relative on the carrier.
+    if (onSurface && rates.pitchRate < 0) {
+      const spdH = Math.hypot(relH.x, relH.z);
+      if (spdH < S.rotateSpeedKt * 0.514444) rates.pitchRate = 0;
+      else rates.pitchRate = Math.max(rates.pitchRate, -ROTATION_RATE_MAX);
+    }
     const angBody = new THREE.Vector3(
       rates.pitchRate,
       rates.yawRate + steerYawRate + deckYawRate,
@@ -973,11 +1285,68 @@ export class Aircraft {
     );
     if (this.fuel <= 0 && this.throttle > 0) this.thrTarget = 0;
 
-    // Engine fire (v2): HP burns away until it is put out by crashing.
-    if (this.failures.fire) {
-      this.hp -= FIRE_BURN_DPS * dt;
+    // Fire state machine (damage-model §3). The failure-scenario
+    // engine fire feeds it (failures.fire starts an engine fire if
+    // none is burning); the damage-model fire (fuel/engine, from
+    // applyDamage's ignition rolls) is the same machine. A fuel fire
+    // ramps to full in ~12 s, an engine fire in ~4 s; fuel burns
+    // 2.0 hp/s at full intensity, engine 1.2 hp/s. A fuel fire spreads
+    // to one adjacent zone per ~8 s (a wing fire burning long enough
+    // destroys the spar). Extinguish: a fuel fire's self-extinguish
+    // chance rises with airspeed (2%/s below 150 m/s IAS, 8%/s above
+    // 300 m/s); an engine fire has a 15%/s chance to go out when the
+    // throttle is cut to 0. A fire that destroys the jet starts the
+    // dying fall — it does not vanish in mid-air.
+    if (this.failures.fire && !this.fireKind && this.alive && !this.dying) {
+      this.startFire('engine', 'engineL');
+    }
+    if (this.fireKind && this.alive && !this.dying) {
+      const ramp = this.fireKind === 'fuel' ? FUEL_FIRE_RAMP_S : ENGINE_FIRE_RAMP_S;
+      this.fireIntensity = Math.min(1, this.fireIntensity + dt / ramp);
+      const dps =
+        this.fireKind === 'fuel' ? FUEL_FIRE_DPS : ENGINE_FIRE_DPS;
+      const burn = dps * this.fireIntensity * dt;
+      this.hp -= burn;
+      // The fire eats the burning zone too (structural damage, so the
+      // solver degrades and a wing fire can destroy the spar).
+      const dz = this.damageZones;
+      const zone = this.fireZone;
+      if (zone === 'fuel') dz.fuel = clamp(dz.fuel + burn * 0.004, 0, 1);
+      else if (zone === 'engineL' || zone === 'engine') dz.engineL = clamp(dz.engineL + burn * 0.005, 0, 1);
+      else if (zone === 'engineR') dz.engineR = clamp(dz.engineR + burn * 0.005, 0, 1);
+      // Spread (fuel fire only): one adjacent zone per ~8 s.
+      if (this.fireKind === 'fuel') {
+        this.fireSpreadTimer += dt;
+        if (this.fireSpreadTimer >= FIRE_SPREAD_S) {
+          this.fireSpreadTimer = 0;
+          const adjacent: DamageZone[] = ['wingL', 'wingR', 'tail', 'engineL', 'engineR'];
+          const spreadTo = adjacent[Math.floor(Math.random() * adjacent.length)]!;
+          if (spreadTo === 'wingL') dz.wingL = clamp(dz.wingL + 0.15, 0, 1);
+          else if (spreadTo === 'wingR') dz.wingR = clamp(dz.wingR + 0.15, 0, 1);
+          else if (spreadTo === 'tail') dz.tail = clamp(dz.tail + 0.15, 0, 1);
+          else if (spreadTo === 'engineL') dz.engineL = clamp(dz.engineL + 0.15, 0, 1);
+          else dz.engineR = clamp(dz.engineR + 0.15, 0, 1);
+        }
+      }
+      // A wing fire burning long enough destroys the spar.
+      if ((dz.wingL > WING_LOSS_DMG || dz.wingR > WING_LOSS_DMG) && !this.wingDetached) {
+        this.detachWing();
+      }
+      // Extinguish rolls (per-second probabilities, scaled by dt).
+      let extP = 0;
+      if (this.fireKind === 'fuel') {
+        const t = clamp((this.ias - 150) / 150, 0, 1);
+        extP = FUEL_FIRE_EXT_LO + (FUEL_FIRE_EXT_HI - FUEL_FIRE_EXT_LO) * t;
+      } else if (this.throttle <= 0.05 && this.thrTarget <= 0.05) {
+        extP = ENGINE_FIRE_EXT_THR0;
+      }
+      if (extP > 0 && Math.random() < extP * dt) {
+        this.fireKind = null;
+        this.fireIntensity = 0;
+        this.fireZone = null;
+      }
       if (this.hp <= 0) {
-        this.crash('engine fire');
+        this.startDying('fire');
         return;
       }
     }
@@ -1011,16 +1380,52 @@ export class Aircraft {
     });
   }
 
+  /** Start a fire (damage-model §3). Fuel fire ramps to full in ~12 s,
+   *  engine fire in ~4 s. Called from applyDamage's ignition rolls
+   *  and from the engine-fire failure. A fire already burning is not
+   *  restarted (its intensity keeps ramping). */
+  startFire(kind: 'fuel' | 'engine', zone: DamageZone): void {
+    if (!this.alive || this.dying) return;
+    if (this.fireKind) return;
+    this.fireKind = kind;
+    this.fireZone = zone;
+    this.fireIntensity = 0;
+    this.fireSpreadTimer = 0;
+  }
+
   /** v2 damage(): zone multipliers, per-zone accumulators, wing loss,
    *  smoke/fire thresholds, kill credit. A grounded or spawn-protected
    *  PLAYER cannot be damaged (v1.1 — the AI should not be shooting at
    *  a parked jet); over-G calls with byPlayer=false while airborne
-   *  are unaffected. */
+   *  are unaffected.
+   *
+   *  Damage model (§6 step 2): the hit routes through DamageableEntity
+   *  (the single source of truth for per-zone HP, §7 table) AND the
+   *  Aircraft's hp/damageZones (which feed the solver's degradation).
+   *  A lost zone triggers its effect: fuel → ignition roll (fuel fire),
+   *  engine → engine-fire roll, wing → detach, tail → controls dead
+   *  (dying), fin → tail authority degraded. Severe damage (WT rule:
+   *  fuselage / both engines / tail / total) or hp ≤ 0 starts the
+   *  dying fall — the jet does not vanish in mid-air. */
   applyDamage(amount: number, zone: DamageZone, byPlayer: boolean): void {
-    if (!this.alive) return;
+    if (!this.alive || this.dying) return;
     this.lastHitByIsPlayer = byPlayer;
     this.lastHitByRecord = { isPlayer: byPlayer };
     if (this.isPlayer && (this.grounded || this.isSpawnProtected())) return;
+    // Route through the entity (zone HP + severe-damage rule). Map the
+    // v2 generic zones to per-side entity zones (a 'wing' hit damages
+    // both wings; an 'engine' hit damages both engines).
+    const entityZone =
+      zone === 'wing' ? 'wingL' : zone === 'engine' ? 'engineL' : zone;
+    const result = this.damageEntity.applyDamage(amount, entityZone, byPlayer);
+    // A generic 'wing'/'engine' hit damages the other side too (the
+    // entity only saw one side above) — check its zone loss as well.
+    let lost2: string | null = null;
+    if (zone === 'wing') {
+      lost2 = this.damageEntity.applyDamage(amount, 'wingR', byPlayer).zoneLost;
+    } else if (zone === 'engine') {
+      lost2 = this.damageEntity.applyDamage(amount, 'engineR', byPlayer).zoneLost;
+    }
     let mult = 1;
     if (zone === 'wing' || zone === 'wingL' || zone === 'wingR') mult = 1.2;
     else if (zone === 'engine' || zone === 'engineL' || zone === 'engineR') mult = 1.5;
@@ -1037,10 +1442,44 @@ export class Aircraft {
     } else if (zone === 'engineL') dz.engineL = clamp(dz.engineL + amount * 0.005, 0, 1);
     else if (zone === 'engineR') dz.engineR = clamp(dz.engineR + amount * 0.005, 0, 1);
     else if (zone === 'tail') dz.tail = clamp(dz.tail + amount * 0.004, 0, 1);
+    else if (zone === 'fin') {
+      dz.fin = clamp(dz.fin + amount * 0.004, 0, 1);
+      // Losing the fin degrades directional stability; the solver has
+      // no fin input, so it feeds the tail authority (handling
+      // degrades without killing the jet outright, per §7).
+      dz.tail = clamp(dz.tail + amount * 0.002, 0, 1);
+    } else if (zone === 'fuel') {
+      dz.fuel = clamp(dz.fuel + amount * 0.004, 0, 1);
+      // A fuel hit leaks and raises the ignition chance; an incendiary
+      // (gun API mix) hit ignites it ~5% of the time (BRL Memo 484:
+      // AP 0-2%, API ~5%). The missile/bomb proximity path rolls its
+      // own 25% fuel-explosion chance in WeaponSystem.
+      if (Math.random() < 0.05) this.startFire('fuel', 'fuel');
+    }
+    // Zone-lost effects (first time a zone's HP hits zero).
+    const lost = result.zoneLost ?? lost2;
+    if (lost === 'fuel') this.startFire('fuel', 'fuel');
+    else if (lost === 'engine' || lost === 'engineL' || lost === 'engineR') {
+      // An engine destroyed by a hit has a chance to catch fire.
+      if (Math.random() < 0.15) {
+        this.startFire('engine', lost as DamageZone);
+      }
+    } else if (lost === 'tail') {
+      // Tail (controls) gone — uncontrollable, start the dying fall.
+      this.startDying('tail destroyed');
+      return;
+    } else if (lost === 'fin') {
+      dz.tail = Math.max(dz.tail, 0.6);
+    }
     if ((dz.wingL > WING_LOSS_DMG || dz.wingR > WING_LOSS_DMG) && !this.wingDetached) {
       this.detachWing();
     }
-    if (this.hp <= 0) this.crash('shot down');
+    // Severe damage (WT rule) or hp exhausted → the dying fall, not an
+    // instant vanish. The kill is credited at this moment (see
+    // DamageableEntity.isSeverelyDamaged), not when the wreck hits.
+    if (this.damageEntity.isSeverelyDamaged() || this.hp <= 0) {
+      this.startDying('shot down');
+    }
   }
 
   /** Detach the worse-damaged wing as a tumbling segment (v2 detachWing:
@@ -1058,6 +1497,69 @@ export class Aircraft {
     this.events.onDetachSegment?.(this, segment, this.pos.clone(), this.vel.clone());
   }
 
+  /** Detach the tail as a tumbling segment (damage-model §6 step 4 —
+   *  the rig already binds `tail_section` per its slot list). Called
+   *  when the tail zone is destroyed (spar/fire rules), not only from
+   *  a damage threshold. */
+  detachTail(): void {
+    if (this.tailDetached) return;
+    this.tailDetached = true;
+    const segment = this.rig ? this.rig.detachSegment('tail_section') : null;
+    this.events.onDetachSegment?.(this, segment, this.pos.clone(), this.vel.clone());
+  }
+
+  /** Start the dying fall (damage-model §6 step 1). The jet is shot
+   *  down: `alive` stays true for physics, but `dying` makes it
+   *  untargetable (AI skips it, weapons skip it, lock breaks), zeroes
+   *  the throttle, and records the death cause/killer. The aircraft
+   *  keeps stepping with the solver running degraded — throttle 0,
+   *  controls zeroed — so the stall/spin model, asymmetric roll and
+   *  engine-out yaw produce the tumble naturally, and the controller's
+   *  gravity + solver drag drive the fall to its terminal velocity.
+   *  NOTE: Rapier gravity stays at scale 0 — the controller already
+   *  adds `acc.y -= G`, so setting gravityScale = 1 would double-count
+   *  gravity (the report's §6 step 1 assumed gravity lived in the
+   *  solver's force sum; in this port it lives in the controller). */
+  startDying(reason: string): void {
+    if (!this.alive || this.dying) return;
+    this.dying = true;
+    this.dyingReason = reason;
+    this.lastCrashReason = reason;
+    this.thrTarget = 0;
+    this.throttle = 0;
+    this.pitchIn = 0;
+    this.rollIn = 0;
+    this.yawIn = 0;
+    if (this.ai) this.ai.state = 'dead';
+    this.events.onDying?.(this, reason);
+  }
+
+  /** Ground impact after a dying fall (damage-model §6 step 5). The
+   *  explosion is scaled by the remaining fuel (a wreck with fuel
+   *  left fireballs; without fuel it crumples), debris scatters, and
+   *  only then does the aircraft become dead — handleDeaths (via
+   *  onCrash) does the explosion/scorch at THIS (impact) position,
+   *  not the position where the jet was shot down. */
+  finishCrash(): void {
+    if (!this.alive) return;
+    this.crashedFromDying = true;
+    this.alive = false;
+    if (
+      (this.damageZones.wingL > WING_DETACH_FATAL ||
+        this.damageZones.wingR > WING_DETACH_FATAL) &&
+      !this.wingDetached
+    ) {
+      this.detachWing();
+    }
+    this.group.visible = false;
+    this.body.setEnabled(false);
+    this.events.onCrash?.(this, this.dyingReason ?? 'crashed');
+  }
+
+  /** Instant vanish (v2 crash): hard landing / terrain impact when the
+   *  jet was NOT already dying — it is already on the ground, so there
+   *  is no fall to spectate. A dying jet never reaches here; its ground
+   *  contact calls finishCrash() instead. */
   crash(reason: string): void {
     if (!this.alive) return;
     this.alive = false;
@@ -1082,11 +1584,36 @@ export class Aircraft {
     this.respawn({ x, z, elev: y - GEAR_HEIGHT, hdg: hdgDeg });
   }
 
+  /**
+   * Give an air-spawned aircraft a flying speed along its nose. Enemies
+   * and traffic spawn in mid-air — a jet there is flying, not hovering
+   * at 0 kt. Without this the jet spawns below stall speed, the wing
+   * cannot hold 1 g, and no steering law can turn it; the AI bleeds
+   * altitude and circles while it accelerates from zero. Call after
+   * resetAt (respawn zeroes the body velocity). Ground spawns (runway,
+   * deck) do not call this.
+   */
+  setAirspeed(vMs: number): void {
+    const f = this.fwd();
+    this.body.setLinvel({ x: f.x * vMs, y: 0, z: f.z * vMs }, true);
+    this.vel.set(f.x * vMs, 0, f.z * vMs);
+    this.ias = vMs;
+  }
+
   /** Reset to a runway (v2 resetAt): repaired, refuelled, re-armed,
    *  5 s spawn protection for the player. The respawn timer is owned
    *  by main.ts (v1.1: tracked, so Restart cancels a pending respawn). */
   respawn(runway: RunwaySpawn): void {
-    this.pos.set(runway.x, runway.elev + GEAR_HEIGHT, runway.z);
+    // Never spawn inside the terrain: the analytic runway elevation can
+    // sit below the sampled mesh/collider height at plateau edges, and a
+    // spawn inside the heightfield is what the first-Take-Off crash looked
+    // like (jet falling nose-high from 5 ft before any throttle input).
+    // Clamp the spawn elevation to the real ground height.
+    const ground = this.terrainHeightAt
+      ? this.terrainHeightAt(runway.x, runway.z)
+      : runway.elev;
+    const elev = Math.max(runway.elev, ground);
+    this.pos.set(runway.x, elev + GEAR_HEIGHT, runway.z);
     this.vel.set(0, 0, 0);
     this.quat.setFromEuler(new THREE.Euler(0, runway.hdg * D2R, 0, 'YXZ'));
     this.throttle = 0;
@@ -1097,11 +1624,21 @@ export class Aircraft {
     this.vtolCounted = false;
     this.fuel = 1;
     this.hp = 100;
+    this.damageEntity.repair();
     this.damageZones.wingL = 0;
     this.damageZones.wingR = 0;
     this.damageZones.tail = 0;
     this.damageZones.engineL = 0;
     this.damageZones.engineR = 0;
+    this.damageZones.fuel = 0;
+    this.damageZones.fin = 0;
+    this.fireKind = null;
+    this.fireIntensity = 0;
+    this.fireZone = null;
+    this.fireSpreadTimer = 0;
+    this.dying = false;
+    this.dyingReason = null;
+    this.crashedFromDying = false;
     this.alive = true;
     this.msl = 6;
     this.flares = 30;
@@ -1109,10 +1646,15 @@ export class Aircraft {
     this.flareCd = 0;
     this.grounded = true;
     this.onDeck = false;
+    this.onSurface = false;
     this.stalled = false;
+    this.spin = 0;
+    this.spinArrow = 0;
+    this.betaDeg = 0;
     this._trapped = false;
     this.trapTimer = 0;
     this.wingDetached = false;
+    this.tailDetached = false;
     this.lastHitByIsPlayer = false;
     this.lastHitByRecord = null;
     this.lastCrashReason = null;
@@ -1147,7 +1689,11 @@ export class Aircraft {
     this.syncFromBody();
   }
 
-  /** Read the Rapier body into pos / vel / quat and the visual group. */
+  /** Read the Rapier body into pos / vel / quat and the visual group.
+   *  Also reads the body's angular velocity (world frame) into
+   *  angVelBody (body frame) for the BET solver's v_local = v_cg +
+   *  ω × r — the solver needs the true rate, including anything
+   *  Rapier's contact solver or angular damping did to it. */
   private syncFromBody(): void {
     const t = this.body.translation();
     this.pos.set(t.x, t.y, t.z);
@@ -1155,6 +1701,8 @@ export class Aircraft {
     this.vel.set(v.x, v.y, v.z);
     const r = this.body.rotation();
     this.quat.set(r.x, r.y, r.z, r.w);
+    const av = this.body.angvel();
+    this.angVelBody.set(av.x, av.y, av.z).applyQuaternion(this.quat.clone().invert());
     this.group.position.copy(this.pos);
     this.group.quaternion.copy(this.quat);
   }

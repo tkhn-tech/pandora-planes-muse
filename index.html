@@ -67,6 +67,14 @@
   #warn{position:fixed;left:50%;top:calc(64px + env(safe-area-inset-top));transform:translateX(-50%);z-index:6;
     pointer-events:none;font-size:13px;font-weight:800;letter-spacing:.08em;color:#ff5a5a;text-shadow:0 1px 6px rgba(0,0,0,.8);opacity:0;transition:opacity .3s}
   #warn.show{opacity:1}
+  /* Spectate banner (damage-model §5): shown while the player's wreck
+     is falling and for 2 s after impact. Text + a Respawn button. */
+  #spectate{position:fixed;left:50%;top:calc(110px + env(safe-area-inset-top));transform:translateX(-50%);z-index:6;
+    display:none;align-items:center;gap:10px;background:rgba(6,18,30,.75);border:1px solid rgba(255,90,90,.5);
+    border-radius:12px;padding:8px 12px;backdrop-filter:blur(4px);pointer-events:auto}
+  #spectate.show{display:flex}
+  #spectateText{font-size:12px;font-weight:800;letter-spacing:.06em;color:#ffb3b3;text-shadow:0 1px 6px rgba(0,0,0,.8)}
+  #respawnBtn{background:#c0392b;color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:12px;font-weight:800;cursor:pointer}
   /* left: throttle slider (X-Plane 9 style) + 2-axis stick */
   #thrWrap{position:fixed;left:10px;top:38%;z-index:6;width:34px;height:170px;transform:translateY(-50%);
     background:rgba(6,18,30,.6);border:1px solid rgba(140,190,230,.3);border-radius:17px;backdrop-filter:blur(4px)}
@@ -107,6 +115,17 @@
   #pipper{position:fixed;left:-100px;top:-100px;width:34px;height:34px;margin:-17px 0 0 -17px;z-index:6;pointer-events:none;
     border:2px solid rgba(255,209,102,.9);border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
   #pipper:after{content:'';position:absolute;left:50%;top:50%;width:6px;height:6px;margin:-3px 0 0 -3px;background:#ffd166;border-radius:50%}
+  /* ROTATE cue (green, under the warn line) + CCIP bomb pipper (gold ring
+     with crosshair; red when below the min-release altitude). */
+  #rotateCue{position:fixed;left:50%;top:calc(88px + env(safe-area-inset-top));transform:translateX(-50%);z-index:6;
+    pointer-events:none;font-size:15px;font-weight:800;letter-spacing:.14em;color:#7dff8a;text-shadow:0 1px 6px rgba(0,0,0,.8);opacity:0;transition:opacity .2s}
+  #rotateCue.show{opacity:1}
+  #ccip{position:fixed;left:-100px;top:-100px;width:30px;height:30px;margin:-15px 0 0 -15px;z-index:6;pointer-events:none;
+    border:2px solid rgba(255,209,102,.9);border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+  #ccip:before{content:'';position:absolute;left:50%;top:-7px;width:2px;height:44px;margin-left:-1px;background:rgba(255,209,102,.9)}
+  #ccip:after{content:'';position:absolute;top:50%;left:-7px;height:2px;width:44px;margin-top:-1px;background:rgba(255,209,102,.9)}
+  #ccip.danger{border-color:rgba(255,90,90,.95)}
+  #ccip.danger:before,#ccip.danger:after{background:rgba(255,90,90,.95)}
   .overlay{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;
     background:rgba(4,10,18,.78);backdrop-filter:blur(4px);padding:16px;overflow-y:auto}
   .card{max-width:520px;width:100%;max-height:calc(100vh - 48px);max-height:calc(100dvh - 48px);overflow-y:auto;text-align:center;
@@ -200,7 +219,10 @@
 <div id="miniMap"><canvas id="miniCv" width="144" height="144"></canvas><div id="miniStats">KILLS <b id="miniKills">0</b> · TRAPS <b id="miniTraps">0</b> · <b id="miniTime">00:00</b></div></div>
 <div id="toast"><h2 id="toastTitle"></h2><p id="toastSub"></p></div>
 <div id="warn"></div>
+<div id="rotateCue">ROTATE</div>
+<div id="spectate"><span id="spectateText"></span><button id="respawnBtn">Respawn now (R)</button></div>
 <div id="pipper" style="display:none"></div>
+<div id="ccip" style="display:none"></div>
 <div id="debug" class="hidden"></div>
 
 <div id="thrWrap"><span class="tLab">THR</span><input type="range" id="thr" min="0" max="100" value="0"><span id="thrVal">0%</span></div>
@@ -234,11 +256,25 @@
       <h3>✈️ Choose your aircraft</h3>
       <div class="seaRow"><div class="seg" id="jetPicker">
         <button data-k="fa18" class="on">F/A-18F<small>carrier · 196 kN</small></button>
-        <button data-k="f35">F-35A VTOL<small>lift-fan · 191 kN</small></button>
+        <button data-k="f35a">F-35A VTOL<small>lift-fan · 191 kN</small></button>
         <button data-k="f22">F-22<small>312 kN · agile</small></button>
-        <button data-k="f15">F-15E<small>258 kN · fast</small></button>
+        <button data-k="f15e">F-15E<small>258 kN · fast</small></button>
       </div></div>
-      <div class="seaRow"><span class="lab" id="jetSpec">Stall 120 kt · 9 G</span></div>
+      <div class="seaRow"><span class="lab" id="jetSpec">Stall 128 kt · 9 G · carrier-capable</span></div>
+      <div class="seaRow"><span class="lab">Spawn</span><div class="seg" id="segSpawn">
+        <button data-v="alpha" class="on">Alpha runway<small>land · 650 m</small></button><button data-v="carrier">Helicarrier deck<small>fly at 350 m</small></button></div></div>
+    </div>
+    <div class="seaBox">
+      <h3>🎮 Controls — keyboard stick</h3>
+      <div class="seaRow"><span class="lab">Pitch invert</span><div class="seg" id="segInvPitch">
+        <button data-v="0" class="on">Normal</button><button data-v="1">Inverted</button></div></div>
+      <div class="seaRow"><span class="lab">Roll invert</span><div class="seg" id="segInvRoll">
+        <button data-v="0" class="on">Normal</button><button data-v="1">Inverted</button></div></div>
+      <div class="seaRow"><span class="lab">Pitch sens</span><div class="sliderRow">
+        <input type="range" id="pitchSensSl" min="0.5" max="2" step="0.05" value="1"><span class="stepVal" id="pitchSensVal">1.00×</span></div></div>
+      <div class="seaRow"><span class="lab">Roll sens</span><div class="sliderRow">
+        <input type="range" id="rollSensSl" min="0.5" max="2" step="0.05" value="1"><span class="stepVal" id="rollSensVal">1.00×</span></div></div>
+      <div class="seaRow"><span class="lab"></span><span style="font-size:11px;color:#9db8cc">Sensitivity is the stick exponent (1.00× = linear; 2.00× = soft centre, 0.50× = sharp centre). Applies to the keyboard arrows. Mouse yoke and gamepad are unaffected.</span></div>
     </div>
     <div class="seaBox">
       <h3>⚔️ Enemies &amp; traffic</h3>
@@ -266,12 +302,12 @@
       <div class="seaRow"><span class="lab">Turbulence</span><div class="sliderRow">
         <input type="range" id="turbSl" min="0" max="3" step="0.1" value="0"><span class="stepVal" id="turbVal">0.0</span></div></div>
       <div class="seaRow"><span class="lab">Failure</span><div class="seg" id="segFail">
-        <button data-v="none" class="on">None</button><button data-v="engineL">Eng L</button><button data-v="engineR">Eng R</button><button data-v="fire">Eng fire</button><button data-v="hydro">Hydraulic</button><button data-v="gear">Gear jam</button><button data-v="fuel">Fuel leak</button></div></div>
+        <button data-v="none" class="on">Off</button><button data-v="engineL">Eng L</button><button data-v="engineR">Eng R</button><button data-v="engineFire">Eng fire</button><button data-v="hydraulic">Hydraulic</button><button data-v="gearJam">Gear jam</button><button data-v="fuelLeak">Fuel leak</button><button data-v="random">Random</button></div></div>
       <div class="seaRow"><span class="lab">Fail when</span><div class="seg" id="segFailWhen">
         <button data-v="start" class="on">At start</button><button data-v="random">Random 30–90 s</button></div></div>
       <div class="seaRow"><span class="lab">Carrier</span><div class="seg"><button class="on" data-v="ford">Gerald Ford 🚢</button></div></div>
     </div>
-    <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
+    <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
     <div class="ver">v3.0 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
@@ -281,14 +317,19 @@
     <h2>Controls</h2>
     <div class="keys">
       <b>Stick</b> (bottom-left) — pitch / roll. Drag, release to centre.<br>
-      <b>Throttle</b> (left slider) — Shift / Ctrl or ↑ / ↓ on keyboard.<br>
+      <b>Throttle</b> (left slider) — W / S, or Shift / Ctrl.<br>
       <b>Flaps / Airbrake / Vector</b> — right panel sliders. Vector only on the F-35A: at 90° the throttle becomes lift — hover, then descend under 4 m/s onto a VTOL pad.<br>
-      <b>Throttle</b> W / S (or Shift / Ctrl). <b>Stick</b> arrow keys, drag on the canvas (mouse yoke), or tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
+      <b>Keyboard —</b> <b>Stick</b> arrow keys (pitch / roll) · <b>Rudder</b> Q / E · <b>Throttle</b> W / S (or Shift / Ctrl) · <b>Flaps</b> [ / ] (±10°) · <b>Airbrake</b> X (toggle) · <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only) · <b>Camera</b> C · <b>Camera reset</b> R · <b>Pause</b> P. Mouse: drag on the canvas steers (mouse yoke) in Chase / Cockpit cam. Tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
+      <b>Stick feel:</b> the keyboard stick slews at ~3°/s per frame step so it moves like a real stick, not a switch. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
       <b>Camera</b> C — Chase / Cockpit / Free orbit (drag to orbit, pinch to zoom in Free). R resets the camera.<br>
-      <b>Pause</b> P · <b>Restart</b> ↻ button.<br>
+      <b>Pause</b> P · <b>Restart</b> ↻ button · <b>Setup</b> (pause menu) — change the sandbox settings mid-flight and Apply &amp; Restart, or Resume with the old settings.<br>
+      <b>Spawn:</b> Alpha runway, or the Helicarrier deck (setup menu) — the jet starts on the deck at the carrier's heading and speed, ready to roll off the bow.<br>
       <b>Carrier trap:</b> hook down, under 140 kt over one of the three stern wires — the wire catches you and hauls you to a stop. Over that speed it snaps.<br>
       <b>VTOL pad:</b> F-35A only — vector 70°+, slow vertical descent onto a marked yellow pad on the deck.<br>
       <b>Lead pipper:</b> the gold ring on the HUD is where your gun rounds will meet the locked target — put the ring on the jet, not the jet itself.<br>
+      <b>ROTATE:</b> the green cue appears on the runway roll at your jet's rotation speed — pull back then, not before.<br>
+      <b>CCIP:</b> with bombs carried, the gold crosshair ring marks where a bomb released now would hit; it turns red (and the HUD warns PULL UP) when you are below the minimum-release altitude for your dive — the 4&nbsp;g pull-out needs that height.<br>
+      <b>Spin:</b> if the jet departs into a spin the HUD shows an arrow — push the stick WITH the arrow, nose down, and the spin unwinds.<br>
       <b>Stall:</b> below stall speed the wing drops and the nose falls — push the nose down and add power to recover.<br>
       <b>Damage:</b> wing hits roll you, engine hits cost thrust. Smoke under 60%, fire under 35%.<br>
       <b>Minimap:</b> green = runways, blue = helicarrier, red diamonds = enemies, grey = traffic, white = you.
@@ -301,7 +342,7 @@
   <div class="card">
     <h1>Paused</h1>
     <p class="sub" id="pauseSub"></p>
-    <div class="btnRow"><button class="bigBtn" id="resumeBtn">Resume</button><button class="ghostBtn" id="restartBtn2">Restart round</button></div>
+    <div class="btnRow"><button class="bigBtn" id="resumeBtn">Resume</button><button class="ghostBtn" id="setupBtn">Setup ⚙️</button><button class="ghostBtn" id="restartBtn2">Restart round</button></div>
     <div class="ver" id="pauseStats"></div>
   </div>
 </div>

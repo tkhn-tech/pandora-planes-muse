@@ -24,6 +24,19 @@ export type FailureScenario =
   | 'fuelLeak'
   | 'random';
 
+/** Valid aircraft keys / failure values, for validating stored configs. */
+const SPECS_KEYS = new Set(['fa18', 'f35a', 'f22', 'f15e']);
+const FAILURE_VALUES = new Set([
+  'none',
+  'engineL',
+  'engineR',
+  'engineFire',
+  'hydraulic',
+  'gearJam',
+  'fuelLeak',
+  'random',
+]);
+
 export interface SandboxConfig {
   aircraftKey: string;
   enemies: number;
@@ -41,6 +54,19 @@ export interface SandboxConfig {
     clouds: boolean;
   };
   failure: FailureScenario;
+  /** Failure timing: 'start' fires a named scenario at 3 s; 'random'
+   *  fires it at a random 30–90 s. 'random' as the scenario picks a
+   *  random scenario; the timing still comes from failWhen. */
+  failWhen: 'start' | 'random';
+  /** Spawn: Alpha land runway, or the helicarrier deck. */
+  spawn: 'alpha' | 'carrier';
+  /** Stick shaping (PC keyboard): invert + sensitivity exponent. */
+  invertPitch: boolean;
+  invertRoll: boolean;
+  /** Sensitivity exponent gamma, 0.5–2.0 (1.0 = linear). Applied as
+   *  out = sign(x) * |x|^gamma to the keyboard stick. */
+  pitchSens: number;
+  rollSens: number;
   carrier: string;
 }
 
@@ -61,14 +87,22 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     clouds: false,
   },
   failure: 'none',
+  failWhen: 'start',
+  spawn: 'alpha',
+  invertPitch: false,
+  invertRoll: false,
+  pitchSens: 1,
+  rollSens: 1,
   carrier: 'ford',
 };
 
+// Stall speeds at combat mass (spec.stallSpeed, m/s -> kt): F-18 66 m/s
+// = 128 kt, F-35A 68 = 132 kt, F-22 54 = 105 kt, F-15E 62 = 120 kt.
 const JET_DESC: Record<string, string> = {
-  fa18: 'Stall 120 kt · 9 G · carrier-capable',
-  f35: 'Stall 117 kt · 9 G · lift-fan VTOL 0-90°',
-  f22: 'Stall 126 kt · 9.5 G · fastest turn',
-  f15: 'Stall 120 kt · 9 G · highest top speed',
+  fa18: 'Stall 128 kt · 9 G · carrier-capable',
+  f35a: 'Stall 132 kt · 9 G · lift-fan VTOL 0-90°',
+  f22: 'Stall 105 kt · 9.5 G · fastest turn',
+  f15e: 'Stall 120 kt · 9 G · highest top speed',
 };
 
 /** Weather preset -> slider values + flags (template segWx click handler). */
@@ -90,20 +124,120 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
+/** localStorage key for the persisted sandbox setup (whole config). */
+const STORAGE_KEY = 'pandora-planes-config-v1';
+
 export class SandboxMenu {
   private readonly onStart: (cfg: SandboxConfig) => void;
   private cfg: SandboxConfig = structuredClone(DEFAULT_CONFIG);
   private wxPreset = 'clear';
+  /** In-game re-setup mode: the start button becomes "Apply & Restart"
+   *  and routes to onApplyRestart instead of onStart (which builds the
+   *  carrier — build() must never run twice in one session). */
+  private mode: 'preflight' | 'ingame' = 'preflight';
+  private onApplyRestart: ((cfg: SandboxConfig) => void) | null = null;
+  private onResume: (() => void) | null = null;
 
   constructor(onStart: (cfg: SandboxConfig) => void) {
     this.onStart = onStart;
+    this.loadStored();
     this.wireSegments();
     this.wireSteppers();
     this.wireSliders();
     const startBtn = $('startBtn');
-    startBtn?.addEventListener('click', () => this.onStart(this.read()));
+    startBtn?.addEventListener('click', () => {
+      if (this.mode === 'ingame' && this.onApplyRestart) {
+        this.onApplyRestart(this.read());
+      } else {
+        this.onStart(this.read());
+      }
+    });
+    $('menuResumeBtn')?.addEventListener('click', () => {
+      this.onResume?.();
+    });
     // Keep the menu's live state in sync while the user fiddles.
     this.applyLive(this.cfg);
+  }
+
+  /** Switch between the pre-flight menu and the in-game re-setup drawer.
+   *  In-game the button reads "Apply & Restart" and a Resume button
+   *  appears; the carrier is never rebuilt on this path. */
+  setMode(
+    mode: 'preflight' | 'ingame',
+    onApplyRestart?: (cfg: SandboxConfig) => void,
+    onResume?: () => void,
+  ): void {
+    this.mode = mode;
+    this.onApplyRestart = onApplyRestart ?? null;
+    this.onResume = onResume ?? null;
+    const startBtn = $('startBtn') as HTMLButtonElement | null;
+    if (startBtn) {
+      startBtn.textContent =
+        mode === 'ingame' ? 'Apply & Restart 🔄' : 'Take Off 🛫';
+      startBtn.disabled = false;
+    }
+    $('menuResumeBtn')?.classList.toggle('hidden', mode !== 'ingame');
+  }
+
+  /** Persist the whole setup so the next session opens where this one
+   *  left off (controls + spawn + everything else). */
+  private save(): void {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.cfg));
+    } catch {
+      // Private mode / quota — the in-memory config still works.
+    }
+  }
+
+  /** Load a stored setup over the defaults, validating every field so a
+   *  stale or corrupt entry can never break the menu. */
+  private loadStored(): void {
+    let raw: string | null = null;
+    try {
+      raw = localStorage.getItem(STORAGE_KEY);
+    } catch {
+      return;
+    }
+    if (!raw) return;
+    try {
+      const s = JSON.parse(raw) as Partial<SandboxConfig>;
+      const c = this.cfg;
+      if (typeof s.aircraftKey === 'string' && SPECS_KEYS.has(s.aircraftKey)) {
+        c.aircraftKey = s.aircraftKey;
+      }
+      if (typeof s.enemies === 'number') c.enemies = clamp(Math.round(s.enemies), 0, 20);
+      if (s.enemySkill === 'rookie' || s.enemySkill === 'veteran' || s.enemySkill === 'ace') {
+        c.enemySkill = s.enemySkill;
+      }
+      if (typeof s.enemySpawnDistance === 'number') {
+        c.enemySpawnDistance = clamp(s.enemySpawnDistance, 400, 3000);
+      }
+      if (typeof s.traffic === 'boolean') c.traffic = s.traffic;
+      if (typeof s.trafficCount === 'number') {
+        c.trafficCount = clamp(Math.round(s.trafficCount), 1, 30);
+      }
+      if (typeof s.tod === 'number') c.tod = clamp(s.tod, 0, 24);
+      if (s.weather && typeof s.weather === 'object') {
+        const w = s.weather as Partial<SandboxConfig['weather']>;
+        if (typeof w.windSpeed === 'number') c.weather.windSpeed = clamp(w.windSpeed, 0, 25);
+        if (typeof w.windDir === 'number') c.weather.windDir = clamp(w.windDir, 0, 360);
+        if (typeof w.turbulence === 'number') c.weather.turbulence = clamp(w.turbulence, 0, 3);
+        if (typeof w.rain === 'boolean') c.weather.rain = w.rain;
+        if (typeof w.fog === 'number') c.weather.fog = w.fog;
+        if (typeof w.clouds === 'boolean') c.weather.clouds = w.clouds;
+      }
+      if (typeof s.failure === 'string' && FAILURE_VALUES.has(s.failure)) {
+        c.failure = s.failure as FailureScenario;
+      }
+      if (s.failWhen === 'start' || s.failWhen === 'random') c.failWhen = s.failWhen;
+      if (s.spawn === 'alpha' || s.spawn === 'carrier') c.spawn = s.spawn;
+      if (typeof s.invertPitch === 'boolean') c.invertPitch = s.invertPitch;
+      if (typeof s.invertRoll === 'boolean') c.invertRoll = s.invertRoll;
+      if (typeof s.pitchSens === 'number') c.pitchSens = clamp(s.pitchSens, 0.5, 2);
+      if (typeof s.rollSens === 'number') c.rollSens = clamp(s.rollSens, 0.5, 2);
+    } catch {
+      // Corrupt JSON — keep the defaults.
+    }
   }
 
   private segWire(
@@ -131,19 +265,40 @@ export class SandboxMenu {
         spec.textContent =
           JET_DESC[this.cfg.aircraftKey] ?? JET_DESC['fa18']!;
       }
+      this.save();
+    });
+    this.segWire('segSpawn', (d) => {
+      this.cfg.spawn = d['v'] === 'carrier' ? 'carrier' : 'alpha';
+      this.save();
     });
     this.segWire('segSkill', (d) => {
       this.cfg.enemySkill = (d['v'] as EnemySkill) ?? 'veteran';
+      this.save();
     });
     this.segWire('segTraffic', (d) => {
       this.cfg.traffic = d['v'] === '1';
+      this.save();
     });
     this.segWire('segWx', (d) => {
       this.wxPreset = d['v'] ?? 'clear';
       this.applyWxPreset();
+      this.save();
     });
     this.segWire('segFail', (d) => {
       this.cfg.failure = (d['v'] as FailureScenario) ?? 'none';
+      this.save();
+    });
+    this.segWire('segFailWhen', (d) => {
+      this.cfg.failWhen = d['v'] === 'random' ? 'random' : 'start';
+      this.save();
+    });
+    this.segWire('segInvPitch', (d) => {
+      this.cfg.invertPitch = d['v'] === '1';
+      this.save();
+    });
+    this.segWire('segInvRoll', (d) => {
+      this.cfg.invertRoll = d['v'] === '1';
+      this.save();
     });
   }
 
@@ -172,6 +327,7 @@ export class SandboxMenu {
       set: (v: number) => void,
       min: number,
       max: number,
+      fmt: (v: number) => string = (v) => String(v),
     ) => {
       const root = $(id);
       if (!root) return;
@@ -181,10 +337,14 @@ export class SandboxMenu {
             clamp(get() + Number((b as HTMLElement).dataset['d'] ?? 0), min, max),
           );
           const val = $(valId);
-          if (val) val.textContent = String(get());
+          if (val) val.textContent = fmt(get());
+          this.save();
         });
       });
     };
+    // Enemies 0 = Off (first-class choice: no enemies spawn, no AI
+    // combat). The stepper remembers the count, so stepping back up
+    // restores it — no separate toggle needed.
     wire(
       'stepEnemy',
       'stepEnemyVal',
@@ -192,8 +352,9 @@ export class SandboxMenu {
       (v) => {
         this.cfg.enemies = v;
       },
-      1,
+      0,
       20,
+      (v) => (v === 0 ? 'Off' : String(v)),
     );
     wire(
       'stepTraffic',
@@ -221,6 +382,7 @@ export class SandboxMenu {
         set(Number(input.value));
         const val = $(valId);
         if (val) val.textContent = fmt(get());
+        this.save();
       });
     };
     wire(
@@ -274,10 +436,30 @@ export class SandboxMenu {
         this.cfg.weather.turbulence = v;
       },
     );
+    // Stick sensitivity exponents, 0.5–2.0 (1.0 = linear).
+    wire(
+      'pitchSensSl',
+      'pitchSensVal',
+      (v) => v.toFixed(2) + '×',
+      () => this.cfg.pitchSens,
+      (v) => {
+        this.cfg.pitchSens = v;
+      },
+    );
+    wire(
+      'rollSensSl',
+      'rollSensVal',
+      (v) => v.toFixed(2) + '×',
+      () => this.cfg.rollSens,
+      (v) => {
+        this.cfg.rollSens = v;
+      },
+    );
   }
 
   /** Read the current menu state as a SandboxConfig. */
   read(): SandboxConfig {
+    this.save();
     return structuredClone(this.cfg);
   }
 
@@ -292,7 +474,7 @@ export class SandboxMenu {
       const e = $(id);
       if (e) e.textContent = v;
     };
-    setText('stepEnemyVal', String(cfg.enemies));
+    setText('stepEnemyVal', cfg.enemies === 0 ? 'Off' : String(cfg.enemies));
     setText('stepTrafficVal', String(cfg.trafficCount));
     setVal('spawnSl', String(cfg.enemySpawnDistance));
     setText('spawnVal', cfg.enemySpawnDistance + ' m');
@@ -309,6 +491,10 @@ export class SandboxMenu {
     setText('windDirVal', cfg.weather.windDir + '°');
     setVal('turbSl', String(cfg.weather.turbulence));
     setText('turbVal', cfg.weather.turbulence.toFixed(1));
+    setVal('pitchSensSl', String(cfg.pitchSens));
+    setText('pitchSensVal', cfg.pitchSens.toFixed(2) + '×');
+    setVal('rollSensSl', String(cfg.rollSens));
+    setText('rollSensVal', cfg.rollSens.toFixed(2) + '×');
     setText('jetSpec', JET_DESC[cfg.aircraftKey] ?? '');
     // Segment 'on' states.
     const markSeg = (id: string, match: (b: HTMLElement) => boolean) => {
@@ -319,9 +505,13 @@ export class SandboxMenu {
       });
     };
     markSeg('jetPicker', (b) => b.dataset['k'] === cfg.aircraftKey);
+    markSeg('segSpawn', (b) => b.dataset['v'] === cfg.spawn);
     markSeg('segSkill', (b) => b.dataset['v'] === cfg.enemySkill);
     markSeg('segTraffic', (b) => b.dataset['v'] === (cfg.traffic ? '1' : '0'));
     markSeg('segFail', (b) => b.dataset['v'] === cfg.failure);
+    markSeg('segFailWhen', (b) => b.dataset['v'] === cfg.failWhen);
+    markSeg('segInvPitch', (b) => b.dataset['v'] === (cfg.invertPitch ? '1' : '0'));
+    markSeg('segInvRoll', (b) => b.dataset['v'] === (cfg.invertRoll ? '1' : '0'));
   }
 
   show(): void {

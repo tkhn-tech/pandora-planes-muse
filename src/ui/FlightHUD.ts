@@ -16,6 +16,9 @@ export interface HudGameState {
   traps: number;
   elapsed: number; // seconds
   lockTarget: Aircraft | null;
+  /** True when the jet is below the min-release altitude for its dive
+   *  (CCIP, 4 g pull-out) — the HUD shows PULL UP. */
+  belowMinReleaseAlt?: boolean;
 }
 
 export interface MinimapEntities {
@@ -46,7 +49,8 @@ export class FlightHUD {
       'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudAoA', 'hudG',
       'hudFuel', 'hudWpn', 'hudScore', 'hudVec', 'vecPill', 'vecRow',
       'miniKills', 'miniTraps', 'miniTime', 'warn', 'lockInd', 'pipper',
-      'toast', 'toastTitle', 'toastSub', 'debug', 'soundBtn',
+      'ccip', 'rotateCue', 'toast', 'toastTitle', 'toastSub', 'debug',
+      'soundBtn',
     ];
     for (const id of ids) this.el[id] = document.getElementById(id);
     const miniCv = document.getElementById('miniCv') as HTMLCanvasElement | null;
@@ -80,19 +84,47 @@ export class FlightHUD {
     set('miniTraps', String(game.traps));
     set('miniTime', fmtTime(game.elapsed));
 
-    // Stall + low-fuel warnings.
+    // Stall / spin / fire / pull-up / low-fuel warnings (priority order).
+    // Spin first: the NATOPS arrow is the only thing that matters in
+    // a spin (spinArrow -1 = push the stick LEFT, +1 = push it RIGHT).
+    // Fire second: a burning jet (damage-model §3) — the kind tells
+    // the player what to do (fuel fire: dive fast to blow it out;
+    // engine fire: cut the throttle).
     const w = this.el['warn'];
     if (w) {
-      if (ac.stalled && ac.alive) {
+      if (ac.spin > 0.5 && ac.alive) {
+        w.textContent =
+          ac.spinArrow < 0
+            ? '◀ SPIN — PUSH STICK LEFT'
+            : 'SPIN — PUSH STICK RIGHT ▶';
+        w.classList.add('show');
+      } else if (ac.fireKind && ac.alive) {
+        w.textContent =
+          ac.fireKind === 'fuel'
+            ? '🔥 FUEL FIRE — DIVE FAST TO BLOW IT OUT'
+            : '🔥 ENGINE FIRE — CUT THROTTLE TO STARVE IT';
+        w.classList.add('show');
+      } else if (ac.stalled && ac.alive) {
         w.textContent = '⚠ STALL — NOSE DOWN, FULL POWER';
         w.classList.add('show');
-      } else if (ac.fuel < 15 && ac.alive) {
+      } else if (game.belowMinReleaseAlt && ac.alive) {
+        w.textContent = '⚠ PULL UP — BELOW MIN RELEASE ALT';
+        w.classList.add('show');
+      } else if (ac.fuel < 0.15 && ac.alive) {
+        // 0.15 on the 0..1 fuel scale — the old `ac.fuel < 15` compared a
+        // 0..1 fraction against a 0..100 threshold, so LOW FUEL flashed
+        // constantly even at 100% fuel.
         w.textContent = '⚠ LOW FUEL';
         w.classList.add('show');
       } else {
         w.classList.remove('show');
       }
     }
+
+    // ROTATE cue (BET §3): green, shown while the gear is on a surface
+    // and the jet is at/above its per-spec rotation speed.
+    const rc = this.el['rotateCue'];
+    if (rc) rc.classList.toggle('show', ac.alive && ac.rotateCue);
 
     // Lock indicator.
     const li = this.el['lockInd'];
@@ -178,6 +210,26 @@ export class FlightHUD {
   /** Convenience: draw with the canvas this HUD was constructed with. */
   drawMinimapDefault(e: MinimapEntities): void {
     if (this.mini) this.drawMinimap(this.mini, e);
+  }
+
+  /** Place the CCIP (bomb impact point) pipper at viewport pixel coords.
+   *  Gold normally; red when the jet is below the min-release altitude
+   *  for its dive (no room for the 4 g pull-out). Pass null to hide it. */
+  showCcip(x: number | null, y: number | null, danger = false): void {
+    const c = this.el['ccip'];
+    if (!c) return;
+    if (x === null || y === null) {
+      c.style.display = 'none';
+      return;
+    }
+    c.style.left = x + 'px';
+    c.style.top = y + 'px';
+    c.style.display = 'block';
+    c.classList.toggle('danger', danger);
+  }
+
+  hideCcip(): void {
+    this.showCcip(null, null);
   }
 
   /** Place the gold lead-pipper ring at viewport pixel coords (from

@@ -25,11 +25,15 @@ export const FORD_SCALE = 333 / 52.9;
 export const FORD_DECK_LOCAL_Y = (1.28 - 2.8) * FORD_SCALE; // -9.57 m from group origin
 export const CARRIER_SPEED = 40; // m/s
 export const CARRIER_ALT = 350; // m
-/** v2 startRound: ~1.1 km from Alpha, in the player's forward view. */
-export const CARRIER_START_POS = new THREE.Vector3(-500, 350, -200);
+/** v2 startRound: ~900 m dead ahead of Alpha (was ~1.1 km at 38 deg left
+ *  of the takeoff heading — outside a portrait phone's ~±17 deg FOV, so
+ *  the carrier was never seen). Alpha is at (-1400, -900) heading east;
+ *  the carrier sits at (-500, -900) heading east to its first waypoint,
+ *  so it is on the nose at round start in every viewport. */
+export const CARRIER_START_POS = new THREE.Vector3(-500, 350, -900);
 /** v2: first leg east from the start position, with the takeoff direction. */
 export const CARRIER_WAYPOINTS: THREE.Vector3[] = [
-  new THREE.Vector3(1400, 350, 0),
+  new THREE.Vector3(1400, 350, -900),
   new THREE.Vector3(700, 350, 1212),
   new THREE.Vector3(-700, 350, 1212),
   new THREE.Vector3(-1400, 350, 0),
@@ -304,7 +308,11 @@ export class HelicarrierController {
     );
     const desc = RAPIER.ColliderDesc.cuboid(DECK_HALF_X, 0.75, DECK_HALF_Z)
       .setTranslation(0, this.deckLocalY - 0.75, 0)
-      .setFriction(1.0)
+      // Friction 0 (was 1.0): same takeoff-killer as the terrain — the
+      // controller owns deck physics (traps, deck-velocity transfer), so
+      // the deck collider must not eat thrust through Coulomb friction.
+      .setFriction(0)
+      .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min)
       .setRestitution(0)
       // Collision events feed the integrator's notifyContact() dispatch.
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
@@ -317,7 +325,12 @@ export class HelicarrierController {
   reset(pos?: THREE.Vector3, yaw?: number): void {
     this.alive = true;
     this.pos.copy(pos ?? CARRIER_START_POS);
-    this.yaw = yaw ?? Math.atan2(1400 - this.pos.x, 0 - this.pos.z);
+    this.yaw =
+      yaw ??
+      Math.atan2(
+        CARRIER_WAYPOINTS[0]!.x - this.pos.x,
+        CARRIER_WAYPOINTS[0]!.z - this.pos.z,
+      );
     this.wpIndex = 0;
     this.list = 0;
     this.yawRate = 0;

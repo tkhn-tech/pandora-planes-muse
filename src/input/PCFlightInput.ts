@@ -30,7 +30,34 @@ export interface PCInputEvents {
   pausePressed: boolean;
   bombPressed: boolean;
   brakeHeld: boolean;
+  /** Flaps step keys: [ = up 10 deg, ] = down 10 deg. */
+  flapsUpPressed: boolean;
+  flapsDownPressed: boolean;
+  /** X toggles the airbrake. */
+  airbrakePressed: boolean;
 }
+
+/** Keyboard stick shaping, from the setup menu (SandboxConfig). The
+ *  exponent gamma is applied as out = sign(x) * |x|^gamma (1.0 =
+ *  linear); inversion flips the axis. Applies to the KEYBOARD stick
+ *  only — the mouse yoke and gamepad are analogue and unaffected. */
+export interface StickShaping {
+  invertPitch: boolean;
+  invertRoll: boolean;
+  pitchSens: number;
+  rollSens: number;
+}
+
+const DEFAULT_SHAPING: StickShaping = {
+  invertPitch: false,
+  invertRoll: false,
+  pitchSens: 1,
+  rollSens: 1,
+};
+
+/** Keyboard stick slew, units/s — the arrow-key stick ramps to its
+ *  target instead of jumping, so it moves like a real stick. */
+const STICK_SLEW = 3;
 
 const DEADZONE = 0.12;
 
@@ -44,6 +71,10 @@ export class PCFlightInput implements IFlightInputProvider {
   private throttle = 0;
   private camMode = 0; // 0 chase, 1 cockpit, 2 free-orbit
   private lastPoll = performance.now();
+  private shaping: StickShaping = { ...DEFAULT_SHAPING };
+  /** Slewed keyboard stick (ramps toward the arrow-key target). */
+  private kbPitch = 0;
+  private kbRoll = 0;
 
   // Mouse yoke: drag on the canvas steers in chase/cockpit cam (template
   // ~1750); in free-orbit the same drag orbits (main.ts owns that path).
@@ -95,6 +126,11 @@ export class PCFlightInput implements IFlightInputProvider {
     }
   }
 
+  /** Stick shaping from the setup menu (inversion + sensitivity). */
+  setStickShaping(shaping: Partial<StickShaping>): void {
+    this.shaping = { ...this.shaping, ...shaping };
+  }
+
   setAircraftKind(_kind: 'fixed-wing' | 'vtol' | 'rotary'): void {
     // No per-kind behaviour on PC.
   }
@@ -125,12 +161,35 @@ export class PCFlightInput implements IFlightInputProvider {
       px = clamp(this.yoke.dy / 60, -1, 1);
       rx = clamp(-this.yoke.dx / 60, -1, 1);
     }
-    if (this.keys.has('ArrowUp')) px -= 1;
-    if (this.keys.has('ArrowDown')) px += 1;
-    if (this.keys.has('ArrowLeft')) rx += 1;
-    if (this.keys.has('ArrowRight')) rx -= 1;
-    if (this.keys.has('KeyA')) rx += 1;
-    if (this.keys.has('KeyD')) rx -= 1;
+    // Keyboard stick: arrow keys (+ A/D roll) give a -1..1 target; the
+    // stick slews toward it at STICK_SLEW/s, then inversion + the
+    // sensitivity exponent shape it. This is the keyboard-only path —
+    // the mouse yoke and gamepad above are analogue and unshaped.
+    const kbPitchTarget =
+      (this.keys.has('ArrowDown') ? 1 : 0) - (this.keys.has('ArrowUp') ? 1 : 0);
+    const kbRollTarget =
+      (this.keys.has('ArrowLeft') ? 1 : 0) -
+      (this.keys.has('ArrowRight') ? 1 : 0) +
+      (this.keys.has('KeyA') ? 1 : 0) -
+      (this.keys.has('KeyD') ? 1 : 0);
+    const slew = (cur: number, target: number): number => {
+      const step = STICK_SLEW * dt;
+      if (cur < target) return Math.min(target, cur + step);
+      if (cur > target) return Math.max(target, cur - step);
+      return cur;
+    };
+    this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1));
+    this.kbRoll = slew(this.kbRoll, clamp(kbRollTarget, -1, 1));
+    const shape = (v: number, gamma: number, invert: boolean): number => {
+      const s = invert ? -v : v;
+      return Math.sign(s) * Math.pow(Math.abs(s), gamma);
+    };
+    px += shape(this.kbPitch, this.shaping.pitchSens, this.shaping.invertPitch);
+    rx += shape(this.kbRoll, this.shaping.rollSens, this.shaping.invertRoll);
+
+    // Rudder: Q = left, E = right (yawIn > 0 = nose right, solver yaw).
+    const yaw =
+      (this.keys.has('KeyE') ? 1 : 0) - (this.keys.has('KeyQ') ? 1 : 0);
 
     // Throttle: incremental while held; null = no opinion this frame.
     let throttle: number | null = null;
@@ -158,14 +217,15 @@ export class PCFlightInput implements IFlightInputProvider {
     return {
       pitch: clamp(px, -1, 1),
       roll: clamp(rx, -1, 1),
-      yaw: 0,
+      yaw,
       throttle,
     };
   }
 
   /** Discrete + held actions since the last call. Edge flags (missile,
-   *  flare, gear, hook, camera, pause, bomb) are consumed — each press
-   *  reports exactly once. Call once per frame from main.ts. */
+   *  flare, gear, hook, camera, pause, bomb, flaps, airbrake) are
+   *  consumed — each press reports exactly once. Call once per frame
+   *  from main.ts. */
   consumeEvents(): PCInputEvents {
     const ev: PCInputEvents = {
       fireHeld: this.keys.has('Space') || this.gpFire,
@@ -178,9 +238,12 @@ export class PCFlightInput implements IFlightInputProvider {
       pausePressed: this.keys.has('KeyP') || this.gpEdge.pause,
       bombPressed: this.keys.has('KeyN'),
       brakeHeld: this.keys.has('KeyB'),
+      flapsUpPressed: this.keys.has('BracketLeft'),
+      flapsDownPressed: this.keys.has('BracketRight'),
+      airbrakePressed: this.keys.has('KeyX'),
     };
     // Single-shot keys are consumed so a held key does not repeat.
-    for (const k of ['KeyM', 'KeyF', 'KeyG', 'KeyH', 'KeyC', 'KeyR', 'KeyP', 'KeyN']) {
+    for (const k of ['KeyM', 'KeyF', 'KeyG', 'KeyH', 'KeyC', 'KeyR', 'KeyP', 'KeyN', 'BracketLeft', 'BracketRight', 'KeyX']) {
       this.keys.delete(k);
     }
     this.gpEdge.missile = false;
