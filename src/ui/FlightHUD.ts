@@ -25,7 +25,7 @@ export interface MinimapEntities {
   player: Aircraft | null;
   enemies: Aircraft[];
   traffic: Aircraft[];
-  carrier: { alive: boolean; pos: THREE.Vector3; yaw: number } | null;
+  carriers: Array<{ alive: boolean; pos: THREE.Vector3; yaw: number }>;
   runways: { x: number; z: number; len: number; dir: THREE.Vector3 }[];
   /** Cumulative floating-origin shift (scene coords + shift = original). */
   originShift: THREE.Vector3;
@@ -57,11 +57,11 @@ export class FlightHUD {
 
   constructor() {
     const ids = [
-      'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudAoA', 'hudG',
+      'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudAoA', 'hudBank', 'hudG',
       'hudFuel', 'hudWpn', 'hudScore', 'hudVec', 'vecPill', 'vecRow',
       'miniKills', 'miniTraps', 'miniTime', 'warn', 'lockInd', 'pipper',
       'ccip', 'rotateCue', 'toast', 'toastTitle', 'toastSub', 'debug',
-      'soundBtn',
+      'soundBtn', 'dmgFuse', 'dmgWing', 'dmgEng', 'dmgFuel',
     ];
     for (const id of ids) this.el[id] = document.getElementById(id);
     const miniCv = document.getElementById('miniCv') as HTMLCanvasElement | null;
@@ -80,6 +80,20 @@ export class FlightHUD {
     const hdg = ((Math.atan2(ac.fwd().x, ac.fwd().z) * R2D) % 360 + 360) % 360;
     set('hudHdg', String(Math.round(hdg)).padStart(3, '0') + '°');
     set('hudAoA', Math.round(ac.aoa) + '°');
+    // Bank indicator (Issue 1): the ACTUAL bank from the physics
+    // quaternion (Euler YXZ z; positive = left bank). Steer right must
+    // read "N° ▶" (right bank) and steer left "◀ N°" — if this ever
+    // disagrees with the stick, the input chain is inverted, not the
+    // physics. Level within 2° reads 0°.
+    const bankDeg = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z * R2D;
+    set(
+      'hudBank',
+      bankDeg > 2
+        ? `◀ ${Math.round(bankDeg)}°`
+        : bankDeg < -2
+          ? `${Math.round(-bankDeg)}° ▶`
+          : '0°',
+    );
     set('hudG', ac.gload.toFixed(1));
     set('hudFuel', Math.round(ac.fuel * 100) + '%');
     const fuelEl = this.el['hudFuel'];
@@ -95,6 +109,54 @@ export class FlightHUD {
     set('miniTraps', String(game.traps));
     set('miniTime', fmtTime(game.elapsed));
 
+    // Per-zone damage chips (issue 5): FUSE / WING / ENG / FUEL, from
+    // the damage entity's per-zone HP (the same source the solver's
+    // degradation and the severe-damage rule read). WING and ENG show
+    // the WORST side (one shot-off wing / dead engine is what the
+    // pilot needs to know); F-35A is single-engine (one `engine`
+    // zone, not engineL/engineR). Bands: >=70% ok (dim green),
+    // 35-70% hurt (amber), <35% crit (red), 0 dead (solid red). A
+    // burning zone gets the 🔥 prefix + pulsing border, so the chips
+    // say WHERE the fire is, not just that there is one (the FIRE
+    // banner alone never said which zone was burning).
+    const de = ac.damageEntity;
+    const frac = (zone: string): number => {
+      const max = de.maxHpFor(zone);
+      return max > 0 ? de.hpFor(zone) / max : 1;
+    };
+    const engFrac =
+      de.maxHpFor('engine') > 0
+        ? frac('engine')
+        : Math.min(frac('engineL'), frac('engineR'));
+    const fireChip =
+      ac.fireZone === 'fuel'
+        ? 'dmgFuel'
+        : ac.fireZone === 'engine' || ac.fireZone === 'engineL' || ac.fireZone === 'engineR'
+          ? 'dmgEng'
+          : ac.fireZone === 'wing' || ac.fireZone === 'wingL' || ac.fireZone === 'wingR'
+            ? 'dmgWing'
+            : ac.fireZone
+              ? 'dmgFuse'
+              : null;
+    const chipDefs: Array<{ id: string; label: string; health: number }> = [
+      { id: 'dmgFuse', label: 'FUSE', health: frac('fuselage') },
+      { id: 'dmgWing', label: 'WING', health: Math.min(frac('wingL'), frac('wingR')) },
+      { id: 'dmgEng', label: 'ENG', health: engFrac },
+      { id: 'dmgFuel', label: 'FUEL', health: frac('fuel') },
+    ];
+    for (const c of chipDefs) {
+      const chip = this.el[c.id];
+      if (!chip) continue;
+      const band =
+        c.health <= 0 ? 'dead' : c.health < 0.35 ? 'crit' : c.health < 0.7 ? 'hurt' : 'ok';
+      const burning = fireChip === c.id;
+      chip.className = `dmg ${band}${burning ? ' fire' : ''}`;
+      const lbl = chip.querySelector('b');
+      if (lbl) lbl.textContent = burning ? `🔥 ${c.label}` : c.label;
+      const fill = chip.querySelector('.bar i') as HTMLElement | null;
+      if (fill) fill.style.width = `${Math.round(c.health * 100)}%`;
+    }
+
     // Stall / spin / fire / pull-up / low-fuel warnings (priority order).
     // Spin first: the NATOPS arrow is the only thing that matters in
     // a spin (spinArrow -1 = push the stick LEFT, +1 = push it RIGHT).
@@ -103,7 +165,14 @@ export class FlightHUD {
     // engine fire: cut the throttle).
     const w = this.el['warn'];
     if (w) {
-      if (ac.spin > 0.5 && ac.alive) {
+      // Dying jets own no #warn (live finding 4): while the jet is
+      // dying the spectate banner ("SHOT DOWN — watching the wreck")
+      // owns the screen. #warn is gated on !dying so a stale STALL /
+      // PULL UP / LOW FUEL cannot linger through the death sequence.
+      if (ac.dying) {
+        w.classList.remove('show');
+        w.textContent = '';
+      } else if (ac.spin > 0.5 && ac.alive) {
         w.textContent =
           ac.spinArrow < 0
             ? '◀ SPIN — PUSH STICK LEFT'
@@ -129,6 +198,12 @@ export class FlightHUD {
         w.classList.add('show');
       } else {
         w.classList.remove('show');
+        // Clear the text too (live finding 4): removing `show` hides
+        // the banner visually (opacity 0) but the textContent stays
+        // in the DOM, so a DOM-reading check reports a stale banner
+        // as present. Clearing the text makes the DOM and the pixels
+        // agree.
+        w.textContent = '';
       }
     }
 
@@ -153,18 +228,24 @@ export class FlightHUD {
       }
     }
 
-    // Thrust-vector readout (F-35A only).
+    // Thrust-vector readout (F-35A only): angle + mode. HOVER at
+    // vector 70 deg+ (lift fan + FCS holding attitude), TRANSIT in
+    // between, forward flight below 20 deg.
     this.el['vecPill']?.classList.toggle('hidden', !ac.spec.vtol);
-    if (ac.spec.vtol) set('hudVec', Math.round(ac.vector) + '°');
+    if (ac.spec.vtol) {
+      const v = Math.round(ac.vector);
+      set('hudVec', v >= 70 ? v + '° HOVER' : v >= 20 ? v + '° TRANSIT' : v + '°');
+    }
   }
 
   /** Minimap (144 x 144 canvas): green runways, blue carrier, grey traffic,
    *  red enemy diamonds, white player triangle. Template drawMinimap. */
   drawMinimap(ctx: CanvasRenderingContext2D, e: MinimapEntities): void {
     const W = 144;
-    const S = W / 6200;
-    const X = (x: number) => (x + e.originShift.x + 3100) * S;
-    const Z = (z: number) => (z + e.originShift.z + 3100) * S;
+    // 12 km map: the full world spans 12000 m + a 100 m margin each side.
+    const S = W / 12200;
+    const X = (x: number) => (x + e.originShift.x + 6100) * S;
+    const Z = (z: number) => (z + e.originShift.z + 6100) * S;
     ctx.clearRect(0, 0, W, W);
     ctx.fillStyle = 'rgba(10,25,40,0.85)';
     ctx.fillRect(0, 0, W, W);
@@ -178,11 +259,12 @@ export class FlightHUD {
       ctx.lineTo(X(sx + r.dir.x * r.len / 2), Z(sz + r.dir.z * r.len / 2));
       ctx.stroke();
     }
-    if (e.carrier?.alive) {
+    for (const c of e.carriers) {
+      if (!c.alive) continue;
       ctx.fillStyle = '#6ab8ff';
       ctx.save();
-      ctx.translate(X(e.carrier.pos.x), Z(e.carrier.pos.z));
-      ctx.rotate(e.carrier.yaw);
+      ctx.translate(X(c.pos.x), Z(c.pos.z));
+      ctx.rotate(c.yaw);
       ctx.fillRect(-2, -5, 4, 10);
       ctx.restore();
     }
@@ -283,13 +365,27 @@ export class FlightHUD {
    *  otherwise hide a NEW toast early, or a re-fired toast would
    *  linger). Called from startRound() and respawnPlayer(). */
   clearTransient(): void {
-    this.el['warn']?.classList.remove('show');
-    this.el['rotateCue']?.classList.remove('show');
+    // Clear textContent as well as hiding (live finding 4): a hidden
+    // banner's text persists in the DOM and reads as a stale banner.
+    const w = this.el['warn'];
+    if (w) {
+      w.classList.remove('show');
+      w.textContent = '';
+    }
+    const rc = this.el['rotateCue'];
+    if (rc) {
+      // Hide only — do NOT clear textContent: the ROTATE cue's text
+      // is static HTML ("ROTATE — HOLD ↑ / PULL BACK"), not set by
+      // JS, so clearing it would wipe the cue permanently.
+      rc.classList.remove('show');
+    }
     if (this.toastTimer) {
       clearTimeout(this.toastTimer);
       this.toastTimer = null;
     }
     this.el['toast']?.classList.remove('show');
+    if (this.el['toastTitle']) this.el['toastTitle'].textContent = '';
+    if (this.el['toastSub']) this.el['toastSub'].textContent = '';
   }
 
   /** ?debug=1 panel (v1.1 feature): FPS + sim dt + per-model load status +

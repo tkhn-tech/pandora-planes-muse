@@ -322,6 +322,37 @@ async function main(): Promise<void> {
     ac.dispose();
   }
 
+  // ---- 6. Going-down sequence for EVERY aircraft type (issue 6) ----
+  // Lethal damage -> dying + fire -> freefall -> ground impact, per
+  // type, through the real applyDamage path (the kill path the live
+  // game uses for missile/gun kills). The v3 play-test showed a
+  // shoot-down with no fire, no falling wreck and no impact — this
+  // proves the sequence runs end to end for each jet.
+  for (const key of ['fa18', 'f35a', 'f22', 'f15e', 'mig29', 'su34']) {
+    const ac = makeJet(key, false);
+    ac.resetAt(0, 600, -900, 90);
+    ac.setAirspeed(150);
+    ac.thrTarget = 0.8;
+    ac.applyDamage(200, 'fuselage', true);
+    const entered = ac.dying && ac.alive && ac.fireKind !== null;
+    let fell = false;
+    let crashed = false;
+    for (let i = 0; i < 60 * 30; i++) {
+      substep(ac);
+      if (ac.pos.y < 550) fell = true;
+      if (!ac.alive) {
+        crashed = true;
+        break;
+      }
+    }
+    check(
+      `Going-down (${key}): lethal damage -> dying + fire -> fall -> impact`,
+      entered && fell && crashed && ac.crashedFromDying,
+      `dying=${ac.dying} fire=${ac.fireKind} fell=${fell} crashed=${crashed} crashedFromDying=${ac.crashedFromDying} finalY=${ac.pos.y.toFixed(1)}`,
+    );
+    ac.dispose();
+  }
+
   console.log(failures === 0 ? '\nALL DAMAGE CHECKS PASSED' : `\n${failures} DAMAGE CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

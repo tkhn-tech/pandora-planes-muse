@@ -13,7 +13,7 @@
 // the collider takes a COLUMN-major copy of the heights (index =
 // ix*(nsubdivsZ+1)+iz); the visual mesh uses the same values row-major.
 // Mesh and collider therefore agree exactly; both approximate the analytic
-// heightAt between grid nodes (piecewise-linear over the 40 m grid).
+// heightAt between grid nodes (piecewise-linear over the 60 m grid).
 
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
@@ -21,6 +21,7 @@ import {
   WORLD_SIZE,
   WORLD_SEED,
   TERRAIN_SEGMENTS,
+  GRID_STEP,
   heightAt,
   heightfieldHeightAt,
   runwayBlend,
@@ -71,7 +72,7 @@ export class PandoraWorldGenerator {
   /** Flat box colliders, one per runway (see buildHeightfieldCollider). */
   private runwayColliders: RAPIER.Collider[] = [];
   private heights: Float32Array | null = null;
-  /** Samples per side of the terrain grid (151 = 150 segments + 1). */
+  /** Samples per side of the terrain grid (201 = 200 segments + 1). */
   readonly resolution = TERRAIN_SEGMENTS + 1;
 
   private islands: THREE.Group[] = [];
@@ -113,7 +114,7 @@ export class PandoraWorldGenerator {
     this.buildFlora(rand);
     this.buildClouds(rand);
     this.scene.background = new THREE.Color(0x87b5d9);
-    this.scene.fog = new THREE.Fog(0x9db8cc, 900, 5200);
+    this.scene.fog = new THREE.Fog(0x9db8cc, 900, 11000);
     this.built = true;
   }
 
@@ -170,7 +171,7 @@ export class PandoraWorldGenerator {
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position as THREE.BufferAttribute;
     // PlaneGeometry vertex order after rotateX(-PI/2) is row-major with x
-    // fastest and z running -3000 -> +3000 down the rows — exactly the
+    // fastest and z running -6000 -> +6000 down the rows — exactly the
     // layout generateHeights() produces, so heights[i] IS vertex i's height.
     const col = new Float32Array(pos.count * 3);
     const cA = new THREE.Color(0x3d7a44);
@@ -217,12 +218,12 @@ export class PandoraWorldGenerator {
     // LAYOUT (verified numerically — see the task report): Rapier's
     // heightfield heights are COLUMN-major (ColliderDesc.heightfield docs),
     // index = ix * (nsubdivsZ + 1) + iz, where ix is the x-index and iz the
-    // z-index; sample (ix, iz) sits at x = -3000 + ix*40, z = -3000 + iz*40.
+    // z-index; sample (ix, iz) sits at x = -6000 + ix*60, z = -6000 + iz*60.
     // The visual mesh array is ROW-major (index = iz*151 + ix), so the
     // collider gets a transposed copy of the SAME values. Row-major passed
     // straight in is wrong by up to ~190 m; transposed, raycasts at grid
     // nodes agree with heightAt to ~3e-4 m (float32). Between nodes the
-    // heightfield is piecewise-linear over the 40 m grid, so it deviates
+    // heightfield is piecewise-linear over the 60 m grid, so it deviates
     // from the analytic heightAt by up to ~13 m at the worst spots
     // (plateau edges) — exactly like the visual mesh, which shares the
     // same grid, so mesh and collider always agree with each other.
@@ -253,14 +254,14 @@ export class PandoraWorldGenerator {
     this.terrainCollider = this.world.createCollider(desc, this.terrainBody);
 
     // ---- runway boxes (flat, single-face ground for the gear) ----------
-    // The heightfield is piecewise-linear over a 40 m grid, and a gear
+    // The heightfield is piecewise-linear over a 60 m grid, and a gear
     // ski crossing a cell boundary can make Rapier's contact solver
     // explode: probed on the F-35A flaps-0 roll, one world.step at
     // x=-1326.8 (nose ski crossing the -1320 cell boundary at 38 m/s)
     // changed the body velocity by 35 m/s — (38.1,-0.2) to (4.6,+9.8) —
     // throwing the jet 5 m up and killing 33 m/s of forward speed, so it
     // hung in a deep stall and never lifted off. The gear skis spread the
-    // contact but cannot span a 40 m cell, so the boundary is still there.
+    // contact but cannot span a 60 m cell, so the boundary is still there.
     // A runway is a flat man-made surface, so it gets a flat cuboid
     // collider instead: one clean face, no triangles, no boundary, and
     // the contact manifold is stable at any speed. The box covers the
@@ -293,12 +294,17 @@ export class PandoraWorldGenerator {
     // Lightened (was rock 0x6a5a4a / top 0x3d7a44): the dark Lambert
     // cones read as pure black faceted discs floating in the sky at
     // distance (v2 play-test's "black discs"), especially in shadow.
-    const rockMat = new THREE.MeshLambertMaterial({ color: 0x7d6f5e });
-    const topMat = new THREE.MeshLambertMaterial({ color: 0x4a8a52 });
-    const rootMat = new THREE.MeshLambertMaterial({ color: 0x4a3a2a });
+    // The v3 lightening alone could not fix it — a Lambert face
+    // pointing away from the sun gets ~0 light whatever its colour,
+    // so the island materials now also carry a small emissive: the
+    // shadowed faces read as dark rock/grass, never pure black.
+    // Scatter spans the 12 km map (islands within ±4800 m).
+    const rockMat = new THREE.MeshLambertMaterial({ color: 0x7d6f5e, emissive: 0x2a241c });
+    const topMat = new THREE.MeshLambertMaterial({ color: 0x4a8a52, emissive: 0x16240f });
+    const rootMat = new THREE.MeshLambertMaterial({ color: 0x4a3a2a, emissive: 0x1a120a });
     for (let i = 0; i < ISLAND_COUNT; i++) {
-      const x = (rand() - 0.5) * 4800;
-      const z = (rand() - 0.5) * 4800;
+      const x = (rand() - 0.5) * (WORLD_SIZE * 0.8);
+      const z = (rand() - 0.5) * (WORLD_SIZE * 0.8);
       const y = 260 + rand() * 260;
       const R = 60 + rand() * 90;
       const g = new THREE.Group();
@@ -369,8 +375,8 @@ export class PandoraWorldGenerator {
     let si = 0;
     let pi = 0;
     for (let k = 0; k < 900 && si < FLORA_STEMS; k++) {
-      const x = (rand() - 0.5) * 5600;
-      const z = (rand() - 0.5) * 5600;
+      const x = (rand() - 0.5) * (WORLD_SIZE - 800);
+      const z = (rand() - 0.5) * (WORLD_SIZE - 800);
       if (runwayBlend(x, z) > 0.1) continue;
       const h = heightAt(x, z);
       if (h > 150) continue;
@@ -382,8 +388,8 @@ export class PandoraWorldGenerator {
       si++;
     }
     for (let k = 0; k < 200 && pi < FLORA_SPIRES; k++) {
-      const x = (rand() - 0.5) * 5600;
-      const z = (rand() - 0.5) * 5600;
+      const x = (rand() - 0.5) * (WORLD_SIZE - 800);
+      const z = (rand() - 0.5) * (WORLD_SIZE - 800);
       if (runwayBlend(x, z) > 0.1) continue;
       const h = heightAt(x, z);
       if (h > 150) continue;
@@ -410,7 +416,7 @@ export class PandoraWorldGenerator {
       );
       const sc = 260 + rand() * 420;
       s.scale.set(sc, sc * 0.36, 1);
-      s.position.set((rand() - 0.5) * 5600, 620 + rand() * 320, (rand() - 0.5) * 5600);
+      s.position.set((rand() - 0.5) * (WORLD_SIZE - 800), 620 + rand() * 320, (rand() - 0.5) * (WORLD_SIZE - 800));
       this.cloudBase.push(s.position.clone());
       this.scene.add(s);
       this.clouds.push(s);
@@ -435,8 +441,8 @@ export class PandoraWorldGenerator {
     return heightAt(x + this._originShift.x, z + this._originShift.z);
   }
 
-  /** Sampled terrain height: bilinear interpolation over the 151x151
-   *  heights grid (40 m spacing, x/z from -3000). This is the surface
+  /** Sampled terrain height: bilinear interpolation over the 201x201
+   *  heights grid (60 m spacing, x/z from -6000). This is the surface
    *  the visual mesh and the Rapier heightfield actually render/collide
    *  with — the analytic heightAt() can deviate from it by up to ~13 m
    *  at plateau edges, which is what the chase camera must be clamped
@@ -454,8 +460,8 @@ export class PandoraWorldGenerator {
     const ox = x + this._originShift.x;
     const oz = z + this._originShift.z;
     const res = this.resolution;
-    const gx = (ox + WORLD_SIZE / 2) / 40;
-    const gz = (oz + WORLD_SIZE / 2) / 40;
+    const gx = (ox + WORLD_SIZE / 2) / GRID_STEP;
+    const gz = (oz + WORLD_SIZE / 2) / GRID_STEP;
     const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
     const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
     const fx = Math.max(0, Math.min(1, gx - ix));
@@ -534,11 +540,12 @@ export class PandoraWorldGenerator {
     }
   }
 
-  /** v2 cloud drift: +windX * dt * 0.4, wrapping past x = 3000 to -3000. */
+  /** v2 cloud drift: +windX * dt * 0.4, wrapping past x = WORLD_SIZE/2
+   *  to -WORLD_SIZE/2. */
   updateClouds(dt: number, windX: number): void {
     for (const c of this.clouds) {
       c.position.x += windX * dt * 0.4;
-      if (c.position.x > 3000) c.position.x = -3000;
+      if (c.position.x > WORLD_SIZE / 2) c.position.x = -WORLD_SIZE / 2;
     }
   }
 

@@ -24,6 +24,7 @@ import {
   RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
+  GRID_STEP,
 } from '../src/world/PandoraTerrainWorker';
 import { CARRIER_START_POS, CARRIER_WAYPOINTS } from '../src/entities/HelicarrierController';
 
@@ -44,9 +45,10 @@ function main(): void {
   });
   // Bilinear over the sampled grid — the surface the mesh and the
   // heightfield actually render/collide with.
+  const half = WORLD_SIZE / 2;
   const bilinear = (x: number, z: number): number => {
-    const gx = (x + 3000) / 40;
-    const gz = (z + 3000) / 40;
+    const gx = (x + half) / GRID_STEP;
+    const gz = (z + half) / GRID_STEP;
     const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
     const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
     const fx = gx - ix;
@@ -91,7 +93,7 @@ function main(): void {
       gridWorst = Math.max(gridWorst, Math.abs(bilinear(x, z) - r.elev));
     }
     check(
-      `${r.name} roll path flat on the sampled 40 m grid too`,
+      `${r.name} roll path flat on the sampled ${GRID_STEP} m grid too`,
       gridWorst < 0.01,
       `worst |h - elev| = ${gridWorst.toFixed(4)}`,
     );
@@ -188,23 +190,29 @@ function main(): void {
   );
 
   // 5. Takeoff corridor east of Alpha stays low (the v1 bug: a hill at
-  //    the runway end). From the overrun tip (x=-875) to 2 km downrange
-  //    (x=1000) — where the jet is still low and climbing. (Past that,
-  //    Charlie's plateau skirt legitimately rises toward its 220 m mesa
-  //    at x~1600, where the jet is already high.)
+  //    the runway end). From the overrun tip to 2 km downrange along
+  //    Alpha's takeoff heading — where the jet is still low and
+  //    climbing. (Computed from Alpha's table entry, so it follows the
+  //    runway if the table moves.)
+  const alpha = RUNWAY_TABLE[0]!;
+  const ash = Math.sin((alpha.hdg * Math.PI) / 180);
+  const ach = Math.cos((alpha.hdg * Math.PI) / 180);
+  const tipAlong = alpha.len / 2 + 100;
   let corridorMax = -1e9;
   let corridorAt = '';
-  for (let x = -875; x <= 1000; x += 25) {
-    const h = heightAt(x, -900);
+  for (let d = tipAlong; d <= tipAlong + 2000; d += 25) {
+    const x = alpha.x + d * ash;
+    const z = alpha.z + d * ach;
+    const h = heightAt(x, z);
     if (h > corridorMax) {
       corridorMax = h;
-      corridorAt = `${x}`;
+      corridorAt = `${d.toFixed(0)} m downrange`;
     }
   }
   check(
     'Takeoff corridor east of Alpha stays low (no hill at the runway end)',
     corridorMax < 100,
-    `max = ${corridorMax.toFixed(1)} m at x=${corridorAt}`,
+    `max = ${corridorMax.toFixed(1)} m at ${corridorAt}`,
   );
 
   // 6. The ranges are real mountains: peaks 600-750 m, valleys low.
@@ -213,8 +221,8 @@ function main(): void {
   let above500 = 0;
   let above600 = 0;
   let total = 0;
-  for (let x = -3000; x <= 3000; x += 40) {
-    for (let z = -3000; z <= 3000; z += 40) {
+  for (let x = -6000; x <= 6000; x += 60) {
+    for (let z = -6000; z <= 6000; z += 60) {
       const h = baseHeight(x, z);
       total++;
       if (h > 500) above500++;
@@ -237,8 +245,8 @@ function main(): void {
   );
   // Basin valley floor stays low.
   let basinMin = 1e9;
-  for (let x = -1200; x <= 1200; x += 60) {
-    for (let z = -1000; z <= 1000; z += 60) {
+  for (let x = -2400; x <= 2400; x += 60) {
+    for (let z = -2000; z <= 2000; z += 60) {
       basinMin = Math.min(basinMin, baseHeight(x, z));
     }
   }

@@ -35,6 +35,8 @@ export interface PCInputEvents {
   flapsDownPressed: boolean;
   /** X toggles the airbrake. */
   airbrakePressed: boolean;
+  /** V toggles VTOL hover (F-35A lift-fan mode). */
+  vtolPressed: boolean;
 }
 
 /** Keyboard stick shaping, from the setup menu (SandboxConfig). The
@@ -64,6 +66,13 @@ const DEFAULT_SHAPING: StickShaping = {
  *  short hold while a tap still does not rotate the jet by itself
  *  (rotation needs a SUSTAINED pull — the ROTATE cue says so). */
 const STICK_SLEW = 5;
+/** Keyboard PITCH slew rate (per second) — slower than roll (live
+ *  finding 8): one ArrowUp tap at 5/s swung the vertical speed by
+ *  5,000-13,000 fpm and the pitch persisted (enough to loop/stall),
+ *  because the curve solver is a pure rate command (55 deg/s) with no
+ *  damping. 3/s for pitch keeps a tap from over-rotating while a held
+ *  pull still rotates the jet for takeoff. Roll stays at 5/s. */
+const PITCH_SLEW = 3;
 
 const DEADZONE = 0.12;
 
@@ -81,6 +90,12 @@ export class PCFlightInput implements IFlightInputProvider {
   /** Slewed keyboard stick (ramps toward the arrow-key target). */
   private kbPitch = 0;
   private kbRoll = 0;
+  /** Flaps repeat timers (live finding 8): holding [ or ] steps the
+   *  flaps every 0.25 s. consumeEvents reports the flag only when the
+   *  interval has elapsed since the last report, so a held key
+   *  repeats but a tap steps exactly once. */
+  private lastFlapUpMs = -1e9;
+  private lastFlapDownMs = -1e9;
 
   // Mouse yoke: drag on the canvas steers in chase/cockpit cam (template
   // ~1750); in free-orbit the same drag orbits (main.ts owns that path).
@@ -178,14 +193,14 @@ export class PCFlightInput implements IFlightInputProvider {
       (this.keys.has('ArrowRight') ? 1 : 0) +
       (this.keys.has('KeyA') ? 1 : 0) -
       (this.keys.has('KeyD') ? 1 : 0);
-    const slew = (cur: number, target: number): number => {
-      const step = STICK_SLEW * dt;
+    const slew = (cur: number, target: number, rate: number): number => {
+      const step = rate * dt;
       if (cur < target) return Math.min(target, cur + step);
       if (cur > target) return Math.max(target, cur - step);
       return cur;
     };
-    this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1));
-    this.kbRoll = slew(this.kbRoll, clamp(kbRollTarget, -1, 1));
+    this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1), PITCH_SLEW);
+    this.kbRoll = slew(this.kbRoll, clamp(kbRollTarget, -1, 1), STICK_SLEW);
     const shape = (v: number, gamma: number, invert: boolean): number => {
       const s = invert ? -v : v;
       return Math.sign(s) * Math.pow(Math.abs(s), gamma);
@@ -233,6 +248,19 @@ export class PCFlightInput implements IFlightInputProvider {
    *  consumed — each press reports exactly once. Call once per frame
    *  from main.ts. */
   consumeEvents(): PCInputEvents {
+    // Flaps repeat (live finding 8): [ / ] are HELD keys, not
+    // single-shot — holding one steps the flaps every 0.25 s. The
+    // key stays in `keys` while held (it is NOT deleted below), and
+    // the flag reports only when the interval has elapsed since the
+    // last report, so a tap steps exactly once. onKeyDown ignores
+    // e.repeat, so the repeat is timed here, not by the OS.
+    const nowMs = performance.now();
+    const flapUp =
+      this.keys.has('BracketLeft') && nowMs - this.lastFlapUpMs >= 250;
+    if (flapUp) this.lastFlapUpMs = nowMs;
+    const flapDown =
+      this.keys.has('BracketRight') && nowMs - this.lastFlapDownMs >= 250;
+    if (flapDown) this.lastFlapDownMs = nowMs;
     const ev: PCInputEvents = {
       fireHeld: this.keys.has('Space') || this.gpFire,
       missilePressed: this.keys.has('KeyM') || this.gpEdge.missile,
@@ -241,15 +269,19 @@ export class PCFlightInput implements IFlightInputProvider {
       hookPressed: this.keys.has('KeyH'),
       cameraPressed: this.keys.has('KeyC'),
       cameraResetPressed: this.keys.has('KeyR'),
-      pausePressed: this.keys.has('KeyP') || this.gpEdge.pause,
+      pausePressed:
+        this.keys.has('KeyP') || this.keys.has('Escape') || this.gpEdge.pause,
       bombPressed: this.keys.has('KeyN'),
       brakeHeld: this.keys.has('KeyB'),
-      flapsUpPressed: this.keys.has('BracketLeft'),
-      flapsDownPressed: this.keys.has('BracketRight'),
+      flapsUpPressed: flapUp,
+      flapsDownPressed: flapDown,
       airbrakePressed: this.keys.has('KeyX'),
+      vtolPressed: this.keys.has('KeyV'),
     };
     // Single-shot keys are consumed so a held key does not repeat.
-    for (const k of ['KeyM', 'KeyF', 'KeyG', 'KeyH', 'KeyC', 'KeyR', 'KeyP', 'KeyN', 'BracketLeft', 'BracketRight', 'KeyX']) {
+    // BracketLeft / BracketRight are NOT here — they are held keys
+    // with their own 0.25 s repeat above.
+    for (const k of ['KeyM', 'KeyF', 'KeyG', 'KeyH', 'KeyC', 'KeyR', 'KeyP', 'Escape', 'KeyN', 'KeyX', 'KeyV']) {
       this.keys.delete(k);
     }
     this.gpEdge.missile = false;

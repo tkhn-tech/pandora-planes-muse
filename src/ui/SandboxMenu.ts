@@ -67,7 +67,12 @@ export interface SandboxConfig {
    *  out = sign(x) * |x|^gamma to the keyboard stick. */
   pitchSens: number;
   rollSens: number;
-  carrier: string;
+  /** Number of SHIELD helicarriers travelling around (issue 5):
+   *  0–3, default 1. Each gets its own loop path (a scaled hexagon,
+   *  so the loops are concentric and never overlap). 0 means no
+   *  carrier at all — the carrier spawn option is hidden and falls
+   *  back to Alpha. */
+  helicarriers: number;
 }
 
 export const DEFAULT_CONFIG: SandboxConfig = {
@@ -93,7 +98,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   invertRoll: false,
   pitchSens: 1,
   rollSens: 1,
-  carrier: 'ford',
+  helicarriers: 1,
 };
 
 // Stall speeds at combat mass (spec.stallSpeed, m/s -> kt): F-18 66 m/s
@@ -231,6 +236,9 @@ export class SandboxMenu {
       }
       if (s.failWhen === 'start' || s.failWhen === 'random') c.failWhen = s.failWhen;
       if (s.spawn === 'alpha' || s.spawn === 'carrier') c.spawn = s.spawn;
+      if (typeof s.helicarriers === 'number') {
+        c.helicarriers = clamp(Math.round(s.helicarriers), 0, 3);
+      }
       if (typeof s.invertPitch === 'boolean') c.invertPitch = s.invertPitch;
       if (typeof s.invertRoll === 'boolean') c.invertRoll = s.invertRoll;
       if (typeof s.pitchSens === 'number') c.pitchSens = clamp(s.pitchSens, 0.5, 2);
@@ -366,6 +374,44 @@ export class SandboxMenu {
       1,
       30,
     );
+    // Helicarriers 0–3 (issue 5): each carrier gets its own loop.
+    // 0 means no carrier — the carrier spawn option is hidden and
+    // falls back to Alpha (a deck spawn with no deck would strand
+    // the jet in mid-air).
+    wire(
+      'stepHeli',
+      'stepHeliVal',
+      () => this.cfg.helicarriers,
+      (v) => {
+        this.cfg.helicarriers = v;
+        this.syncSpawnSeg();
+      },
+      0,
+      3,
+    );
+  }
+
+  /** Carrier spawn availability follows the helicarrier count: with
+   *  0 carriers the deck button is disabled and a carrier spawn falls
+   *  back to Alpha. Called from the helicarrier stepper and applyLive. */
+  private syncSpawnSeg(): void {
+    const root = $('segSpawn');
+    if (!root) return;
+    const carrierBtn = root.querySelector(
+      'button[data-v="carrier"]',
+    ) as HTMLButtonElement | null;
+    if (!carrierBtn) return;
+    if (this.cfg.helicarriers === 0) {
+      carrierBtn.disabled = true;
+      if (this.cfg.spawn === 'carrier') {
+        this.cfg.spawn = 'alpha';
+        root.querySelectorAll('button').forEach((b) => {
+          b.classList.toggle('on', (b as HTMLElement).dataset['v'] === 'alpha');
+        });
+      }
+    } else {
+      carrierBtn.disabled = false;
+    }
   }
 
   private wireSliders(): void {
@@ -476,6 +522,7 @@ export class SandboxMenu {
     };
     setText('stepEnemyVal', cfg.enemies === 0 ? 'Off' : String(cfg.enemies));
     setText('stepTrafficVal', String(cfg.trafficCount));
+    setText('stepHeliVal', String(cfg.helicarriers));
     setVal('spawnSl', String(cfg.enemySpawnDistance));
     setText('spawnVal', cfg.enemySpawnDistance + ' m');
     setVal('todSl', String(cfg.tod));
@@ -506,6 +553,7 @@ export class SandboxMenu {
     };
     markSeg('jetPicker', (b) => b.dataset['k'] === cfg.aircraftKey);
     markSeg('segSpawn', (b) => b.dataset['v'] === cfg.spawn);
+    this.syncSpawnSeg();
     markSeg('segSkill', (b) => b.dataset['v'] === cfg.enemySkill);
     markSeg('segTraffic', (b) => b.dataset['v'] === (cfg.traffic ? '1' : '0'));
     markSeg('segFail', (b) => b.dataset['v'] === cfg.failure);

@@ -22,6 +22,7 @@ import {
   RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
+  GRID_STEP,
 } from '../src/world/PandoraTerrainWorker';
 import {
   CARRIER_START_POS,
@@ -129,12 +130,15 @@ async function main(): Promise<void> {
   for (const h of runwayBoxHandles) owners.set(h, 'terrain');
 
   // Helicarrier (procedural fallback hull — no GLB in the driver), as in
-  // main.ts startRound: reset to (-500, 350, -900), heading east.
+  // main.ts startRound: reset to CARRIER_START_POS, heading east toward waypoint 0.
   const carrier = new HelicarrierController(scene, world, {});
   await carrier.build();
   carrier.reset(
-    new THREE.Vector3(-500, 350, -900),
-    Math.atan2(1400 - -500, -900 - -900),
+    CARRIER_START_POS.clone(),
+    Math.atan2(
+      CARRIER_WAYPOINTS[0]!.x - CARRIER_START_POS.x,
+      CARRIER_WAYPOINTS[0]!.z - CARRIER_START_POS.z,
+    ),
   );
   const dc = carrier.deckColliderRef;
   if (dc) owners.set(dc.handle, 'deck');
@@ -144,7 +148,14 @@ async function main(): Promise<void> {
     },
     deckHeightAt: (x, z) => carrier.deckHeightAt(x, z),
     velocity: () => carrier.vel.clone(),
+    velocityAt: (x, z) => {
+      const rx = x - carrier.pos.x;
+      const rz = z - carrier.pos.z;
+      const w = carrier.yawRate;
+      return new THREE.Vector3(carrier.vel.x + w * rz, carrier.vel.y, carrier.vel.z - w * rx);
+    },
     yawRate: () => carrier.yawRate,
+    yawRateAt: () => carrier.yawRate,
     local: (x, z) => {
       const v = carrier.localPosition(new THREE.Vector3(x, 0, z));
       return v ? { x: v.x, z: v.z } : null;
@@ -238,9 +249,10 @@ async function main(): Promise<void> {
   const alpha = RUNWAY_TABLE[0]!;
 
   // ---- E. Runway flatness (analytic + sampled grid) ----
-  // Alpha is a plateau runway now (elev 85 m): the strip must be exactly
-  // flat AT the plateau elevation, not at 0 — the check is elev-relative
-  // with the same strictness (exact flatness), only the reference moved.
+  // Alpha is a plateau runway (elev from the table): the strip must be
+  // exactly flat AT the plateau elevation, not at 0 — the check is
+  // elev-relative with the same strictness (exact flatness), only the
+  // reference moved.
   let flatWorst = 0;
   for (let d = -425; d <= 425; d += 5) {
     const h = heightAt(alpha.x + d, alpha.z);
@@ -248,14 +260,14 @@ async function main(): Promise<void> {
   }
   check('Alpha strip + 100 m overrun flat (heightAt == elev)', flatWorst === 0, `worst |h - elev| = ${flatWorst}`);
   // Sampled grid, bilinear at the exact centreline points the jet rolls
-  // over (x -1400..-1050: the takeoff roll — every jet is airborne by
-  // ~300 m). Nearest-node sampling would catch feather-zone nodes past
-  // the overrun tips — those are expected to rise (the analytic strip
-  // is flat to 425 m, but the 40 m grid feathers early at the tips; the
-  // strip mesh itself is flat and the jet is airborne by then).
+  // over (the takeoff roll — every jet is airborne by ~300 m).
+  // Nearest-node sampling would catch feather-zone nodes past the
+  // overrun tips — those are expected to rise (the analytic strip is
+  // flat to 425 m, but the grid feathers early at the tips; the strip
+  // mesh itself is flat and the jet is airborne by then).
   const bilinear = (x: number, z: number): number => {
-    const gx = (x + 3000) / 40;
-    const gz = (z + 3000) / 40;
+    const gx = (x + WORLD_SIZE / 2) / GRID_STEP;
+    const gz = (z + WORLD_SIZE / 2) / GRID_STEP;
     const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
     const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
     const fx = gx - ix;
@@ -616,8 +628,11 @@ async function main(): Promise<void> {
     owners.set(terrainCollider.handle, 'terrain');
     if (dc) owners.set(dc.handle, 'deck');
     carrier.reset(
-      new THREE.Vector3(-500, 350, -900),
-      Math.atan2(1400 - -500, -900 - -900),
+      CARRIER_START_POS.clone(),
+      Math.atan2(
+        CARRIER_WAYPOINTS[0]!.x - CARRIER_START_POS.x,
+        CARRIER_WAYPOINTS[0]!.z - CARRIER_START_POS.z,
+      ),
     );
   }
 

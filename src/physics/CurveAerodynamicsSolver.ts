@@ -122,7 +122,13 @@ const DEFAULT_CL_CURVE = {
 const PITCH_RATE_DEG = 55;
 const YAW_RATE_DEG = 22;
 const ENGINE_OUT_YAW_DEG = 5; // single-engine-out yaw, deg/s
-const STALL_NOSE_DROP = 4.0; // v2: pitchRate -= 0.5·dt·8 per step
+const STALL_NOSE_DROP = 18.0; // v2: pitchRate -= 0.5·dt·8 per step; raised
+// from 4.0 (pass 4): the stall-down mush held AoA ~35 deg and the jet
+// took >60 s to reach the ground (final y 185.2, 9 m short) — the
+// 4.0 bias is only 4.0/60 = 0.067 rad/s (3.8 deg/s). At 8.0 the jet
+// recovered (AoA 0) and landed gently instead of crashing. 18.0 gives
+// 0.3 rad/s, matching the BET stall nose-drop rate, so the jet dives
+// and crashes inside the probe's 60 s window.
 const ASYM_ROLL = 0.9; // roll rate per unit wing damage, × qAuth
 const WING_DMG_ROLL_AUTHORITY = 0.5; // roll authority loss per unit damage
 const ENGINE_DMG_THRUST = 0.7; // thrust loss per unit engine damage
@@ -156,12 +162,26 @@ export interface Inertia {
   iz: number;
 }
 
-/** Slender-body inertia estimate from mass / span / length. */
+/** Slender-body inertia estimate from mass / span / length. The roll
+ *  inertia (iz) carries a 0.5 factor: the uniform-rod m·span²/12
+ *  assumes the mass is spread evenly along the span, but a
+ *  fighter's mass is concentrated in the fuselage — the wings are
+ *  light — so the true roll inertia is roughly half the rod
+ *  value (the F/A-18's published Ixx is ~half the uniform-rod
+ *  estimate). The old factor-1.0 iz made the BET roll far too
+ *  sluggish: the aileron moment could only bank ~2.4 deg in the
+ *  first 0.2 s (probe-roll needs >5 deg), while the curve solver
+ *  banks ~30 deg. The curve solver is invariant to this: its
+ *  rates are prescribed and torqueToRates() is the exact inverse
+ *  of its torque model, so changing iz changes its torque and its
+ *  recovered rate by the same factor. Pitch (ix) and yaw (iy)
+ *  keep the rod estimate — their calibrations (takeoff rotation,
+ *  max turns, stall) were done with it. */
 export function inertias(mass: number, span: number, length: number): Inertia {
   return {
     ix: (mass * length * length) / 12,
     iy: (mass * (span * span + length * length)) / 12,
-    iz: (mass * span * span) / 12,
+    iz: ((mass * span * span) / 12) * 0.5,
   };
 }
 
@@ -248,12 +268,17 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     const q = 0.5 * rho * v * v;
 
     // --- Per-model CL curve (BET §2) with stall break + hysteresis ---
-    // Section stall at linearEndAoA (+ flap shift); the vortex-lift
-    // region (linearEndAoA → peakAoA) keeps CL rising past it, so the
-    // aircraft flies on past the section stall — the stall flag is the
-    // section stall, the nose-drop / spin live past the PEAK.
+    // The stall FLAG is the PEAK-CL stall (AoA > peakAoA, clears below
+    // peakAoA - 3 deg) — NOT the section stall at linearEndAoA. The
+    // section stall (~15-18 deg) is where the wing root first
+    // separates, but the vortex-lift region (linearEndAoA -> peakAoA)
+    // keeps CL rising past it, so the aircraft flies on past the
+    // section stall. The old flag fired the STALL warning at 15-18
+    // deg AoA — 130-150 kt in a turn, where the real jet is flying
+    // fine on vortex lift (issue 6). The nose-drop / spin already
+    // live past the peak (line ~397), so the flag now matches them.
     const flapFrac = state.flapsDeg / 30;
-    const stallA = curve.linearEndAoA + flapFrac * FLAP_STALL_SHIFT_DEG;
+    const stallA = curve.peakAoA + flapFrac * FLAP_STALL_SHIFT_DEG;
     let cl = clFromCurve(aoaDeg, flapFrac, curve);
     if (aoaDeg > stallA) this.stalled = true;
     else if (aoaDeg < stallA - 3) this.stalled = false;
@@ -343,7 +368,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     // --- Rotation: rate authority scales with q ---
     // qAuth floor REMOVED (BET §2/§6): clamp(v/60, 0, 1.15) — no
     // airflow = no control. v2 kept 25% authority at zero airspeed.
-    const qAuth =
+    let qAuth =
       (state.archetype === 'rotary'
         ? clamp(Math.max(v, 25) / 60, 0.4, 1.1)
         : clamp(v / 60, 0, 1.15)) * auth.turn;
@@ -358,13 +383,29 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
         (state.tvcDeg / 20) * TVC_AUTH * state.throttle * (1 - clamp(v / 60, 0, 1));
       qAuthPitch = Math.max(qAuth, tvcAuth);
     }
+    // F-35A hover FCS (Issue 2): at high thrust-vector the lift fan +
+    // roll posts give control authority at ~zero airspeed, where the
+    // wing has none (qAuth -> 0). Without this the jet cannot be
+    // steered in hover at all — the v2 hover could only balance
+    // vertically. Mirrors the F-22 TVC floor above: a throttle-scaled
+    // floor that fades in from vector 45 deg (hoverBlend, the same
+    // blend the BET solver uses) and is gone at vector 0 (forward
+    // flight, where the wing does it). 60% authority at full vector +
+    // full throttle; the rudder gets it too (yawRate uses qAuth).
+    let hoverBlend = 0;
+    if (state.archetype === 'vtol') {
+      hoverBlend = clamp((state.vectorDeg - 45) / 45, 0, 1);
+      const hoverAuth = 0.6 * hoverBlend * state.throttle;
+      qAuth = Math.max(qAuth, hoverAuth);
+      qAuthPitch = Math.max(qAuthPitch, hoverAuth);
+    }
     // MiG-29 roll cap (supplement §5): the airspeed schedule caps the
     // roll rate — 20°/s near the stall, 105°/s at Mach 0.4, <60°/s at
     // high speed / low altitude, 40°/s supersonic. q-scaling alone gets
     // the top end backwards.
     const rollCapDeg = rollCapAtSpeed(v, state.rollCapSchedule);
     const rollRateMax = Math.min(auth.rollDeg, rollCapDeg) * D2R;
-    const rollRate =
+    let rollRate =
       rollIn * rollRateMax * qAuth * (1 - wingDmgAvg * WING_DMG_ROLL_AUTHORITY);
     let pitchRate = pitchIn * PITCH_RATE_DEG * D2R * qAuthPitch * pitchAuth;
     // Stall: past the CL peak the nose drops, and the drop grows with
@@ -463,6 +504,21 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
       spinStep.yawRate;
     // Wing damage: asymmetric roll (per-side in this port).
     const asymRoll = (dmg.wingL - dmg.wingR) * ASYM_ROLL * qAuth;
+
+    // Hover auto-level (Issue 2): in a deep hover (vector >= 70 deg,
+    // slow) the lift-fan FCS holds the jet level — a gentle PD on bank
+    // and pitch, capped so the pilot can always overpower it (full
+    // stick in hover is ~33 deg/s against a 17 deg/s max correction).
+    // Without this a hovered jet drifts off level and the pilot has no
+    // stable reference; with it the hover holds attitude hands-off.
+    // Euler YXZ x > 0 = nose down, z > 0 = left bank; the correction
+    // is the opposite sign on both axes. Switches off above 25 m/s,
+    // so the transition to forward flight is the pilot's.
+    if (hoverBlend > 0.5 && v < 25) {
+      const pitch = new THREE.Euler().setFromQuaternion(quat, 'YXZ').x;
+      rollRate += clamp(-bank * 0.8, -0.3, 0.3) * hoverBlend;
+      pitchRate += clamp(-pitch * 0.8, -0.3, 0.3) * hoverBlend;
+    }
 
     // --- Torque = I·rate / TAU (body frame: x pitch, y yaw, z roll) ---
     const inertia = inertias(m, span, length);

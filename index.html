@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v3.0, 16 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.0, 17 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -51,6 +51,27 @@
     padding:6px 11px;font-size:12.5px;font-weight:650;backdrop-filter:blur(6px);white-space:nowrap}
   .pill b{color:#ffd166}
   .pill.warn b{color:#ff5a5a}
+  /* Per-zone damage chips (issue 5): one small chip per damage zone
+    (FUSE / WING / ENG / FUEL) on its own row under the HUD pills.
+    Always visible but dim when healthy, so the layout never shifts
+    when damage lands; the bar + colour carry the state at a glance
+    on a phone. ok = green bar, hurt = amber, crit = red, dead =
+    solid red, fire = 🔥 prefix + pulsing red border. */
+  #dmgChips{display:flex;gap:6px;flex-basis:100%;pointer-events:none}
+  .dmg{display:flex;align-items:center;gap:5px;background:rgba(6,18,30,.72);
+    border:1px solid rgba(140,190,230,.25);border-radius:999px;
+    padding:4px 9px;font-size:11px;font-weight:700;letter-spacing:.04em;
+    backdrop-filter:blur(6px);white-space:nowrap;opacity:.55}
+  .dmg .bar{width:26px;height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden}
+  .dmg .bar i{display:block;height:100%;background:#3ddc84}
+  .dmg.hurt{opacity:1;border-color:rgba(255,176,32,.6)}
+  .dmg.hurt .bar i{background:#ffb020}
+  .dmg.crit{opacity:1;border-color:rgba(255,90,90,.7)}
+  .dmg.crit .bar i{background:#ff5a5a}
+  .dmg.dead{opacity:1;background:rgba(120,10,10,.85);border-color:#ff5a5a}
+  .dmg.dead .bar i{background:#ff5a5a}
+  .dmg.fire{animation:dmgFire 0.8s infinite alternate}
+  @keyframes dmgFire{from{border-color:#ff5a5a}to{border-color:#ffb020}}
   .iconBtn{pointer-events:auto;background:rgba(6,18,30,.72);border:1px solid rgba(140,190,230,.25);color:#e8f1f8;
     border-radius:999px;width:36px;height:36px;font-size:16px;cursor:pointer;backdrop-filter:blur(6px)}
   .iconBtn:active{transform:scale(.94)}
@@ -75,6 +96,23 @@
   #spectate.show{display:flex}
   #spectateText{font-size:12px;font-weight:800;letter-spacing:.06em;color:#ffb3b3;text-shadow:0 1px 6px rgba(0,0,0,.8)}
   #respawnBtn{background:#c0392b;color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:12px;font-weight:800;cursor:pointer}
+  /* Respawn picker (issue 4): shown after the jet goes down (and after
+     the spectate sequence when one applies). The player chooses the
+     runway/deck to respawn at; the last choice is highlighted. */
+  #respawnPicker{position:fixed;left:50%;top:38%;transform:translate(-50%,-50%);z-index:7;
+    display:none;background:rgba(6,18,30,.88);border:1px solid rgba(140,190,230,.4);
+    border-radius:14px;padding:16px 18px;backdrop-filter:blur(6px);width:min(320px,88vw);text-align:center}
+  #respawnPicker.show{display:block}
+  #respawnPicker h2{font-size:16px;letter-spacing:.12em;text-transform:uppercase;color:#fff}
+  #respawnPicker p{font-size:12px;color:#9db8cc;margin-top:4px}
+  .pickerBtns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+  .pickerBtns button{background:rgba(255,255,255,.07);border:1px solid rgba(140,190,230,.35);color:#dbe9f2;
+    border-radius:10px;padding:11px 6px;font-size:13px;font-weight:800;cursor:pointer}
+  .pickerBtns button.on{background:#007aff;color:#fff;border-color:#007aff}
+  .pickerBtns button:disabled{opacity:.35;cursor:default}
+  #pickerHint{font-size:11px;color:#9db8cc;margin-top:10px}
+  #pickerCancel{background:none;border:1px solid rgba(140,190,230,.35);color:#9db8cc;border-radius:999px;
+    padding:6px 16px;font-size:12px;font-weight:700;cursor:pointer;margin-top:10px}
   /* left: throttle slider (X-Plane 9 style) + 2-axis stick */
   #thrWrap{position:fixed;left:10px;top:38%;z-index:6;width:34px;height:170px;transform:translateY(-50%);
     background:rgba(6,18,30,.6);border:1px solid rgba(140,190,230,.3);border-radius:17px;backdrop-filter:blur(4px)}
@@ -205,11 +243,18 @@
   <div class="pill"><b id="hudVsi">0</b> fpm</div>
   <div class="pill"><b id="hudHdg">000°</b></div>
   <div class="pill">AoA <b id="hudAoA">0°</b></div>
+  <div class="pill">Bank <b id="hudBank">0°</b></div>
   <div class="pill hidden" id="vecPill">VEC <b id="hudVec">0°</b></div>
   <div class="pill">G <b id="hudG">1.0</b></div>
   <div class="pill">⛽ <b id="hudFuel">100%</b></div>
   <div class="pill">🎯 <b id="hudWpn">6 MSL · 30 FLR</b></div>
   <div class="pill">⭐ <b id="hudScore">0</b></div>
+  <div id="dmgChips">
+    <span class="dmg ok" id="dmgFuse"><b>FUSE</b><span class="bar"><i></i></span></span>
+    <span class="dmg ok" id="dmgWing"><b>WING</b><span class="bar"><i></i></span></span>
+    <span class="dmg ok" id="dmgEng"><b>ENG</b><span class="bar"><i></i></span></span>
+    <span class="dmg ok" id="dmgFuel"><b>FUEL</b><span class="bar"><i></i></span></span>
+  </div>
   <button class="iconBtn" id="soundBtn" title="Sound on/off">🔊</button>
   <button class="iconBtn" id="camBtn" title="Camera (C)">📷</button>
   <button class="iconBtn" id="pauseBtn" title="Pause (P)">⏸</button>
@@ -221,6 +266,18 @@
 <div id="warn"></div>
 <div id="rotateCue">ROTATE — HOLD ↑ / PULL BACK</div>
 <div id="spectate"><span id="spectateText"></span><button id="respawnBtn">Respawn now (R)</button></div>
+<div id="respawnPicker">
+  <h2>Respawn at</h2>
+  <p>Choose where to get back in the air</p>
+  <div class="pickerBtns">
+    <button data-target="alpha">Alpha runway</button>
+    <button data-target="bravo">Bravo runway</button>
+    <button data-target="charlie">Charlie runway</button>
+    <button data-target="carrier">Helicarrier deck</button>
+  </div>
+  <div id="pickerHint">R — respawn at the highlighted choice</div>
+  <button id="pickerCancel">Cancel</button>
+</div>
 <div id="pipper" style="display:none"></div>
 <div id="ccip" style="display:none"></div>
 <div id="debug" class="hidden"></div>
@@ -235,6 +292,7 @@
   <div class="btnGrid">
     <button class="ctlBtn" id="gearBtn">⚙️ Gear</button>
     <button class="ctlBtn" id="hookBtn">🪝 Hook</button>
+    <button class="ctlBtn hidden" id="vtolBtn">🛬 VTOL</button>
     <button class="ctlBtn" id="brakeBtn">🛑 Brake</button>
     <button class="ctlBtn" id="flareBtn">✨ Flare</button>
     <button class="ctlBtn fire" id="fireBtn">🔥 FIRE</button>
@@ -305,10 +363,11 @@
         <button data-v="none" class="on">Off</button><button data-v="engineL">Eng L</button><button data-v="engineR">Eng R</button><button data-v="engineFire">Eng fire</button><button data-v="hydraulic">Hydraulic</button><button data-v="gearJam">Gear jam</button><button data-v="fuelLeak">Fuel leak</button><button data-v="random">Random</button></div></div>
       <div class="seaRow"><span class="lab">Fail when</span><div class="seg" id="segFailWhen">
         <button data-v="start" class="on">At start</button><button data-v="random">Random 30–90 s</button></div></div>
-      <div class="seaRow"><span class="lab">Carrier</span><div class="seg"><button class="on" data-v="ford">Gerald Ford 🚢</button></div></div>
+      <div class="seaRow"><span class="lab">Helicarriers</span><div class="stepper" id="stepHeli">
+        <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v3.0 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.0 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 

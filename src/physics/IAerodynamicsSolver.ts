@@ -323,6 +323,15 @@ export interface AeroState {
    *  freefalls instead of gliding on with zero controls. It scales the
    *  LIFT only, not the drag — a broken wing has high drag. */
   liftScale?: number;
+  /** Dying (damage-model §6): the airframe is breaking up. The BET
+   *  solver uses this for a nose-down departure moment (a dead jet
+   *  with zeroed controls stays trimmed and glides — the live
+   *  shoot-down held AoA 10 deg and G 0.8 all the way down — so
+   *  the wreck must be driven nose-down into a spiral dive).
+   *  The controller also applies a 0.15 rad/s nose-down bias to
+   *  the rates; the moment is the solver-side half, fed back
+   *  through the rate sync. */
+  dying?: boolean;
   /** Fixed-step length, s. Default 1/60. Used only for the stall
    *  nose-drop rate and spin build/decay (v2 applies them per step). */
   dt?: number;
@@ -391,4 +400,16 @@ export interface IAerodynamicsSolver {
   /** Reset stall/spin hysteresis (respawn — a fresh jet is not
    *  stalled and not spinning, whatever the wreck was doing). */
   reset?(): void;
+  /** Sync the solver's integrated angular-rate state to the rates the
+   *  controller actually applied (after its clamps / biases). Only
+   *  the blade-element solver integrates a rate state — the curve
+   *  solver prescribes its rates fresh each step, so it has nothing
+   *  to sync and omits this. Without the sync, the BET solver keeps
+   *  integrating from a rate the body never flew: the rotation clamp
+   *  zeroes the pitch rate on the ground while the thrust moment
+   *  winds the solver's pitch rate up, and the jet rotates on its
+   *  own above Vr; the dying nose-down bias never reaches the
+   *  solver's damping model either. The controller calls this every
+   *  step with the final (clamped / biased) solver rates. */
+  syncRates?(rates: { pitchRate: number; yawRate: number; rollRate: number }): void;
 }

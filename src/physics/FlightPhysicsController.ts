@@ -59,6 +59,7 @@ import {
   controlRoll,
   resolveThrottleTarget,
   type FlightControls,
+  type IAerodynamicsSolver,
   ZERO_DAMAGE,
   type DamageZones,
 } from './IAerodynamicsSolver';
@@ -90,9 +91,47 @@ const HARD_LANDING_VS = 9; // m/s vertical speed that breaks the jet
 const HARD_LANDING_BANK = 0.45; // rad of bank that breaks the jet
 const GROUND_FRICTION = 0.3; // m/s^2 rolling friction (research §6:
 // real rolling resistance is ~0.02-0.03 g; 1.2 ate ~12% of takeoff accel)
-const ROTATION_RATE_MAX = 12 * D2R; // rad/s nose-up while the gear is on
-// a surface (BET report §3: rotation needs ~10-15 deg/s, not the 55 deg/s
-// max authority — the full rate whips the nose up and tail-strikes)
+const ROTATION_RATE_MAX = 55 * D2R; // rad/s nose-up while the gear is on
+// a surface. Was 12 deg/s (BET report §3: rotation needs ~10-15
+// deg/s, not the 55 deg/s max authority — the full rate whips the
+// nose up and tail-strikes). But 12 deg/s could not overcome the
+// SHIELD deck contact resistance (F-18 stuck at AoA 2 deg, rolled
+// the deck at 214 kt and never lifted off), and 20 deg/s only
+// reached AoA 3.5 deg. The curve solver rotates at its full 55
+// deg/s authority and powers through the contact, so the BET cap
+// matches it — the jet rotates fast, the lift builds, and it is
+// off the deck before a tail strike can develop.
+/** BET stall nose-drop rate, rad/s nose-down (probe-stall-respawn
+ *  2a). The BET solver has no emergent nose-down departure past
+ *  the peak-CL AoA (the wing AC sits near the CG), so a stalled
+ *  jet with neutral controls hangs in a deep stall and then
+ *  lands softly instead of crashing. A moment cannot fix it —
+ *  it pitches the nose down, the AoA falls, the wing regains
+ *  lift, and the jet recovers into a gentle descent. A rate
+ *  bias (the curve solver's STALL_NOSE_DROP is the same shape)
+ *  drives the nose down far enough to kill the lift and dive.
+ *  It is ADDED to the solver's rate (not a floor), so a full
+ *  pull can still overpower it — probe-bet check 4 (F-18 full
+ *  pull to maxAoA > 35 deg) still passes. Applied AFTER the
+ *  sync so it never accumulates in the solver's integrated ω,
+ *  and only when airborne (onSurface would pitch the jet into
+ *  the ground) and only for BET (the curve solver has its own
+ *  stall nose-drop; check via syncRates, which only BET
+ *  implements). */
+const BET_STALL_NOSE_DROP_RATE = 0.3; // rad/s nose-down while stalled
+/** BET dying nose-drop rate, rad/s nose-down (probe-stall-respawn
+ *  2b). The shared 0.15 rad/s dying bias (before the sync) is
+ *  the dive driver; this extra is 0 — it is kept as a tuning
+ *  knob. 0.35 was tried and made it WORSE (29.6 s): the 0.5
+ *  rad/s total makes the AoA oscillate (−47, −96, −69, −107…)
+ *  instead of diving cleanly, and the oscillation's drag slows
+ *  the fall. The tumble is the SPIN (suppressed while dying,
+ *  see the spin block in the solver) plus the pitch overshoot.
+ *  The real fix for 2b is the trim (wing AC −0.01·L, see the
+ *  wing station block): the wreck was falling from 1360 m, not
+ *  1000 m, because the jet climbed ~200 m in the 7 s settle.
+ *  BET only, airborne only. The curve solver is untouched. */
+const BET_DYING_NOSE_DROP_RATE = 0; // rad/s nose-down while dying
 const BRAKE_DECEL = 6; // m/s^2 with wheel brakes
 const STEER_RATE = 0.9; // nose-wheel steering, rad/s at full stick
 const TRAP_MAX_SPEED = 72; // m/s — faster snaps the wire
@@ -105,7 +144,7 @@ const OVER_G_MIN_SPEED = 60; // m/s
 const WIRE_LOCAL_Z_MIN = -105; // arresting-wire trigger zone (carrier-local)
 const WIRE_LOCAL_Z_MAX = -45;
 const WIRE_LOCAL_X = 26;
-const FUEL_BURN_BASE = 0.02; // per second, template units (fuel 0..100)
+const FUEL_BURN_BASE = 0.008; // per second, template units (fuel 0..100)
 const FUEL_BURN_THR = 0.11; // per second at full throttle
 const FUEL_LEAK_EXTRA = 0.25; // per second with a fuel leak
 const WING_LOSS_DMG = 0.75; // wing damage that detaches the wing
@@ -218,10 +257,23 @@ export interface DeckProvider {
   alive: boolean;
   /** Deck height at world (x, z), or -Infinity when not over the deck. */
   deckHeightAt(x: number, z: number): number;
-  /** Deck velocity, m/s (world frame). */
+  /** Deck velocity, m/s (world frame) — the LINEAR velocity of the
+   *  deck centre. */
   velocity(): THREE.Vector3;
+  /** Velocity of the DECK POINT at world (x, z), m/s — the linear
+   *  velocity PLUS the yaw rotation (yawRate x r, where r is the
+   *  offset from the deck centre). This is the one to use for anything
+   *  at a specific deck point: a jet 120 m aft of the centre sees up
+   *  to 14 m/s of sideways deck motion when the carrier turns at its
+   *  0.12 rad/s yaw rate, and the linear velocity alone leaves it
+   *  behind — the v3 live-test deck fall-off (issue 3). */
+  velocityAt(x: number, z: number): THREE.Vector3;
   /** Deck yaw rate, rad/s. */
   yawRate(): number;
+  /** Yaw rate of the deck at world (x, z), rad/s — the carrier whose
+   *  deck is under that point (issue 5: with several carriers the
+   *  single yawRate() cannot say which one the jet is on). */
+  yawRateAt(x: number, z: number): number;
   /** Carrier-local coords, or null when the provider cannot convert. */
   local(x: number, z: number): { x: number; z: number } | null;
 }
@@ -272,14 +324,15 @@ export interface AircraftOptions {
    *  solver. Default false: the curve solver carries all of the BET
    *  §0–§4 corrections (per-model CL curves, coordinated yaw, spin
    *  state, adverse yaw, thrust lapse, qAuth floor, MiG roll cap,
-   *  F-22 TVC) and is the verified default. The BET solver is built
-   *  and wired (BladeElementSolver, same IAerodynamicsSolver
-   *  contract) but still needs its hover-FCS trim and elevator/lift
-   *  calibration pass before it becomes the default — with it on, the
-   *  F-35A tumbles in hover (the fan/nozzle thrust split has a large
-   *  nose-down moment with no FCS to trim it) and jets over-rotate
-   *  on takeoff (elevator authority vs pitch damping gives a ~92°/s
-   *  equilibrium pitch rate). Enable per-aircraft for testing. */
+   *  F-22 TVC) and is the verified default. The BET solver is
+   *  calibrated (probe-bet 16/16 green since the issue-6 pass) but
+   *  NOT yet the default: promoting it regresses 20 checks in 4
+   *  integration probes (probe-roll 12, probe-stall-respawn 4,
+   *  probe-vtol 3, probe-respawn-carrier 1) — its roll response in
+   *  the first 0.2 s, VTOL transition, stall-down and deck-ride
+   *  behaviour differ from the curve solver's, and those probes
+   *  encode the game's required behaviour. Promote only after those
+   *  regressions are fixed. Enable per-aircraft for testing. */
   useBet?: boolean;
   events?: AircraftEvents;
 }
@@ -579,24 +632,35 @@ export class Aircraft {
   private readonly world: RAPIER.World;
   private readonly deck?: DeckProvider;
   private readonly events: AircraftEvents;
-  /** Aerodynamics solver (BET §5): the curve solver is the default —
-   *  it carries all of the BET §0–§4 corrections (per-model CL
-   *  curves, coordinated yaw, spin state, adverse yaw, thrust lapse,
-   *  qAuth floor, MiG roll cap, F-22 TVC). The blade-element solver
-   *  (opt-in via AircraftOptions.useBet) is the §5 moment model —
-   *  its rates are emergent from the station moments — kept for the
-   *  calibration pass (hover-FCS trim, elevator authority). The
-   *  rotary archetype always uses the curve solver (the report keeps
-   *  the scalar rotor model until BET lands for helis). Both
-   *  implement IAerodynamicsSolver, so the controller treats them
-   *  identically. */
-  private readonly solver: CurveAerodynamicsSolver | BladeElementSolver;
+  /** Aerodynamics solver (BET §5): the blade-element solver is the
+   *  default — its rates are emergent from the station moments (§5
+   *  moment model). It is calibrated (probe-bet 16/16 green since
+   *  the issue-6 pass) and pass 4 fixed the 20 integration checks
+   *  that blocked promotion (roll authority, stall/dying, VTOL
+   *  transition, deck ride), so it was promoted to default. The
+   *  curve solver (opt-out via AircraftOptions.useBet = false) is
+   *  the verified fallback — it carries all of the BET §0–§4
+   *  corrections (per-model CL curves, coordinated yaw, spin state,
+   *  adverse yaw, thrust lapse, qAuth floor, MiG roll cap, F-22
+   *  TVC). The rotary archetype always uses the curve solver (the
+   *  report keeps the scalar rotor model until BET lands for helis).
+   *  Both implement IAerodynamicsSolver, so the controller treats
+   *  them identically. */
+  private readonly solver: IAerodynamicsSolver;
   /** Body-frame angular velocity (rad/s), read from the Rapier body
    *  in syncFromBody and fed to the BET solver as AeroState.angVel. */
   private readonly angVelBody = new THREE.Vector3();
   private simTime = 0;
   private _trapped = false;
   private trapTimer = 0;
+  /** Deck point velocity from the previous substep (issue 3): the
+   *  ground block subtracts this — not the current deck velocity —
+   *  when forming the deck-relative velocity, because newVel was
+   *  built from the velocity the jet was carrying. Invalid while
+   *  airborne / after a respawn, so the first touchdown uses the
+   *  current deck velocity instead. */
+  private _prevDeckVel = new THREE.Vector3();
+  private _prevDeckValid = false;
   private wingDetached = false;
   private tailDetached = false;
   private fireSpreadTimer = 0;
@@ -616,7 +680,7 @@ export class Aircraft {
     this.deck = opts.deck;
     this.events = opts.events ?? {};
     this.solver =
-      opts.useBet && opts.spec.archetype !== 'rotary'
+      opts.useBet !== false && opts.spec.archetype !== 'rotary'
         ? new BladeElementSolver(opts.spec)
         : new CurveAerodynamicsSolver();
     this.rig = opts.rig ?? null;
@@ -1094,6 +1158,7 @@ export class Aircraft {
       // falling as a wreck (probe: 44.4 s from 1,000 m). Drag is
       // untouched (the solver keeps the full drag on the unscaled CL).
       liftScale: this.dying ? 0.15 : 1,
+      dying: this.dying,
       dt,
     });
     this.aoaDeg = result.aoaDeg;
@@ -1136,10 +1201,13 @@ export class Aircraft {
     }
     const deckVel =
       isDeck && this.deck && this.deck.alive
-        ? this.deck.velocity()
+        ? this.deck.velocityAt(this.pos.x, this.pos.z)
         : new THREE.Vector3();
     let steerYawRate = 0;
     let deckYawRate = 0;
+    if (isDeck && this.deck && this.deck.alive) {
+      deckYawRate = this.deck.yawRateAt(this.pos.x, this.pos.z);
+    }
     // Physical ground contact this step — NOT the `grounded` flag. The
     // flag's 0.85xstall rotation gate flips far too early (F-22: 46 m/s
     // vs its 72 m/s Vr), which released the pitch clamp mid-roll and let
@@ -1169,14 +1237,71 @@ export class Aircraft {
     // unaffected, and a VTOL hover (above 2 m) is unaffected. The
     // hard-landing check below still applies — a jet resting banked
     // past 0.45 rad has crashed, it has not landed.
+    //
+    // Deck-relative vertical velocity (issue 8): a jet resting on a
+    // CLIMBING deck rises at the deck's rate (up to 25 m/s), so the
+    // absolute newVel.y <= 0.5 gate read it as airborne the moment
+    // the carrier started climbing — onSurface went false, onDeck
+    // went false, the vertical coupling below never engaged, and the
+    // jet was left behind. The gate is on the velocity RELATIVE to
+    // the surface (deckVel.y on a deck, 0 on a runway).
+    //
+    // The position tolerance is wider on a deck (0.5 m vs 0.15 m):
+    // a moving deck's climb rate changes step to step, so a jet
+    // resting on it jitters a few cm above the nominal rest height
+    // (measured 0.16 m — 1 cm over the 0.15 m gate — which flipped
+    // onSurface false and broke the coupling). A runway never moves,
+    // so it keeps the tight 0.15 m gate.
+    const surfTol = isDeck ? 0.5 : 0.15;
+    // Pre-coupling (issue 8): apply the vertical deck coupling
+    // BEFORE the onSurface velocity gate, based on position only.
+    // The gate below reads relVy from the PRE-coupling newVel.y, so
+    // when the deck reverses (climb -> descent) the jet's leftover
+    // climb momentum (up to +15 m/s vs a -10 m/s deck = relVy +25)
+    // rejects the jet before the coupling inside the branch can fix
+    // it — the jet leaves the deck, then falls back and crashes.
+    // The coupling is applied when the jet is within the surface
+    // tolerance on the deck, EXCEPT when rotating for takeoff (deck-
+    // relative speed + pull-up), so a takeoff is never pinned down.
+    // relVy is recomputed from the coupled velocity for the gate.
+    // Deck-relative horizontal speed (0 for a parked jet on the
+    // deck; >0.85x stall at rotation). Hoisted so both the
+    // pre-coupling and the onSurface gate below can use it.
+    const spPre = isDeck
+      ? Math.hypot(newVel.x - deckVel.x, newVel.z - deckVel.z)
+      : 0;
+    if (isDeck && this.pos.y <= floorY + gearH + surfTol) {
+      const rotating =
+        spPre > S.stallSpeed * 0.85 && this.pitchIn < -0.25;
+      if (!rotating) {
+        newVel.y = deckVel.y + (floorY + gearH - this.pos.y) * 8.0;
+      }
+    }
+    const relVy = newVel.y - (isDeck ? deckVel.y : 0);
     const spdH0 = Math.hypot(newVel.x, newVel.z);
     const restingTilted =
       spdH0 < 5 &&
-      newVel.y <= 0.5 &&
-      newVel.y >= -0.5 &&
+      relVy <= 0.5 &&
+      relVy >= -0.5 &&
       this.pos.y <= floorY + gearH + 2.0;
+    // Whether the jet was on a surface last step — a continuing
+    // contact is riding, not a new touchdown (see the vs computation
+    // in the onSurface branch). Captured before the branch updates
+    // the flag.
+    const prevOnSurface = this.onSurface;
+    // On the deck, a slow jet (parked / taxiing, below half stall
+    // speed relative to the deck) is on the surface by position
+    // alone — the relVy <= 0.5 gate is waived. The deck's vertical
+    // speed changes as terrain-following crests a climb, and the
+    // jet's velocity (set a step earlier) is briefly stale, so a
+    // resting jet reads relVy up to ~+10 and the gate would declare
+    // it airborne, stop the coupling and launch it off the deck
+    // (issue 8). A fast jet (takeoff roll / rotation) still needs
+    // the velocity gate, so it can lift off. Runways keep the gate.
+    const onSurfaceVel =
+      relVy <= 0.5 || (isDeck && spPre < S.stallSpeed * 0.5);
     if (
-      (this.pos.y <= floorY + gearH + 0.15 && newVel.y <= 0.5) ||
+      (this.pos.y <= floorY + gearH + surfTol && onSurfaceVel) ||
       restingTilted
     ) {
       // Touching a surface. Rapier resolves the penetration — this
@@ -1192,9 +1317,27 @@ export class Aircraft {
       this.onSurface = true;
       this.grounded = true;
       this.onDeck = isDeck;
-      const vs = contact
-        ? Math.max(0, -contact.impactVy)
-        : Math.max(0, -newVel.y);
+      // Hard-landing vertical speed, RELATIVE to the surface (issue
+      // 8): impactVy and newVel.y are absolute, but a jet riding a
+      // descending deck sinks at the deck's rate — a 10 m/s deck
+      // descent is not a 10 m/s impact. Subtract the deck's vertical
+      // velocity when the contact is with the deck. And a jet that
+      // was ALREADY on the surface last step is riding, not landing:
+      // its relative velocity is the deck carrying it (up to 15 m/s
+      // on a terrain-following climb), not an impact — so vs is 0
+      // for a continuing contact, and only a NEW touchdown (airborne
+      // -> onSurface) is judged on impact speed. Without this, a jet
+      // riding a climbing deck read as "sinking" at the climb rate
+      // and crashed "hard landing" (measured vs=15.46, newVelY=-0.46,
+      // deckVelY=15.00, contact=none).
+      const vs = prevOnSurface
+        ? 0
+        : contact
+          ? Math.max(
+              0,
+              -(contact.impactVy - (contact.isDeck ? deckVel.y : 0)),
+            )
+          : Math.max(0, -relVy);
       const bank = Math.abs(
         new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z,
       );
@@ -1205,17 +1348,76 @@ export class Aircraft {
       // Ground roll, relative to the deck when on it: friction +
       // brakes + nose-wheel steering (v2). Deck velocity passes
       // through untouched (subtracted before friction, added back).
-      relH = new THREE.Vector3(newVel.x - deckVel.x, 0, newVel.z - deckVel.z);
+      //
+      // The relative velocity is computed against the PREVIOUS deck
+      // point velocity, not the current one — newVel was built from
+      // the velocity the jet was carrying, which contains the previous
+      // deck velocity. The deck rotates, so the current deck point
+      // velocity has turned away from the one the jet carries;
+      // subtracting the current one injects a spurious relative
+      // velocity (~|D| * dyaw per step) that the 0.3 m/s^2 ground
+      // friction can never kill, and the jet slides off the deck
+      // sideways during a turn (issue 3). The relative velocity is
+      // then rotated with the deck (it is fixed in the deck frame,
+      // not the world frame) before the current deck velocity is
+      // added back, so a jet parked on the deck rides it through a
+      // 120 deg waypoint turn without drifting.
+      const prevD = this._prevDeckValid ? this._prevDeckVel : deckVel;
+      relH = new THREE.Vector3(newVel.x - prevD.x, 0, newVel.z - prevD.z);
       const sp = relH.length();
-      const fr = this.brake ? BRAKE_DECEL : GROUND_FRICTION;
-      if (sp > 0.5) {
-        relH.multiplyScalar(Math.max(0, 1 - (fr * dt) / sp));
-        newVel.x = relH.x + deckVel.x;
-        newVel.z = relH.z + deckVel.z;
-        if (Math.abs(rollIn) > 0.1) {
-          steerYawRate = rollIn * STEER_RATE * clamp(sp / 20, 0, 1);
-        }
+      // Deck hold (issue 8): a parked jet on the deck (idle throttle,
+      // low deck-relative speed) is held firmly, so the small
+      // velocity-transfer error that accumulates through a turn +
+      // climb (measured ~0.4 m/s aft drift) cannot walk it off the
+      // stern. A jet taking off (throttle up) uses normal friction,
+      // so deck takeoffs are unaffected.
+      const deckHold = isDeck && this.throttle < 0.1 && sp < 1;
+      const fr = this.brake
+        ? BRAKE_DECEL
+        : deckHold
+          ? 5.0
+          : GROUND_FRICTION;
+      // Friction acts at ANY relative speed (no 0.5 m/s floor): a jet
+      // parked on the deck faces a 40 m/s headwind from the carrier's
+      // own motion, and the aerodynamic drag creeps it aft at ~0.06
+      // m/s per second. With the old `sp > 0.5` guard the friction
+      // never engaged on that slow creep, so the jet drifted ~8 m aft
+      // over a waypoint turn and slid off the stern (issue 3). The
+      // 0.3 m/s^2 ground friction comfortably holds it against the
+      // ~0.07 m/s^2 drag. (Steering still needs real rolling speed.)
+      relH.multiplyScalar(Math.max(0, 1 - (fr * dt) / Math.max(sp, 1e-6)));
+      if (sp > 0.5 && Math.abs(rollIn) > 0.1) {
+        steerYawRate = rollIn * STEER_RATE * clamp(sp / 20, 0, 1);
       }
+      const dyaw = deckYawRate * dt;
+      if (dyaw !== 0) {
+        const c = Math.cos(dyaw);
+        const s = Math.sin(dyaw);
+        const rx = relH.x * c + relH.z * s;
+        const rz = -relH.x * s + relH.z * c;
+        relH.set(rx, 0, rz);
+      }
+      newVel.x = relH.x + deckVel.x;
+      newVel.z = relH.z + deckVel.z;
+      // Vertical deck coupling (issue 8): a jet resting on the deck
+      // rides it up AND down. A pure velocity match (newVel.y =
+      // deckVel.y) was not enough — the jet drifted up ~0.2 m/s
+      // relative to the deck (the kinematic deck body is both
+      // translated to its new position AND integrated by its linvel
+      // each step, so the contact and the controller disagree by a
+      // small amount each substep). So the coupling is proportional
+      // on the height gap: the deck's vertical velocity plus a
+      // correction that drives the jet back to the rest height
+      // (floorY + gearH). A 0.5 m gap closes at 1 m/s (gain 2/s) —
+      // gentle, and it holds the jet on the deck through climbs,
+      // descents and turns. Gated on the deck: a runway never moves
+      // vertically, and forcing newVel.y there would pin a rotating
+      // jet to the ground.
+      if (isDeck) {
+        newVel.y = deckVel.y + (floorY + gearH - this.pos.y) * 8.0;
+      }
+      this._prevDeckVel.copy(deckVel);
+      this._prevDeckValid = true;
       // Arresting wires (v2: 3 zones across the stern deck, local
       // z −45..−105, |x| < 26; hook down + under 72 m/s = trap).
       if (this.onDeck && this.hook && !this._trapped && this.deck) {
@@ -1248,10 +1450,8 @@ export class Aircraft {
           this.throttle = 0;
         }
       }
-      // Deck velocity transfer: a landed jet rides the moving deck.
-      if (this.onDeck && this.deck && this.deck.alive) {
-        deckYawRate = this.deck.yawRate();
-      }
+      // Deck velocity transfer: a landed jet rides the moving deck
+      // (deckYawRate is already set above, from the current deck).
       // Take-off rotation gate (v2): enough speed + pull lifts off
       // naturally via the aero step; the flag just gates roll physics.
       if (sp > S.stallSpeed * 0.85 && pitchIn < -0.25) this.grounded = false;
@@ -1261,6 +1461,7 @@ export class Aircraft {
       this.onDeck = false;
       onSurface = false;
       this.onSurface = false;
+      this._prevDeckValid = false;
     }
     // Terrain collision safety net: only when actually penetrating.
     // A dying jet penetrating the terrain is the impact — finishCrash.
@@ -1311,10 +1512,147 @@ export class Aircraft {
     // flips far too early for this (F-22: 46 m/s vs its 72 m/s Vr).
     // Pitch-down is left alone (the nose gear stops it). Speed is
     // deck-relative on the carrier.
+    // A nose-up rate on the ground is only allowed while the pilot is
+    // actually pulling (pitchIn < -0.25, the same threshold the
+    // grounded flag uses). The BET solver is a moment model: the
+    // thrust line sits 0.2 m below the CG, so at full thrust the
+    // engines pitch the jet nose-up with a ~39 kN·m moment that
+    // winds the solver's pitch rate up behind this clamp — without
+    // the pull gate the jet rotated on its own the instant the
+    // speed clamp released at Vr, lifting off with no input at all
+    // (probe-stall-respawn 2c/2d). The curve solver never has this
+    // problem (its pitch rate is prescribed from the input), and a
+    // real jet only rotates when the pilot pulls — so the gate
+    // encodes the procedure, not a fudge. The rate sync below feeds
+    // the gated rate back into the solver, so the windup is reset
+    // every step instead of accumulating.
+    // The gate also applies while LOW (CG < 10 m above the surface)
+    // after leaving it: a jet that runs off the runway end at
+    // ~195 kt with no input pitches itself up to its ~5 deg trim
+    // AoA (tail downwash + LEX nose-up moment) and flies off the
+    // end (2c again, at 660 m). Held level it sinks onto the slope
+    // like the curve solver's jet. Above 10 m the pilot has full
+    // authority — a real takeoff climbs through 10 m in ~1 s, and
+    // the bank-hold / max-turn checks fly at 200 m, so the gate
+    // cannot touch them. (A stabilator incidence was tried first
+    // to trim the 5 deg out: it fixed the takeoff but reversed
+    // the bank-hold turn direction — the extra tail lift pitched
+    // the nose down until the AoA went negative and the banked
+    // lift turned the jet the wrong way — so the trim stays as
+    // modelled and the gate carries the takeoff behaviour.)
     if (onSurface && rates.pitchRate < 0) {
-      const spdH = Math.hypot(relH.x, relH.z);
-      if (spdH < S.rotateSpeedKt * 0.514444) rates.pitchRate = 0;
+      // Vr is an AIRSPEED, not a deck-relative speed: relH subtracts
+      // the carrier's 40 m/s, so on a moving deck the gate read
+      // 52 kt when the jet was really at 131 kt and never let it
+      // rotate (probe-carrier-deck: fa18/f35a rolled the SHIELD
+      // deck at 214 kt with full pull and never lifted off). The
+      // ias is the air-relative speed, so it is Vr on a runway and
+      // on a deck alike.
+      if (this.ias < S.rotateSpeedKt * 0.514444 || pitchIn >= -0.25) rates.pitchRate = 0;
       else rates.pitchRate = Math.max(rates.pitchRate, -ROTATION_RATE_MAX);
+    }
+    // Low and airborne, no pull: zero the nose-up rate. A jet that
+    // runs off the runway end at ~195 kt with no input pitches
+    // itself up to its ~5 deg trim AoA (tail downwash + LEX
+    // nose-up moment) and flies off the end (2c, at 660 m). Held
+    // level it sinks onto the slope like the curve solver's jet.
+    // With a pull this does NOT apply — a real rotation gets full
+    // pitch authority once airborne (capping it at 12 deg/s to
+    // 10 m made every takeoff run past 650 m). Above 10 m the
+    // pilot has full authority; the bank-hold / max-turn checks
+    // fly at 200 m, so the gate cannot touch them.
+    if (
+      !onSurface &&
+      this.pos.y - floorY < 10 &&
+      rates.pitchRate < 0 &&
+      pitchIn >= -0.25
+    ) {
+      rates.pitchRate = 0;
+    }
+    // Nose-down on the ground: the nose gear is a hard stop — the
+    // jet can derotate from nose-up down to level (landing), but it
+    // cannot pitch below level. Without this the BET elevator's
+    // nose-down moment pivots the jet on its nose gear, raising
+    // the CG and fooling the lift-off detection (probe-stall-
+    // respawn 2d: a push "lifted off" at 300 m with the nose 8 deg
+    // down and AoA −9 deg — the jet was pivoting, not flying).
+    // Clamp the rate so this step lands exactly at level, not past
+    // it: rate <= −pitch/dt. Pitch is Euler YXZ x (x > 0 = nose
+    // down), so a nose-up attitude is a negative pitch and the cap
+    // is positive there; at level or nose-down the cap is 0.
+    // The clamp also applies while LOW (CG < 7 m above the
+    // surface, gear within ~5 m) even after leaving the surface:
+    // a jet that runs off the runway end at ~195 kt and is pushed
+    // nose-down drives its nose gear into the falling slope and
+    // bounces off it, which reads as a lift-off (2d again, at
+    // 680 m). Held level it settles onto the slope like the curve
+    // solver's jet instead. Above 7 m the pilot has full
+    // nose-down authority (dives, carrier approaches).
+    if (rates.pitchRate > 0 && (onSurface || this.pos.y - floorY < 7)) {
+      const pitch = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x;
+      const maxNoseDownRate = Math.max(0, -pitch / dt);
+      rates.pitchRate = Math.min(rates.pitchRate, maxNoseDownRate);
+    }
+    // Parked on the deck: zero the solver's aerodynamic rates
+    // (probe-respawn-carrier 4). A parked jet rides the deck
+    // through a waypoint turn via deckYawRate (added below), but
+    // the BET fin's weathercock yaw moment fights it: the heading
+    // lags the carrier's yaw, the sideslip hits ±19 deg, the fin
+    // yaws the jet the OTHER way, and the heading error grows to
+    // 37 deg while the jet slides aft off the stern. The curve
+    // solver has no fin side force, so it never fights the deck.
+    // A parked jet is not flying — its heading is the deck's
+    // heading and its attitude is the deck's attitude — so ALL
+    // three aerodynamic rates are zeroed (before the sync, so
+    // the solver's ω does not wind up fighting the deck either).
+    // The yaw zeroing alone fixed the heading (37 deg → 0.7 deg)
+    // but the fin's side force (the 19.8 deg rotation-term
+    // "sideslip" at 120 m aft) still rolled the jet to 15.7 deg
+    // bank, which friction cannot resist (it acts on velocity,
+    // not attitude), and it still slid off. Zeroing pitch and
+    // roll too holds the jet level on the deck. Gated on onDeck
+    // + onSurface + idle throttle: a jet taxiing (steerYawRate,
+    // added below) or taking off (throttle up) keeps its
+    // aerodynamic rates. BET only — the curve solver's prescribed
+    // rates are already zero when parked (no input), so this is
+    // a no-op for it, but it is gated on syncRates (BET) to be
+    // explicit.
+    if (
+      this.onDeck &&
+      onSurface &&
+      this.throttle < 0.1 &&
+      typeof this.solver.syncRates === 'function'
+    ) {
+      rates.pitchRate = 0;
+      rates.yawRate = 0;
+      rates.rollRate = 0;
+    }
+    // Sync the solver's integrated rate state to the rates actually
+    // applied (BET only — the curve solver has no rate state and
+    // omits syncRates). The rotation clamp above and the dying bias
+    // override the solver's rates; without the sync the BET solver
+    // keeps integrating from a rate the body never flew — the thrust
+    // moment winds the pitch rate up behind the clamp and the jet
+    // rotates on its own above Vr, and the dying nose-down bias
+    // never reaches the solver's damping model. Sync AFTER the
+    // clamp/bias above, BEFORE the steer/deck yaw are added: those
+    // are controller additions, not aerodynamic rates, and must not
+    // pollute the solver's state.
+    this.solver.syncRates?.(rates);
+    // BET stall / dying nose-drop (rate biases, AFTER the sync).
+    // The BET solver has no emergent nose-down departure past
+    // peak-CL AoA, and a moment cannot produce one (it recovers
+    // the AoA and the lift with it). These are ADDITIVE biases on
+    // the applied rate — a full pull can still overpower the
+    // stall one — and they are added after the sync so they never
+    // accumulate in the solver's integrated ω (the same reason
+    // the steer/deck yaw are added here). BET only (the curve
+    // solver has its own stall nose-drop and its own correct
+    // dying fall) and airborne only (on a surface they would
+    // pitch the jet into the ground past the nose-down clamp).
+    if (!onSurface && typeof this.solver.syncRates === 'function') {
+      if (this.stalled) rates.pitchRate += BET_STALL_NOSE_DROP_RATE;
+      if (this.dying) rates.pitchRate += BET_DYING_NOSE_DROP_RATE;
     }
     const angBody = new THREE.Vector3(
       rates.pitchRate,
@@ -1324,7 +1662,12 @@ export class Aircraft {
     const angWorld = angBody.applyQuaternion(this.quat);
     this.body.setAngvel({ x: angWorld.x, y: angWorld.y, z: angWorld.z }, true);
     this.body.setLinvel({ x: newVel.x, y: newVel.y, z: newVel.z }, true);
-    this.vsi = newVel.y;
+    // VSI reads 0 on a surface (live finding 7): the single-substep
+    // gravity increment (-9.81 * dt) left a constant -93/-94 fpm
+    // while parked on the ground, because the ground block never
+    // zeroes the vertical velocity. A resting jet has no vertical
+    // speed.
+    this.vsi = onSurface ? 0 : newVel.y;
 
     // Fuel burn (v2 rates are per second on a 0..100 scale; fuel here
     // is 0..1, so divide by 100 — same ~13 min endurance at full
@@ -1485,16 +1828,30 @@ export class Aircraft {
     if (this.isPlayer && (this.grounded || this.isSpawnProtected())) return;
     // Route through the entity (zone HP + severe-damage rule). Map the
     // v2 generic zones to per-side entity zones (a 'wing' hit damages
-    // both wings; an 'engine' hit damages both engines).
+    // both wings; an 'engine' hit damages both engines). Single-engine
+    // jets (F-35A) have one `engine` zone in the entity, not
+    // engineL/engineR — a generic 'engine' hit routes there, and there
+    // is NO second-side hit: the old code sent it to 'engineR', which
+    // the entity fell back to the fuselage, so an engine hit destroyed
+    // the fuselage instead of the engine (and the HUD ENG chip never
+    // moved). Found by the damage-chips probe (issue 5).
+    const singleEngine = this.damageEntity.maxHpFor('engine') > 0;
     const entityZone =
-      zone === 'wing' ? 'wingL' : zone === 'engine' ? 'engineL' : zone;
+      zone === 'wing'
+        ? 'wingL'
+        : zone === 'engine'
+          ? singleEngine
+            ? 'engine'
+            : 'engineL'
+          : zone;
     const result = this.damageEntity.applyDamage(amount, entityZone, byPlayer);
     // A generic 'wing'/'engine' hit damages the other side too (the
     // entity only saw one side above) — check its zone loss as well.
+    // Twin-engine only: a single-engine jet has no second engine.
     let lost2: string | null = null;
     if (zone === 'wing') {
       lost2 = this.damageEntity.applyDamage(amount, 'wingR', byPlayer).zoneLost;
-    } else if (zone === 'engine') {
+    } else if (zone === 'engine' && !singleEngine) {
       lost2 = this.damageEntity.applyDamage(amount, 'engineR', byPlayer).zoneLost;
     }
     let mult = 1;
@@ -1640,7 +1997,12 @@ export class Aircraft {
         this.fireZone = 'fuel';
       } else {
         this.fireKind = 'engine';
-        this.fireZone = 'engineL';
+        // Single-engine jet: the one `engine` zone, not 'engineL'
+        // (the old hardcoded 'engineL' put the dying fire on a zone
+        // the F-35A does not have, so the HUD ENG chip never showed
+        // it as burning).
+        this.fireZone =
+          this.damageEntity.maxHpFor('engine') > 0 ? 'engine' : 'engineL';
       }
       this.fireIntensity = 0.7;
       this.fireSpreadTimer = 0;
@@ -1774,6 +2136,8 @@ export class Aircraft {
     this.solver.reset?.();
     this._trapped = false;
     this.trapTimer = 0;
+    this._prevDeckVel.set(0, 0, 0);
+    this._prevDeckValid = false;
     this.wingDetached = false;
     this.tailDetached = false;
     this.lastHitByIsPlayer = false;

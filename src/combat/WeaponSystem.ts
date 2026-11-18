@@ -463,6 +463,11 @@ export class WeaponSystem {
     const vel0 = shooter.vel.clone().addScaledVector(shooter.fwd(), 8);
     const h = shooter.pos.y - groundHeight;
     if (h <= 0) return null;
+    // PULL UP is gated on AGL > 30 m (live finding 4): grounded
+    // flickers false while the jet sits on the runway, so the warning
+    // fired on the ground after a crash. Below 30 m there is no
+    // meaningful pull-out to warn about.
+    if (h < 30) return null;
     // Ballistic time to the ground: h + vy*t - (g/2) t^2 = 0.
     const g = 9.81;
     const vy = vel0.y;

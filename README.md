@@ -34,10 +34,21 @@ string in a TypeScript module under `src/assets/models/`:
 | `fa18.ts` | F/A-18F Super Hornet (Yi Tsung Lee, CC-BY) | 17,517 |
 | `mig29.ts` | MiG-29 (SIpriv, CC-BY) | 5,931 |
 | `su34.ts` | Su-34 (Sketchfab free, downsized) | 15,903 |
-| `ford.ts` | Gerald Ford helicarrier (Usman Zia, CC-BY) | 2,678 |
+| `helicarrier.ts` | SHIELD helicarrier (roboticide, Printables, CC BY-NC 4.0) — see below | 21,247 |
+| `ford.ts` | Gerald Ford helicarrier (Usman Zia, CC-BY) — fallback only, unused in-game | 2,678 |
 | `f22.ts` | F-22 Raptor | 27,116 |
 | `f15e.ts` | F-15E Strike Eagle | 24,147 |
 | `f35a.ts` | F-35A VTOL | 4,601 |
+
+**Helicarrier model attribution:** the in-game helicarrier is the
+SHIELD helicarrier by roboticide, published on Printables under
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+(original STL, converted to GLB, decimated 169,723 → 21,247 tris,
+re-textured with hand-sampled colours and a painted deck). The
+four rotor pods are the model's own `duct_ring_*` / `rotor_disc_*`
+meshes; the controller spins the discs about their duct-ring centres.
+The Gerald Ford model (`ford.ts`) is kept only as a procedural-fallback
+reference and is no longer loaded in-game.
 
 Re-generate them any time from the verified sources with:
 

@@ -28,9 +28,23 @@
 //    world generator lands islands/flora/clouds at the v2 positions.
 //    mulberry32 (task-requested) is a different sequence and would move them.
 
-export const WORLD_SIZE = 6000; // v2 WORLD: world half-extent is +/-3000 m
+export const WORLD_SIZE = 12000; // v4 WORLD: world half-extent is +/-6000 m
 export const WORLD_SEED = 1337; // v2 `rand` seed
-export const TERRAIN_SEGMENTS = 150; // v2 terrain mesh SEG; -> 151x151 samples
+export const TERRAIN_SEGMENTS = 200; // v4 terrain mesh SEG; -> 201x201 samples
+/** Grid spacing in metres (WORLD_SIZE / TERRAIN_SEGMENTS). The 6 km map
+ *  used 40 m; the 12 km map uses 60 m, keeping the sample count (~40k)
+ *  and the mesh / heightfield triangle count (~80k) about the same as
+ *  the 6 km map so mobile performance is unchanged. Plateau flatness is
+ *  analytic (exact where plateauWeight is 1), so the coarser grid does
+ *  not cost runway fidelity. */
+export const GRID_STEP = WORLD_SIZE / TERRAIN_SEGMENTS;
+
+/** Map scale factor vs the 6 km terrain regeneration (WORLD_SIZE /
+ *  6000 = 2 for the 12 km map). All noise frequencies, band positions
+ *  and widths are multiplied by this so the terrain keeps the same
+ *  proportions — same number of ridges across each range, same
+ *  valley-pass geometry relative to the runways — at the larger size. */
+const MAP_SCALE = WORLD_SIZE / 6000;
 
 const D2R = Math.PI / 180;
 
@@ -147,13 +161,15 @@ interface RangeBand {
 /** The four range bands. North is the "Great Range" (tallest, with the
  *  Tibetan-style bench behind it); south/west/east are lower. Each band
  *  near a runway has a valley pass at that runway's along-coordinate:
- *  west at Alpha's latitude (z=-900), south at Bravo's longitude
- *  (x=800), east at Charlie's latitude (z=-350). */
+ *  west at Alpha's latitude (z=-1800), south at Bravo's longitude
+ *  (x=1600), east at Charlie's latitude (z=-700). Band centres are at
+ *  ±4600/±4900 m (twice the 6 km ±2300/±2450), so the central basin —
+ *  runways + carrier loop — stays clear of them. */
 const RANGE_BANDS: RangeBand[] = [
-  { axis: 'z', c: -2300, arc: 150, arcScale: 1800, core: 350, fade: 450, lift: 130, amp: 720 },
-  { axis: 'z', c: 2300, arc: 150, arcScale: 1600, core: 350, fade: 450, lift: 110, amp: 560, gap: { at: 800, halfWidth: 700 } },
-  { axis: 'x', c: -2300, arc: 150, arcScale: 1700, core: 350, fade: 450, lift: 100, amp: 520, gap: { at: -900, halfWidth: 700 } },
-  { axis: 'x', c: 2450, arc: 100, arcScale: 1700, core: 350, fade: 450, lift: 100, amp: 520, gap: { at: -350, halfWidth: 700 } },
+  { axis: 'z', c: -2300 * MAP_SCALE, arc: 150 * MAP_SCALE, arcScale: 1800 * MAP_SCALE, core: 350 * MAP_SCALE, fade: 450 * MAP_SCALE, lift: 130, amp: 720 },
+  { axis: 'z', c: 2300 * MAP_SCALE, arc: 150 * MAP_SCALE, arcScale: 1600 * MAP_SCALE, core: 350 * MAP_SCALE, fade: 450 * MAP_SCALE, lift: 110, amp: 560, gap: { at: 800 * MAP_SCALE, halfWidth: 700 * MAP_SCALE } },
+  { axis: 'x', c: -2300 * MAP_SCALE, arc: 150 * MAP_SCALE, arcScale: 1700 * MAP_SCALE, core: 350 * MAP_SCALE, fade: 450 * MAP_SCALE, lift: 100, amp: 520, gap: { at: -900 * MAP_SCALE, halfWidth: 700 * MAP_SCALE } },
+  { axis: 'x', c: 2450 * MAP_SCALE, arc: 100 * MAP_SCALE, arcScale: 1700 * MAP_SCALE, core: 350 * MAP_SCALE, fade: 450 * MAP_SCALE, lift: 100, amp: 520, gap: { at: -350 * MAP_SCALE, halfWidth: 700 * MAP_SCALE } },
 ];
 
 /** Mask 0..1 of one range band at (x, z): 1 in the core, fading to 0
@@ -188,27 +204,27 @@ function rangeMask(b: RangeBand, x: number, z: number): number {
  * Clamped to [-25, 750] m.
  */
 export function baseHeight(x: number, z: number): number {
-  let h = fbm(x / 900, z / 900) * 70 - 20;
-  h += fbm(x / 300 + 3, z / 300 - 5) * 25;
+  let h = fbm(x / (900 * MAP_SCALE), z / (900 * MAP_SCALE)) * 70 - 20;
+  h += fbm(x / (300 * MAP_SCALE) + 3, z / (300 * MAP_SCALE) - 5) * 25;
   // Low-frequency carve: saddles and valleys across the ranges.
-  const carve = 0.45 + 0.55 * smoothstep(0.32, 0.72, fbm(x / 480 + 11, z / 480 - 7));
+  const carve = 0.45 + 0.55 * smoothstep(0.32, 0.72, fbm(x / (480 * MAP_SCALE) + 11, z / (480 * MAP_SCALE) - 7));
   for (const b of RANGE_BANDS) {
     const m = rangeMask(b, x, z);
     if (m <= 0) continue;
     // Domain warp bends the ridgelines (same warp for every band so
     // the field stays continuous where bands meet at the corners).
-    const wx = x + (fbm(x / 700 + 5, z / 700 - 3) - 0.5) * 260;
-    const wz = z + (fbm(x / 700 - 9, z / 700 + 4) - 0.5) * 260;
+    const wx = x + (fbm(x / (700 * MAP_SCALE) + 5, z / (700 * MAP_SCALE) - 3) - 0.5) * 260 * MAP_SCALE;
+    const wz = z + (fbm(x / (700 * MAP_SCALE) - 9, z / (700 * MAP_SCALE) + 4) - 0.5) * 260 * MAP_SCALE;
     // Anisotropic sampling: long wavelength ALONG the range, short
     // ACROSS it, so crests run parallel to the range axis.
     const r =
       b.axis === 'z'
-        ? ridgedFbm(wx / 650, wz / 200)
-        : ridgedFbm(wx / 200, wz / 650);
+        ? ridgedFbm(wx / (650 * MAP_SCALE), wz / (200 * MAP_SCALE))
+        : ridgedFbm(wx / (200 * MAP_SCALE), wz / (650 * MAP_SCALE));
     h += m * (b.lift + Math.pow(r, 1.35) * b.amp) * carve;
   }
   // Tibetan-style bench north of the main (north) range.
-  const benchT = clamp((-2350 - z) / 400, 0, 1);
+  const benchT = clamp((-2350 * MAP_SCALE - z) / (400 * MAP_SCALE), 0, 1);
   h += 330 * benchT * benchT * (3 - 2 * benchT);
   return clamp(h, -25, 750);
 }
@@ -237,13 +253,16 @@ export interface RunwayData {
 /** Plateau elevations — each chosen above the highest base terrain
  *  within ~50 m of its flat-box boundary (verified by
  *  scripts/probe-terrain.ts), so every plateau is the local high ground
- *  and its sides slope down to the surrounding terrain: Alpha 85 m
- *  (base max 69 m at the ring), Bravo 70 m (base max 55 m), Charlie
- *  220 m (a high mesa at the foot of the east range; base max 202 m). */
+ *  and its sides slope down to the surrounding terrain. The 12 km
+ *  runways are the 6 km positions doubled: Alpha (-2800,-1800) at the
+ *  west-range valley pass (50 m; base edge max 33 m, ring max 40 m),
+ *  Bravo (1600,2800) at the south-range pass (50 m; base edge max
+ *  32 m, ring max 37 m), Charlie (3700,-700) a high mesa at the foot
+ *  of the east range (100 m; base edge max 58 m, ring max 82 m). */
 export const RUNWAY_TABLE: RunwayData[] = [
-  { name: 'Alpha', x: -1400, z: -900, elev: 85, hdg: 90, len: 650, width: 46, dirt: false },
-  { name: 'Bravo', x: 800, z: 1400, elev: 70, hdg: 160, len: 600, width: 42, dirt: true },
-  { name: 'Charlie', x: 1850, z: -350, elev: 220, hdg: 20, len: 650, width: 46, dirt: false },
+  { name: 'Alpha', x: -2800, z: -1800, elev: 50, hdg: 90, len: 650, width: 46, dirt: false },
+  { name: 'Bravo', x: 1600, z: 2800, elev: 50, hdg: 160, len: 600, width: 42, dirt: true },
+  { name: 'Charlie', x: 3700, z: -700, elev: 100, hdg: 20, len: 650, width: 46, dirt: false },
 ];
 
 /** Plateau geometry (m): the flat top extends past the strip, then the
@@ -344,18 +363,18 @@ export function heightAt(x: number, z: number): number {
 
 /** Height of the RAPIER HEIGHTFIELD surface at (x, z) — the exact
  *  piecewise-linear triangle surface the physics collider (and the
- *  visual mesh) actually are, interpolated over the 151x151 sampled
- *  grid (40 m spacing, x/z from -3000, row-major heights,
+ *  visual mesh) actually are, interpolated over the 201x201 sampled
+ *  grid (60 m spacing, x/z from -6000, row-major heights,
  *  index = iz * res + ix).
  *
  *  This is NOT the bilinear interpolation (sampledHeightAt in
  *  PandoraWorldGenerator): Rapier splits each quad along the
  *  (i+1,j)–(i,j+1) diagonal (corners h10–h01), and the bilinear
  *  surface sits up to ~7.4 m away from the triangle surface at the
- *  steepest spots (measured at the (840..880, -2520..-2480) cell:
- *  bilinear 572.73 vs raycast 580.17). The ANALYTIC heightAt() is
- *  worse still (up to ~107 m off the sampled surface where the 46 m
- *  ridged-fbm features are undersampled by the 40 m grid).
+ *  steepest spots (measured at the (840..880, -2520..-2480) cell on
+ *  the 6 km map: bilinear 572.73 vs raycast 580.17). The ANALYTIC
+ *  heightAt() is worse still (up to ~107 m off the sampled surface
+ *  where the ridged-fbm features are undersampled by the grid).
  *
  *  The triangle diagonal was verified against Rapier raycasts: 6
  *  points inside the steep cell above agree with this formula to
@@ -375,8 +394,8 @@ export function heightfieldHeightAt(
   x: number,
   z: number,
 ): number {
-  const gx = (x + WORLD_SIZE / 2) / 40;
-  const gz = (z + WORLD_SIZE / 2) / 40;
+  const gx = (x + WORLD_SIZE / 2) / GRID_STEP;
+  const gz = (z + WORLD_SIZE / 2) / GRID_STEP;
   const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
   const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
   const fx = Math.max(0, Math.min(1, gx - ix));

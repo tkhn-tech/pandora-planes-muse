@@ -371,10 +371,32 @@ export class AircraftAIController {
     // past and climbs away instead of landing (probe). In RTB final
     // the gain is 0.08 — the porpoising risk is lower there because
     // the goal rides the slope smoothly and the speed is low.
+    // GLIDE-SLOPE FEEDFORWARD (issue 4, third pass): the goal rides
+    // the slope, so it DESCENDS as the jet flies forward — a pure
+    // proportional vsDes has a steady-state error of slopeRate/gain
+    // (at 72 m/s the slope sinks 4.4 m/s, so at gain 0.08 the jet
+    // flies 55 m above the slope and arrives at the touchdown ~90 m
+    // high, then flies past). Feed the slope sink rate forward:
+    // vsDes = (goal.y - pos.y) * gain - ias * tan(3.5 deg), so the
+    // jet descends at the slope rate even when exactly on the slope
+    // and the proportional term only corrects small errors.
     const vsGain = this.state === 'rtb' ? 0.08 : 0.03;
-    const vsDes = clamp((goal.y - ac.pos.y) * vsGain, -vsCap, vsCap);
+    const slopeSink =
+      this.state === 'rtb' && this.rtbPhase === 'final'
+        ? ac.ias * Math.tan((3.5 * Math.PI) / 180)
+        : 0;
+    const vsDes = clamp((goal.y - ac.pos.y) * vsGain - slopeSink, -vsCap, vsCap);
     const pitchLim = Math.min(pitchCap, 0.6);
-    let pitchIn = clamp((ac.vsi - vsDes) * 0.03, -pitchLim, pitchLim);
+    // Pitch gain 0.06 (was 0.03, pass 4): the 0.03 gain was tuned for
+    // the curve solver's prescribed pitch rate (pitchIn * 55 deg/s),
+    // where a -0.14 pitchIn gives -7.7 deg/s. Under BET the rate is
+    // emergent from the elevator moment, so the same pitchIn gives
+    // only ~1 deg/s and the jet cannot arrest a -13 m/s sink on the
+    // RTB glide slope (it hit the terrain short of the runway).
+    // Doubling the gain restores the pitch authority under BET; the
+    // 0.08 gain porpoised under the curve solver, but BET's slower
+    // emergent response damps the oscillation.
+    let pitchIn = clamp((ac.vsi - vsDes) * 0.06, -pitchLim, pitchLim);
 
     // Rudder: centre the ball (sideslip beta) + adverse-yaw feedforward
     // when rolling. beta > 0 (velocity right of the nose) needs
@@ -424,8 +446,18 @@ export class AircraftAIController {
     // turn / speed).
     const bankNow = Math.abs(new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z);
     const aboveWant = ac.ias > want;
+    // RTB final-phase floor (pass 4, BET promotion): on the glide
+    // slope the jet needs power to stay on it — with the floor at 0
+    // the AI cut to idle because it was 5 m/s fast, and under BET
+    // the jet sank at -13 m/s (AoA 11-12 deg, high drag) and hit the
+    // terrain short of the runway. The curve solver glides at idle;
+    // BET does not. So in the RTB final phase the floor is 0.35
+    // even when above want (the airbrake still bleeds the excess
+    // speed); the 0 floor stays for the approach, where the jet must
+    // slow from cruise to pattern speed.
+    const rtbFinalFloor = this.state === 'rtb' && this.rtbPhase === 'final';
     const minThr = aboveWant
-      ? 0
+      ? (rtbFinalFloor ? 0.35 : 0)
       : bankNow > (15 * Math.PI) / 180 && ac.ias < want
         ? 0.85
         : 0.35;
@@ -443,15 +475,31 @@ export class AircraftAIController {
     // Terrain avoidance: pull up if the ground is close ahead (v1.1:
     // stronger, plus a hard floor — v1 AI flew into the terrain chasing a
     // ground target).
-    const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), 260);
-    if (this.groundHeight(ahead.x, ahead.z) > ac.pos.y - 80) pitchIn = -1;
-    const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
-    if (
-      ac.pos.y < this.groundHeight(ac.pos.x, ac.pos.z) + 60 ||
-      (deckY > -Infinity && ac.pos.y < deckY + 60)
-    ) {
-      pitchIn = -1;
-      this.thrTarget = Math.max(this.thrTarget, 0.8);
+    // RTB FIX (issue 4, third pass): do NOT apply terrain avoidance on
+    // the RTB final/rollout — the jet is committed to landing on the
+    // flat runway plateau, and the avoidance is what held it at ~130 m
+    // and flew it past the touchdown instead of landing. The hard floor
+    // (ground + 60 m) fires whenever the jet descends below 110 m over
+    // the 50 m runway and commands full nose-up + 0.8 throttle; the
+    // ahead check (ground within 80 m below, 260 m ahead) fires on
+    // final too, because the runway itself is the ground ahead within
+    // 80 m. The glide slope keeps the jet above the runway and the
+    // plateau is flat, so there is no terrain to avoid on final.
+    // In RTB approach (manoeuvring to the fix over rough terrain) and
+    // in every other state the avoidance still applies.
+    const landingFinal =
+      this.state === 'rtb' && this.rtbPhase !== 'approach';
+    if (!landingFinal) {
+      const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), 260);
+      if (this.groundHeight(ahead.x, ahead.z) > ac.pos.y - 80) pitchIn = -1;
+      const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
+      if (
+        ac.pos.y < this.groundHeight(ac.pos.x, ac.pos.z) + 60 ||
+        (deckY > -Infinity && ac.pos.y < deckY + 60)
+      ) {
+        pitchIn = -1;
+        this.thrTarget = Math.max(this.thrTarget, 0.8);
+      }
     }
 
     // Firing intent (v2 G6 block): gun in cone + range, missile when locked
@@ -492,6 +540,13 @@ export class AircraftAIController {
       yawIn = ac.spin > 0.3 ? -ac.spinDir * 1.0 : 0;
     }
 
+    // RTB rollout braking: wheel brakes on the rollout so the jet
+    // actually slows to a stop on the runway (issue 4). Idle throttle
+    // + airbrake alone take too long to bleed 140 kt to a stop, and
+    // the probe's landed criterion is grounded + ias < 10. The
+    // controller only applies the brake when grounded, so setting it
+    // in rollout is safe in the air.
+    const brake = this.state === 'rtb' && this.rtbPhase === 'rollout';
     return {
       pitchIn,
       rollIn,
@@ -500,6 +555,7 @@ export class AircraftAIController {
       gear: gearDown,
       hook: hookDown,
       airbrake,
+      brake,
     };
   }
 
@@ -546,17 +602,34 @@ export class AircraftAIController {
         // so the vs-based pitch holds the slope instead of diving at
         // the runway. Trap speed ~140 kt (72 m/s).
         const d = horiz(ac.pos, this.rtbFinal);
-        this.rtbFinalGoal.set(
-          this.rtbFinal.x,
-          this.rtbFinal.y + d * Math.tan((3.5 * Math.PI) / 180),
-          this.rtbFinal.z,
-        );
+        // FLARE (issue 4, third pass): inside 300 m of the touchdown
+        // the goal is the runway itself (touchdown + 2 m), not the
+        // slope — a jet that drifted BELOW the slope would otherwise
+        // be commanded to CLIMB back to it and float ~1 km past the
+        // touchdown before touching down (probe). The flare goal
+        // descends it onto the strip instead.
+        if (d < 300) {
+          this.rtbFinalGoal.set(this.rtbFinal.x, this.rtbFinal.y + 2, this.rtbFinal.z);
+        } else {
+          this.rtbFinalGoal.set(
+            this.rtbFinal.x,
+            this.rtbFinal.y + d * Math.tan((3.5 * Math.PI) / 180),
+            this.rtbFinal.z,
+          );
+        }
         if (d < 100 && ac.pos.y < this.rtbFinal.y + 15) this.rtbPhase = 'rollout';
         return { goal: this.rtbFinalGoal, speed: 72, gear: true };
       }
       case 'rollout':
       default:
-        return { goal: this.rtbRollout, speed: 30, gear: true };
+        // Rollout: the jet has landed and brakes to a STOP on the
+        // runway (speed 0, not 30 — a damaged jet does not taxi off
+        // at 58 kt; and at speedWant 30 the throttle spooled back up
+        // whenever the brake got it below 30 m/s, so it never reached
+        // the probe's landed criterion of ias < 10 and rolled off the
+        // end of the runway). The brake (set in update()) + idle
+        // throttle bring it to a stop on the strip.
+        return { goal: this.rtbRollout, speed: 0, gear: true };
     }
   }
 

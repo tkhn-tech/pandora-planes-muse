@@ -28,6 +28,11 @@ interface Plume {
   group: THREE.Group;
   life: number;
   maxLife: number;
+  /** Parent the plume is attached to (live finding 3): when set, the
+   *  plume is a child of a moving object (a dying jet's group) so it
+   *  follows the wreck instead of being left behind as a static puff.
+   *  Null = a free plume in the scene (the default). */
+  parent: THREE.Object3D | null;
 }
 
 interface DebrisPiece {
@@ -61,6 +66,8 @@ const SMOKE_STOPS: [number, string][] = [
 /** Max ground scorch decals kept (oldest removed first — see
  *  scorchDecal). */
 const MAX_SCORCH = 12;
+/** Scorch decal lifetime (s): fades out over the last 30 s. */
+const SCORCH_LIFE = 90;
 
 export class CrashVFXManager {
   private readonly scene: THREE.Scene;
@@ -70,8 +77,11 @@ export class CrashVFXManager {
   private readonly booms: Boom[] = [];
   private readonly plumes: Plume[] = [];
   private readonly debris: DebrisPiece[] = [];
-  /** Scorch decals, oldest first — capped (see scorchDecal). */
-  private readonly scorches: THREE.Mesh[] = [];
+  /** Scorch decals, oldest first — capped (see scorchDecal). Each
+   *  carries its age so it fades out over ~90 s (live finding 1:
+   *  a pile of permanent black decals at a repeated crash site reads
+   *  as a flat black disc on the ground). */
+  private readonly scorches: Array<{ mesh: THREE.Mesh; age: number }> = [];
   private debrisWorld: RAPIER.World | null = null;
   private readonly flash = new THREE.PointLight(0xffaa33, 0, 120);
 
@@ -110,10 +120,22 @@ export class CrashVFXManager {
     this.opts.onShake?.(0.8 * scale);
   }
 
-  /** Smoke/fire plume parented to a moving object (e.g. a damaged jet).
-   *  Template: 5 sprites trailing behind/below, colour 0x555555 smoke or
-   *  0xff7722 fire. Returns the group so the caller can remove it. */
-  spawnSmoke(pos: THREE.Vector3, colour: number): THREE.Group {
+  /** Smoke/fire plume. By default a free plume in the scene at `pos`
+   *  (static — it drifts up and fades over 6 s). Pass `attachTo` to
+   *  parent the plume to a moving object (a dying jet's group): the
+   *  plume then follows the wreck instead of being left behind as a
+   *  static puff the falling jet (60-100 m/s) outruns in 0.1 s (live
+   *  finding 3 — the v3 shoot-down showed no fire/smoke in flight
+   *  because the static puffs were left behind). The plume is
+   *  positioned at the parent's origin (the jet's centre) so the
+   *  fire reads as ON the jet, and it tumbles with the wreck.
+   *  Template: 5 sprites trailing behind/below, colour 0x555555 smoke
+   *  or 0xff7722 fire. Returns the group so the caller can remove it. */
+  spawnSmoke(
+    pos: THREE.Vector3,
+    colour: number,
+    attachTo?: THREE.Object3D,
+  ): THREE.Group {
     const group = new THREE.Group();
     for (let i = 0; i < 5; i++) {
       const s = new THREE.Sprite(
@@ -129,10 +151,30 @@ export class CrashVFXManager {
       s.position.set((Math.random() - 0.5) * 2, -i * 1.2, -4 - i * 1.5);
       group.add(s);
     }
-    group.position.copy(pos);
-    this.scene.add(group);
-    this.plumes.push({ group, life: 6, maxLife: 6 });
+    if (attachTo) {
+      // Attached: parent to the moving object at its origin (the
+      // jet's centre) — the fire is ON the jet and follows it.
+      group.position.set(0, 0, 0);
+      attachTo.add(group);
+      this.plumes.push({ group, life: 6, maxLife: 6, parent: attachTo });
+    } else {
+      group.position.copy(pos);
+      this.scene.add(group);
+      this.plumes.push({ group, life: 6, maxLife: 6, parent: null });
+    }
     return group;
+  }
+
+  /** Remove every plume attached to `parent` (e.g. on respawn — a
+   *  respawned jet must not carry the previous life's burn plume). */
+  clearAttached(parent: THREE.Object3D): void {
+    for (let i = this.plumes.length - 1; i >= 0; i--) {
+      const p = this.plumes[i]!;
+      if (p.parent === parent) {
+        parent.remove(p.group);
+        this.plumes.splice(i, 1);
+      }
+    }
   }
 
   /** Detach a wing/tail/engine segment: the supplied mesh becomes an
@@ -193,11 +235,13 @@ export class CrashVFXManager {
   }
 
   /** Cheap ground scorch mark: a dark circle lying on the terrain.
-   *  CAPPED at the 12 most recent (MAX_SCORCH): scorch decals are
-   *  never removed, so a respawn death-loop piles them up at the
-   *  repeated crash site — a growing black disc the stuck jet sits
-   *  on, which is what the v2 play-test read as a "black disc in the
-   *  sky". Oldest decals are removed from the scene and disposed. */
+   *  CAPPED at the 12 most recent (MAX_SCORCH) AND faded out over
+   *  ~90 s (SCORCH_LIFE): scorch decals were never removed, so a
+   *  respawn death-loop piled them up at the repeated crash site —
+   *  a growing black disc the stuck jet sits on, which is what the
+   *  v2 play-test read as a "black disc in the sky". Oldest decals
+   *  are removed from the scene and disposed; the rest fade in
+   *  update() over their last 30 s. */
   scorchDecal(pos: THREE.Vector3, radius = 8): THREE.Mesh {
     const gh = this.opts.groundHeight
       ? this.opts.groundHeight(pos.x, pos.z)
@@ -214,12 +258,12 @@ export class CrashVFXManager {
     decal.rotation.x = -Math.PI / 2;
     decal.position.set(pos.x, gh + 0.15, pos.z);
     this.scene.add(decal);
-    this.scorches.push(decal);
+    this.scorches.push({ mesh: decal, age: 0 });
     while (this.scorches.length > MAX_SCORCH) {
       const old = this.scorches.shift()!;
-      this.scene.remove(old);
-      old.geometry.dispose();
-      (old.material as THREE.Material).dispose();
+      this.scene.remove(old.mesh);
+      old.mesh.geometry.dispose();
+      (old.mesh.material as THREE.Material).dispose();
     }
     return decal;
   }
@@ -249,7 +293,10 @@ export class CrashVFXManager {
         spr.material.opacity = 0.55 * fade;
       }
       if (p.life <= 0) {
-        this.scene.remove(p.group);
+        // Attached plumes are children of a moving object (a jet's
+        // group), not the scene — remove from their parent.
+        if (p.parent) p.parent.remove(p.group);
+        else this.scene.remove(p.group);
         this.plumes.splice(i, 1);
       }
     }
@@ -268,6 +315,21 @@ export class CrashVFXManager {
         this.scene.remove(d.mesh);
         this.debrisWorld?.removeRigidBody(d.body);
         this.debris.splice(i, 1);
+      }
+    }
+    // Scorch decals: age and fade out over SCORCH_LIFE (full opacity
+    // for the first 60 s, then a linear fade to 0 over the last 30 s).
+    for (let i = this.scorches.length - 1; i >= 0; i--) {
+      const s = this.scorches[i]!;
+      s.age += dt;
+      if (s.age >= SCORCH_LIFE) {
+        this.scene.remove(s.mesh);
+        s.mesh.geometry.dispose();
+        (s.mesh.material as THREE.Material).dispose();
+        this.scorches.splice(i, 1);
+      } else if (s.age > SCORCH_LIFE - 30) {
+        const fade = 1 - (s.age - (SCORCH_LIFE - 30)) / 30;
+        (s.mesh.material as THREE.MeshBasicMaterial).opacity = 0.55 * fade;
       }
     }
   }

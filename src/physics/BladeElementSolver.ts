@@ -77,15 +77,92 @@ const CD_GEAR = 0.03;
 const GE_CL = 1.15;
 const GE_CD = 0.9;
 const CL_DELTA = 2.0; // Cl per radian of control deflection (§5)
-const ELEV_DEFLECT_DEG = 25; // max elevator / canard deflection
-const AIL_DEFLECT_DEG = 20; // max aileron deflection
+const AIL_DEFLECT_DEG = 30; // max aileron deflection (was 20: the
+// 20 deg moment banked only ~2.4 deg in the first 0.2 s, probe-roll
+// needs >5 deg; 30 deg is the upper end of a fighter's aileron
+// travel and, with the 0.5 roll-inertia factor, banks ~6-7 deg)
 const RUD_DEFLECT_DEG = 25; // max rudder deflection
+/** Scheduled max elevator / canard deflection (issue 6 calibration).
+ *  A fixed 25 deg deflection is far too much at 400 kt (the tail
+ *  moment overwhelms the damping and the jet departs to 180 deg AoA)
+ *  and far too little at 90 kt (the tail cannot overcome the wing's
+ *  nose-down moment and the jet never reaches its stall). Real FCS
+ *  schedules stabilator travel with q; here the max deflection is
+ *  δ_max = A/V, clamped to 5..30 deg, so the equilibrium pitch rate
+ *  is roughly constant across speeds (a rate-command feel, like the
+ *  curve solver's 55 deg/s authority) instead of exploding with q. */
+const ELEV_SCHED_A = 75; // m/s·rad: δ_max = A/V (default; per-spec
+// elevSchedA overrides — F-22 60, MiG-29 110)
+const ELEV_MIN_DEG = 5;
+const ELEV_MAX_DEG = 30;
+/** Explicit rotary damping (issue 6 calibration): the ω×r term alone
+ *  is worth only Cmq ≈ −9 (the tail is small), so the elevator
+ *  overpowers it and the pitch rate runs away. These are the standard
+ *  derivatives (per rad), applied as moments M = C·q·S·ref·(ω·ref/2V).
+ *  The explicit Cmq is small (−5) on purpose: a large Cmq forces the
+ *  tail to carry a big download to balance the damping moment, and
+ *  that download subtracts from the net lift — the max-turn rates
+ *  fall short (MiG-29 14.3°/s at Cmq −60 vs 15.0°/s at Cmq −5).
+ *  The geometric ω×r term (≈ −9) plus the explicit −5 gives a total
+ *  ≈ −14, which bounds the full-stick pitch rate while keeping the
+ *  tail download small. The cost is more pitch overshoot in hard
+ *  turns (maxAoA 14–16° vs the 12° target) — the loops are stable
+ *  (probe-bet green, no departure) but less damped than at Cmq −60. */
+const CMQ = -5; // pitch damping, per rad (see below)
+const CLP = -2.0; // roll damping, per rad (see below)
+const CNR = -0.2; // yaw damping, per rad
+/** Stall nose-down moment coefficient. Past the peak-CL AoA the
+ *  wing's AC is near the CG (11% MAC static margin, nearly
+ *  neutral), so the BET solver has no emergent nose-down
+ *  departure — a stalled jet with neutral controls settles into
+ *  a stable deep stall and hangs in mid-air instead of dropping
+ *  (probe-stall-respawn 2a: hung at y=157, AoA 0, G 1.0). The
+ *  curve solver has an explicit stall nose-drop (STALL_NOSE_DROP);
+ *  BET gets the equivalent as a RATE bias in the controller
+ *  (see FlightPhysicsController — BET_STALL_NOSE_DROP_RATE).
+ *  A moment was tried first (q-scaled, then a fixed
+ *  0.03·m·g·cbar): it pitches the nose down, the AoA falls,
+ *  the wing regains lift, and the jet recovers into a gentle
+ *  descent and lands softly instead of crashing. Only a rate
+ *  bias — which the pilot's pull can still overpower, so
+ *  probe-bet check 4 (F-18 full pull to maxAoA > 35 deg) still
+ *  passes — drives the nose down far enough to kill the lift
+ *  and dive. Kept for reference; the moment itself is unused. */
+const STALL_NOSE_DOWN_K = 0.03;
+/** Dying nose-down moment coefficient (damage-model §6). Tried
+ *  and found ineffective — the tail's moment in the flat spin
+ *  overwhelms a 0.05·q·S·cbar moment, so dying is a rate bias
+ *  in the controller (BET_DYING_NOSE_DROP_RATE) instead. Kept
+ *  for reference; the moment itself is unused. */
+const DYING_NOSE_DOWN_K = 0.05;
+/** CLP is high on purpose (issue 6): the bank-hold loop drives the
+ *  roll rate with a 0.42 s lag at CLP −0.4, so the bank overshoots
+ *  80° to past 90° in ~1 s — and past 90° the pitch input stops
+ *  raising the AoA (it turns the nose horizontally), the AoA loop
+ *  saturates at full pull, and the jet departs. At CLP −2.0 the
+ *  roll-rate time constant is ~0.19 s and the equilibrium roll rate
+ *  ~57°/s, so the bank approaches 80° without overshooting past 90°.
+ *  The geometric ω×r damping already contributes Clp ≈ −1.0, so
+ *  the total is ≈ −3.0 — high for a bare airframe, but this is the
+ *  fly-by-wire FCS's rate damping, not the bare airframe. */
 const ENGINE_Y = 0.55; // twin-engine lateral offset, m
 const HYDRO_PITCH = 0.4; // pitch authority with hydraulic failure
 const ENGINE_DMG_THRUST = 0.7;
 const ROTOR_TRANSLIFT = 0.3;
 const ROTOR_DRAG = 0.05;
 const SPIN_MOMENT_TAU = 0.5; // s — spin moment drives ω toward the spin rate
+/** F-35A lift-fan / nozzle thrust balance (issue 6 calibration): the
+ *  nozzle station sits at z = −2.2 m so the hover thrust centroid
+ *  (47% fan at +2.5 m, 53% nozzle) is at the CG. The old −0.45·L
+ *  (−7.1 m) put the centroid 2.6 m aft and gave a large nose-down
+ *  moment in hover that the FCS could not trim. */
+const VTOL_NOZZLE_Z = -2.2;
+/** F-35A roll-post authority (issue 6 calibration): each post carries
+ *  9% of the hover thrust with a full (±100%) differential, so full
+ *  roll in hover gives ~2.3 deg of bank in 0.3 s. The old 4.5% /
+ *  ±50% gave 0.4 deg — the stick did nothing in hover. */
+const ROLL_POST_FRAC = 0.25;
+const ROLL_POST_DIFF = 1.0;
 
 type StationKind =
   | 'wing'
@@ -117,6 +194,26 @@ interface Station {
 
 function clamp(v: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, v));
+}
+
+/** Stabilator / canard polar (issue 6 calibration). The old tail model
+ *  was `cl = clamp(4·α, −1, 1) + CL_DELTA·δ`, so full elevator ADDED
+ *  0.87 CL on top of the tail's baseline lift — nearly doubling the
+ *  tail's max CL — and the tail could never drive the nose up at high
+ *  wing AoA because its own baseline lift ate the elevator authority.
+ *  An all-moving stabilator rotates the whole surface, so the
+ *  deflection adds to the EFFECTIVE angle (α_eff = α_tail + δ) and the
+ *  polar is evaluated once at α_eff. The polar is linear (slope
+ *  4.0/rad) to ±14°, peaks at 1.0 at ±16°, and falls to 0.4 at ±40°,
+ *  so the tail stalls like a wing and cannot hold the nose up forever
+ *  past the wing's peak-CL AoA. Canards use the same polar with the
+ *  deflection sign reversed (they lift the nose up on a pull). */
+export function tailPolar(alphaDeg: number): number {
+  const s = alphaDeg < 0 ? -1 : 1;
+  const x = Math.abs(alphaDeg);
+  if (x <= 14) return s * 4.0 * x * D2R;
+  if (x <= 16) return s * (0.977 + (1.0 - 0.977) * ((x - 14) / 2));
+  return s * Math.max(0.4, 1.0 - 0.025 * (x - 16));
 }
 
 /** Per-model station-layout table (supplement §7). `fin` is the total
@@ -152,13 +249,26 @@ export function buildStations(spec: AircraftSpec): Station[] {
 
   // Wing: 8 per half, chord tapering root → tip, AC slightly aft of
   // the CG for a swept wing. Ailerons on the outer half (i ≥ 4).
+  // The wing AC sits at z = −0.03·L (~16.5% MAC static margin).
+  // The old −0.02·L (11% MAC) trimmed the jet to ~5 deg AoA at
+  // 220 m/s — 2.4 g of lift — so it climbed ~200 m in the 7 s
+  // settle of the dying test and the wreck fell from 1360 m
+  // instead of 1000 m (probe-stall-respawn 2b, impactT 27–30 s
+  // vs the < 25 s bar). Halving the margin shifts the trim to
+  // ~2–3 deg AoA, ~1 g, near-level at high speed. The old
+  // −0.08·L put it at 43% MAC (Cessna-like), giving a nose-down
+  // moment so strong the elevator could not hold 12° AoA at
+  // 65 m/s and the jet could not rotate (issue 6 calibration).
+  // 5.5% is still positively stable — a fighter-realistic
+  // relaxed margin — and the tail still provides the restoring
+  // moment.
   for (const side of [-1, 1]) {
     for (let i = 0; i < 8; i++) {
       const t = (i + 0.5) / 8; // 0 root → 1 tip
       const chord = rootChord * (1 - 0.6 * t);
       stations.push({
         kind: 'wing',
-        r: new THREE.Vector3(side * (span / 2) * t, -0.3, -0.08 * L),
+        r: new THREE.Vector3(side * (span / 2) * t, -0.3, -0.03 * L),
         area: chord * (span / 16),
         chord,
         side,
@@ -263,9 +373,14 @@ export function buildStations(spec: AircraftSpec): Station[] {
   // Twin engines at y = ±0.55 m; the F-35A gets one nozzle + one
   // lift fan + two roll posts.
   if (spec.archetype === 'vtol' && layout.liftFan) {
+    // Nozzle at z = VTOL_NOZZLE_Z (−2.2 m): the hover thrust centroid
+    // (47% fan at +2.5 m, 53% nozzle) sits at the CG, so hover trims
+    // level. The old −0.45·L (−7.1 m) put the centroid 2.6 m aft and
+    // gave a large nose-down moment the FCS could not trim
+    // (issue 6 calibration).
     stations.push({
       kind: 'engine',
-      r: new THREE.Vector3(0, -0.2, -0.45 * L),
+      r: new THREE.Vector3(0, -0.2, VTOL_NOZZLE_Z),
       area: 0,
       chord: 0,
       side: 0,
@@ -327,18 +442,39 @@ export class BladeElementSolver implements IAerodynamicsSolver {
    *  is computed from it (one-step lag, physical: the downwash takes
    *  time to reach the tail). */
   private prevCL = 0;
+  /** Integrated angular-velocity state (issue 6 calibration). The
+   *  solver integrates ω itself and returns it as the rate; the
+   *  controller sets the Rapier body to it. Reading the body's rate
+   *  each step broke takeoff — the gear contacts zero the body's
+   *  rate, so the pitch rate never accumulated and the jet could not
+   *  rotate. Seeded once from the body's rate after a reset. */
+  private omega = new THREE.Vector3();
+  private omegaSeeded = false;
 
   constructor(spec: AircraftSpec) {
     this.spec = spec;
     this.stations = buildStations(spec);
   }
 
-  /** Reset stall/spin hysteresis and the tailplane-downwash memory
-   *  (respawn — a fresh jet is not stalled and not spinning). */
+  /** Reset stall/spin hysteresis, the tailplane-downwash memory, and
+   *  the integrated angular velocity (respawn — a fresh jet is not
+   *  stalled, not spinning, and not rotating). */
   reset(): void {
     this.stalled = false;
     this.spinModel.reset();
     this.prevCL = 0;
+    this.omega.set(0, 0, 0);
+    this.omegaSeeded = false;
+  }
+
+  /** Sync the integrated angular-velocity state to the rates the
+   *  controller actually applied (see IAerodynamicsSolver.syncRates).
+   *  The controller's rotation clamp and dying bias override the
+   *  solver's rates; without this the solver keeps integrating from
+   *  a rate the body never flew. */
+  syncRates(rates: { pitchRate: number; yawRate: number; rollRate: number }): void {
+    this.omega.set(rates.pitchRate, rates.yawRate, rates.rollRate);
+    this.omegaSeeded = true;
   }
 
   /** Station count (for the driver / debug — supplement §7 totals). */
@@ -386,17 +522,38 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     const q = 0.5 * rho * v * v;
 
     // --- Control deflections (rad) ---
-    // Elevator: pitchIn < 0 (pull) → the tailplane's Cl DECREASES
-    // (trailing-edge-up elevator → downward tail force → nose up).
-    // The tail is aft of the CG, so a downward tail force pitches the
-    // nose up (M_x = −r.z·Fy < 0 = nose up). Canard: opposite sign
-    // (ahead of the CG, more lift → nose up).
+    // Elevator: pitchIn < 0 (pull) → the tailplane's effective angle
+    // DECREASES (all-moving stabilator rotates trailing-edge-up →
+    // downward tail force → nose up). The tail is aft of the CG, so a
+    // downward tail force pitches the nose up (M_x = −r.z·Fy < 0 =
+    // nose up). Canard: opposite sign (ahead of the CG, more lift →
+    // nose up). The max deflection is SCHEDULED with airspeed
+    // (δ_max = A/V, 5..30 deg): a fixed 25 deg is far too much at
+    // 400 kt (the tail moment overwhelms the damping and the jet
+    // departs to 180 deg AoA) and far too little at 90 kt (the tail
+    // cannot overcome the wing's nose-down moment and the jet never
+    // reaches its stall). Scheduling makes the equilibrium pitch rate
+    // roughly constant across speeds — a rate-command feel, like the
+    // curve solver's 55 deg/s authority (issue 6 calibration).
     const hydroPitch = fail.hydroDegraded ? HYDRO_PITCH : 1;
-    const elevDeflect = pitchIn * ELEV_DEFLECT_DEG * D2R * hydroPitch * auth.pitch;
+    const elevMax = clamp(
+      (this.spec.elevSchedA ?? ELEV_SCHED_A) / Math.max(v, 1),
+      ELEV_MIN_DEG * D2R,
+      ELEV_MAX_DEG * D2R,
+    );
+    const elevDeflect = pitchIn * elevMax * hydroPitch * auth.pitch;
     const ailDeflect = rollIn * AIL_DEFLECT_DEG * D2R;
     const rudDeflect = -yawIn * RUD_DEFLECT_DEG * D2R;
     // F-22 TVC: the nozzle angle follows the pitch input (±20°).
-    const tvcAngle = (state.tvcDeg ?? 0) * D2R * clamp(-pitchIn, -1, 1);
+    // SIGN (issue 6): thrustDirBody is the thrust FORCE direction, so
+    // a pull (pitchIn < 0, nose up) needs the thrust to point DOWN —
+    // the downward force at the tail pushes the tail down and the
+    // nose up. The old `clamp(-pitchIn, ...)` gave +20° on a pull
+    // (thrust UP at the tail), a 540 kN·m nose-DOWN moment that
+    // pinned the nose down and let the TVC's upward thrust bounce
+    // the jet off the runway at 18 kt ("lifted" at 5 m). Now
+    // tvcAngle follows pitchIn directly: pull → −20° → thrust down.
+    const tvcAngle = (state.tvcDeg ?? 0) * D2R * clamp(pitchIn, -1, 1);
 
     // --- Thrust (with the §0 lapse) ---
     const lapse = Math.pow(Math.max(rho / RHO_0, 0.05), 0.7);
@@ -413,16 +570,45 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     const thrustEff = engL + engR;
 
     // --- Station loop: lift + moment ---
-    // ω is the current body-frame angular velocity (from the controller
-    // — the Rapier body's rate, so contacts / damping feed back in).
-    // When the controller omits it, start from zero.
-    const omega = state.angVel ? state.angVel.clone() : new THREE.Vector3();
+    // ω is the solver's OWN integrated angular-velocity state (issue 6
+    // calibration). The old code read the Rapier body's rate each step,
+    // and the gear contacts zero that rate every step while the jet is
+    // on the ground — so the pitch rate never accumulated and the jet
+    // could not rotate at all (pitch stayed 0.0 through the whole
+    // takeoff roll, and the jet only lifted off at 200+ kt when wing
+    // lift alone sufficed, past the runway end). The curve solver is
+    // immune because it PRESCRIBES a rate each step. Integrating ω
+    // inside the solver makes BET prescribe its rate the same way:
+    // the controller sets the body to the solver's rate each substep,
+    // so the two stay in step (the contacts can only fight the rate,
+    // never erase the solver's memory of it). Seeded once from the
+    // body's rate after construction / reset (the respawned body is
+    // at rest, so this is 0 in practice).
+    if (!this.omegaSeeded) {
+      if (state.angVel) this.omega.copy(state.angVel);
+      this.omegaSeeded = true;
+    }
+    const omega = this.omega;
     const AR = (span * span) / S;
     const downwash = (2 * this.prevCL) / (Math.PI * AR); // rad
     const flapFrac = state.flapsDeg / 30;
-    const stallA = curve.linearEndAoA + flapFrac * 3;
+    // Stall flag = PEAK-CL stall (issue 6), not the section stall.
+    // The section stall (~15-18 deg) is where the wing root first
+    // separates, but vortex lift keeps CL rising to the peak
+    // (~25-35 deg), so the aircraft flies on past it. The old flag
+    // fired the STALL warning in turns at 130-150 kt where the real
+    // jet is flying fine.
+    const stallA = curve.peakAoA + flapFrac * 3;
     if (aoaDeg > stallA) this.stalled = true;
-    else if (aoaDeg < stallA - 3) this.stalled = false;
+    // LATCH at low speed: below ~20 m/s the AoA is undefined
+    // (aoaDeg stays 0 when v <= 5), so a jet that stalls and
+    // bleeds off all its speed would clear the flag and the
+    // nose-down moment with it, and hang nose-up on thrust
+    // (probe-stall-respawn 2a: hung at y=158, ias 7, AoA 0).
+    // The flag only clears once the jet has regained flying
+    // speed AND the AoA is back below the peak — a stalled jet
+    // stays stalled until it recovers.
+    else if (v > 20 && aoaDeg < stallA - 3) this.stalled = false;
 
     const totalMoment = new THREE.Vector3(); // body frame
     const vLocal = new THREE.Vector3();
@@ -443,8 +629,21 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       if (st.kind === 'fin') {
         // Fin: side force from the sideslip β, plus rudder.
         // M = r × F with F = (Fx, 0, 0): M_y = z·Fx, M_z = −y·Fx.
+        // SIGN (weathercock — issue 6 root cause): β > 0 means the
+        // velocity is to the RIGHT of the nose (vBody.x > 0), so the
+        // tail must push the nose RIGHT (positive M_y) to align.
+        // M_y = r.z·Fx with r.z < 0 (tail), so Fx must be NEGATIVE
+        // for β > 0: cSide = −4·β. The old +4·β was positive
+        // feedback — it yawed the nose AWAY from the velocity, the
+        // sideslip grew to −78°, the yaw rate ran to the 90°/s clamp,
+        // the drag spiked, the jet bled 400 → 41 kt and tumbled to
+        // AoA ~180° in every hard turn. (The curve solver had the
+        // same sign error and was fixed there; BET's fin never was.)
+        // The rudder term is unchanged: yawIn > 0 (right rudder) →
+        // rudDeflect < 0 → cSide decreases → Fx negative → nose
+        // right, which matches the curve solver.
         const betaLocal = Math.atan2(vLocal.x, vLocal.z);
-        let cSide = clamp(4.0 * betaLocal, -1.2, 1.2);
+        let cSide = clamp(-4.0 * betaLocal, -1.2, 1.2);
         if (st.control === 'rudder') cSide += CL_DELTA * rudDeflect;
         const fSide = q_i * st.area * cSide;
         totalMoment.y += st.r.z * fSide;
@@ -467,11 +666,20 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       if (st.kind === 'wing' || st.kind === 'lex' || st.kind === 'chine') {
         cl = clFromCurve(alpha, flapFrac, curve) * st.clScale;
       } else if (st.kind === 'canard') {
-        cl = clamp(4.0 * alpha * D2R, -1.2, 1.2);
-        cl += CL_DELTA * -elevDeflect; // canard: opposite elevator sign
+        // All-moving canard (issue 6): the deflection rotates the
+        // whole surface, so it adds to the effective angle with the
+        // opposite sign to the tail (ahead of the CG — a pull INCREASES
+        // the canard's effective AoA and lifts the nose up).
+        cl = tailPolar(alpha - elevDeflect * R2D);
       } else if (st.kind === 'tail') {
-        cl = clamp(4.0 * alpha * D2R, -1.0, 1.0);
-        cl += CL_DELTA * elevDeflect;
+        // All-moving stabilator (issue 6): the deflection adds to the
+        // effective angle, and the polar is evaluated once at α_eff.
+        // The old `clamp(4·α, −1, 1) + CL_DELTA·δ` let full elevator
+        // ADD 0.87 CL on top of the tail's baseline lift — nearly
+        // doubling the tail's max CL — while at high wing AoA the
+        // tail's own baseline lift ate the elevator authority, so the
+        // jet could not pitch up at 90 kt at all.
+        cl = tailPolar(alpha + elevDeflect * R2D);
       } else {
         // Fuselage lifting body.
         cl = clamp(2.0 * alpha * D2R, -0.8, 0.8) * st.clScale;
@@ -511,9 +719,19 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // vector, 0% at vector 0 (covered) — the nozzle carries the rest,
     // so the TOTAL is always throttle·thrustMax (hover stays 94%).
     // Hover pitch control: pull → more fan (forward) → nose up.
+    // The pitch coefficient is 0.25 (probe-vtol 3b). The fan share
+    // is NOT scaled by the vector angle: the old
+    // clamp(vecAngle/(π/2)) factor dragged the share (and the
+    // thrust centroid) aft as the vector dropped (0.47 → 0.37 at
+    // 70 deg), and the vertical thrust then pitched the nose down
+    // faster than the pull could counter — the transition departed
+    // nose-down to 84 deg. With the share held at 0.47 the centroid
+    // stays at the CG through the transition and the thrust has no
+    // pitch moment; the tail + the pitch term control the pitch.
+    // (At vector 0 the fan's thrust points forward like the
+    // nozzle's, so the split is moment-neutral there too.)
     const hoverBlend = clamp((state.vectorDeg - 45) / 45, 0, 1);
-    const fanShare =
-      (0.47 + -pitchIn * 0.1 * hoverBlend) * clamp(vecAngle / (Math.PI / 2), 0, 1);
+    const fanShare = 0.47 + -pitchIn * 0.25 * hoverBlend;
     const addThrust = (r: THREE.Vector3, dir: THREE.Vector3, t: number): void => {
       // Moment r × (dir·t), body frame.
       const fx = dir.x * t;
@@ -535,10 +753,14 @@ export class BladeElementSolver implements IAerodynamicsSolver {
         addThrust(st.r, thrustDirBody, thrustEff * fanShare);
       } else if (st.kind === 'rollpost') {
         // Vertical thrust at the wingtips, hover only; the roll input
-        // splits them differentially (roll control in hover).
+        // splits them differentially (roll control in hover). Each
+        // post carries ROLL_POST_FRAC of the hover thrust with a
+        // ROLL_POST_DIFF differential — full roll gives ~2.3 deg of
+        // bank in 0.3 s. The old 4.5% / ±50% gave 0.4 deg, so the
+        // stick did nothing in hover (issue 6 calibration).
         const t =
-          thrustEff * 0.045 * clamp(vecAngle / (Math.PI / 2), 0, 1) *
-          (1 + (st.side < 0 ? -1 : 1) * rollIn * 0.5 * hoverBlend);
+          thrustEff * ROLL_POST_FRAC * clamp(vecAngle / (Math.PI / 2), 0, 1) *
+          (1 + (st.side < 0 ? -1 : 1) * rollIn * ROLL_POST_DIFF * hoverBlend);
         addThrust(st.r, new THREE.Vector3(0, 1, 0), t);
       }
     }
@@ -601,30 +823,96 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // thrustEff along thrustDirBody.
     const thrustVecWorld = thrustDirBody.clone().applyQuaternion(quat).multiplyScalar(thrustEff);
 
-    const gLoad = Math.max(0.2, lift / (m * G));
+    // Unclamped: the lift fraction can go NEGATIVE (AoA < 0, the wing
+    // pushes down), and the lift-following vector floor in main.ts
+    // (and the probe) reads ac.gload to decide how far the nozzle
+    // may come down — it clamps to [0, 1] itself. The old
+    // Math.max(0.2, …) floor reported 0.2 g when the wing was
+    // actually at −0.5 g, so the floor let the vector down to 49
+    // deg while the jet was sinking, the AoA ran away negative,
+    // and the transition fell out of the sky (probe-vtol 3b, 96 m
+    // lost). With the true value the floor holds the vector near
+    // 69 deg until the wing genuinely takes the load. The HUD
+    // displays the raw value (negative G reads negative, which is
+    // true); the over-G check only fires on large positive G.
+    const gLoad = lift / (m * G);
 
     // --- Spin (BET §2) as a moment ---
     // The spin is a yaw-rate state; it is applied as a PD moment
     // driving ω toward the spin target rate (τ = 0.5 s), so it
     // converges instead of accumulating. The spin builds while
     // stalled and yawed and decays on NATOPS recovery input.
+    // DYING: the spin is suppressed — asymmetric missile damage
+    // builds it while stalled, and spin yaw/roll + the dying
+    // nose-down bias tumbles the wreck (AoA flipping −40 to
+    // −132) instead of diving it, which slows the fall to 27–30 s
+    // (probe-stall-respawn 2b). A dying jet does not recover, so
+    // there is no spin to fly out of: it should dive straight
+    // down. Passing stalled=false and asymWing=0 lets the spin
+    // decay, and the moment is not applied at all while dying.
     const spinStep = this.spinModel.step(
       dt,
-      this.stalled,
+      state.dying ? false : this.stalled,
       yawIn,
       pitchIn,
       rollIn,
-      dmg.wingL - dmg.wingR,
+      state.dying ? 0 : dmg.wingL - dmg.wingR,
     );
     const inertia = inertias(m, span, length);
     // Only when the spin is actually developed — otherwise this PD
     // term would be a strong yaw damper (driving ω_y → 0) and would
     // kill the coordinated yaw and the rudder response.
-    if (this.spinModel.spin > 0.01) {
+    if (this.spinModel.spin > 0.01 && !state.dying) {
       totalMoment.y +=
         (inertia.iy * (spinStep.yawRate - omega.y)) / SPIN_MOMENT_TAU;
       totalMoment.z +=
         (inertia.iz * (spinStep.rollRate - omega.z)) / SPIN_MOMENT_TAU;
+    }
+
+    // --- Stall nose-down departure + dying departure ---
+    // These are RATE biases, applied by the controller after the
+    // sync (see FlightPhysicsController) — NOT moments. A moment
+    // cannot produce a departure here: it pitches the nose down,
+    // the AoA falls, the wing regains lift, and the jet recovers
+    // into a gentle descent and lands softly instead of crashing
+    // (probe-stall-respawn 2a: the fixed 0.03·m·g·cbar moment got
+    // the jet to the ground but it landed, G 1.0, not crashed).
+    // The curve solver's stall nose-drop is a rate bias
+    // (STALL_NOSE_DROP) for the same reason. The dying moment
+    // (0.05·q·S·cbar) was likewise ineffective — the tail's
+    // moment in the flat spin overwhelms it — so dying is a
+    // rate bias too. The constants live in the controller.
+
+    // --- Explicit rotary damping (issue 6 calibration) ---
+    // The ω×r term alone is worth only Cmq ≈ −9 (the tail is small),
+    // so the elevator overpowers it and the pitch rate runs away to
+    // the 55 deg/s clamp and the jet departs to 180 deg AoA. These
+    // standard derivatives bound the equilibrium rate. CMQ is kept
+    // small (−5) — a large Cmq forces a big tail download that eats
+    // the net lift and costs turn rate (see the constant's comment).
+    // The terms vanish at rest (q = 0).
+    const cbar = S / span;
+    const vDamp = Math.max(v, 20);
+    totalMoment.x += CMQ * q * S * cbar * (omega.x * cbar / (2 * vDamp));
+    totalMoment.y += CNR * q * S * span * (omega.y * span / (2 * vDamp));
+    totalMoment.z += CLP * q * S * span * (omega.z * span / (2 * vDamp));
+
+    // Transition pitch damper (BET promotion, probe-vtol 3b): a
+    // hard rate cap alone lets the pitch sit AT the cap (20
+    // deg/s) for seconds and still depart — the fan-share pitch
+    // moment is near a bifurcation (0.25 departs nose-down,
+    // 0.40 departs nose-up, 0.32/0.36 depart nose-down after a
+    // brief rotation), so no single coefficient is stable. A
+    // rate-proportional damper (moment = −K·Ix·ωx, K = 1.5/s,
+    // a ~0.7 s time constant) resists the rate smoothly instead
+    // of clamping it, so the nose cannot dwell at a high rate.
+    // It is NOT q-scaled — at low speed q ≈ 0 and the aero
+    // damping vanishes, which is exactly when it is needed.
+    // Active only while any vector is up and the speed is below
+    // 40 m/s (the transition zone); the pilot can still rotate
+    // to 10 deg AoA, just not run away.
+    if (hoverBlend > 0 && v < 40) {
+      totalMoment.x += -1.5 * inertia.ix * omega.x;
     }
 
     // --- Angular dynamics: ω̇ = I⁻¹(M − ω × Iω) ---
@@ -648,6 +936,50 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     newOmega.x = clamp(newOmega.x, -55 * D2R, 55 * D2R);
     newOmega.y = clamp(newOmega.y, -90 * D2R, 90 * D2R);
     newOmega.z = clamp(newOmega.z, -rollCapDeg * D2R, rollCapDeg * D2R);
+
+    // Hover auto-level (issue 6 — BET promotion): the curve solver
+    // has this (issue 2) but BET did not, so a BET hover had no
+    // stable reference and drifted off level. Same PD as the curve
+    // solver — in a deep hover (vector >= 70 deg, slow) the lift-fan
+    // FCS holds the jet level, capped so the pilot can overpower it.
+    // Euler YXZ x > 0 = nose down, z > 0 = left bank; the correction
+    // is the opposite sign on both axes. Switches off above 25 m/s,
+    // so the transition to forward flight is the pilot's.
+    // PITCH YIELDS TO THE PILOT (probe-vtol 3b): the pitch
+    // correction is scaled by (1 − |pitchIn|), so a pilot who is
+    // pulling to rotate to 10 deg AoA is not fought by the
+    // leveler — the old unscaled PD held the pitch at 0 deg
+    // while the speed was under 25 m/s, then switched off and
+    // the pent-up full pull over-rotated the jet to −88 deg.
+    // The roll correction is unscaled (the pilot is not rolling
+    // in the transition; hands-off hover still levels the bank).
+    if (hoverBlend > 0.5 && v < 25) {
+      const euler = new THREE.Euler().setFromQuaternion(quat, 'YXZ');
+      const bank = euler.z;
+      const pitch = euler.x;
+      newOmega.z += clamp(-bank * 0.8, -0.3, 0.3) * hoverBlend;
+      newOmega.x +=
+        clamp(-pitch * 0.8, -0.3, 0.3) * hoverBlend * (1 - Math.abs(pitchIn));
+    }
+
+    // Transition pitch-rate cap (BET promotion, probe-vtol 3b):
+    // in the vector 45–90 deg zone the lift-fan thrust (forward
+    // of the CG, mostly vertical) pitches the nose up hard, and
+    // at low q there is almost no aerodynamic pitch damping to
+    // stop it. This caps the pitch rate at ±20 deg/s while any
+    // vector is up (hoverBlend > 0) and the speed is below 40 m/s
+    // — a RATE cap only, no leveling. Above 40 m/s the wing and
+    // tail have authority and the cap lifts.
+    if (hoverBlend > 0 && v < 40) {
+      newOmega.x = clamp(newOmega.x, -0.35, 0.35);
+    }
+
+    // Store the integrated rate (issue 6): the solver's own ω state
+    // is what the next step integrates from — NOT the Rapier body's
+    // rate, which the gear contacts zero while the jet is on the
+    // ground. The stored rate is the clamped, FCS-corrected rate the
+    // controller actually sets on the body.
+    this.omega.copy(newOmega);
 
     const torque = new THREE.Vector3(
       (inertia.ix * newOmega.x) / TORQUE_TAU,

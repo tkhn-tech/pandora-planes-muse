@@ -42,6 +42,7 @@ import {
   RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
+  GRID_STEP,
 } from '../src/world/PandoraTerrainWorker';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 
@@ -110,8 +111,8 @@ async function main(): Promise<void> {
 
   // Bilinear sampled height (what the mesh / heightfield actually are).
   const sampled = (x: number, z: number): number => {
-    const gx = (x + 3000) / 40;
-    const gz = (z + 3000) / 40;
+    const gx = (x + WORLD_SIZE / 2) / GRID_STEP;
+    const gz = (z + WORLD_SIZE / 2) / GRID_STEP;
     const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
     const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
     const fx = gx - ix;
@@ -173,15 +174,16 @@ async function main(): Promise<void> {
   // Find the steepest mountainside spot (away from runways) for the
   // stall-down: scan the analytic field for max |gradient|.
   let steep = { x: 0, z: 0, grad: 0, h: 0 };
-  for (let x = -2800; x <= 2800; x += 80) {
-    for (let z = -2800; z <= 2800; z += 80) {
+  const half = WORLD_SIZE / 2;
+  for (let x = -half + 100; x <= half - 100; x += 120) {
+    for (let z = -half + 100; z <= half - 100; z += 120) {
       let nearRunway = false;
       for (const r of RUNWAY_TABLE) {
         if (Math.hypot(x - r.x, z - r.z) < 700) nearRunway = true;
       }
       if (nearRunway) continue;
-      const gx = (heightAt(x + 40, z) - heightAt(x - 40, z)) / 80;
-      const gz = (heightAt(x, z + 40) - heightAt(x, z - 40)) / 80;
+      const gx = (heightAt(x + GRID_STEP, z) - heightAt(x - GRID_STEP, z)) / (2 * GRID_STEP);
+      const gz = (heightAt(x, z + GRID_STEP) - heightAt(x, z - GRID_STEP)) / (2 * GRID_STEP);
       const g = Math.hypot(gx, gz);
       if (g > steep.grad) steep = { x, z, grad: g, h: heightAt(x, z) };
     }
@@ -211,11 +213,12 @@ async function main(): Promise<void> {
     };
     let worst = 0;
     let worstAt = '';
-    // Steep cell (840..880, -2520..-2480) + a spread of points.
+    // Steep cell around the steepest spot found above + a spread of
+    // points (map centre, each runway centre).
     const pts: [number, number][] = [
-      [850, -2510], [870, -2510], [850, -2490], [870, -2490],
-      [848, -2488], [872, -2512], [0, 0], [-1400, -900],
-      [400, -2480], [1850, -350], [800, 1400],
+      [steep.x + 10, steep.z], [steep.x + 30, steep.z], [steep.x + 10, steep.z + 20], [steep.x + 30, steep.z + 20],
+      [steep.x + 8, steep.z + 12], [steep.x + 32, steep.z - 12], [0, 0],
+      ...RUNWAY_TABLE.map((r): [number, number] => [r.x, r.z]),
     ];
     for (const [x, z] of pts) {
       const d = Math.abs(rayH(x, z) - triH(x, z));
@@ -240,8 +243,8 @@ async function main(): Promise<void> {
     // report; the respawn path itself is fixed and verified by
     // tests 2/2b, and a tilted survivor is alive and Restart works).
     let restSpot = { x: 0, z: 0, d: 0 };
-    for (let x = -2900; x <= 2900; x += 40) {
-      for (let z = -2900; z <= 2900; z += 40) {
+    for (let x = -half + 100; x <= half - 100; x += GRID_STEP) {
+      for (let z = -half + 100; z <= half - 100; z += GRID_STEP) {
         let nearRunway = false;
         for (const r of RUNWAY_TABLE) {
           if (Math.hypot(x - r.x, z - r.z) < 500) nearRunway = true;

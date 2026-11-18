@@ -113,6 +113,13 @@ export interface AircraftSpec {
   /** Thrust-vectoring nozzle deflection, deg (F-22 TVC ±20 deg pitch
    *  only). Absent = no vectoring. */
   tvcDeg?: number;
+  /** BET elevator-scheduling constant A (m/s·rad): the max stabilator
+   *  deflection is δ_max = A/V. Per model — the value that holds the
+   *  12° AoA in a max-performance turn without the tail downforce
+   *  eating the lift: the F-22 (big tail + TVC) wants 60, the MiG-29
+   *  (small tail) wants 90, the rest 75. Absent = 75. Calibrated
+   *  against probe-bet (issue 6). */
+  elevSchedA?: number;
   /** Effective lifting area, m^2 (MiG-29: 45 — the blended fuselage +
    *  LERX generate ~40% of total lift, so lift uses 45 m^2 while drag
    *  uses wingArea 38 m^2). Absent = wingArea. */
@@ -241,6 +248,7 @@ export const SPECS: Record<string, AircraftSpec> = {
     e: 0.85,
     rotateSpeedKt: 140,
     tvcDeg: 20,
+    elevSchedA: 60, // big tail + TVC: less scheduling needed (issue 6)
     clCurve: {
       linearEndAoA: 15,
       linearEndCL: 1.35,
@@ -316,6 +324,7 @@ export const SPECS: Record<string, AircraftSpec> = {
     inducedK: 0.11,
     e: 0.85,
     rotateSpeedKt: 130,
+    elevSchedA: 110, // small tail: more scheduling needed (issue 6)
     clCurve: {
       linearEndAoA: 15,
       linearEndCL: 1.35,
@@ -332,7 +341,7 @@ export const SPECS: Record<string, AircraftSpec> = {
     rollCapSchedule: [
       [71, 20],
       [137, 105],
-      [200, 60],
+      [200, 90],
       [340, 40],
     ],
     maxG: 9,

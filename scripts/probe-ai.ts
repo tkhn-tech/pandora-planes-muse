@@ -10,7 +10,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { AircraftAIController } from '../src/entities/AircraftAIController';
-import { HelicarrierController } from '../src/entities/HelicarrierController';
+import { HelicarrierController, CARRIER_START_POS, CARRIER_WAYPOINTS } from '../src/entities/HelicarrierController';
 import {
   generateHeights,
   heightAt,
@@ -72,7 +72,7 @@ async function main(): Promise<void> {
   const groundH = (x: number, z: number): number => heightAt(x, z, heights);
   const carrier = new HelicarrierController(scene, world, {});
   await carrier.build();
-  carrier.reset(new THREE.Vector3(-500, 350, -900), Math.atan2(1900, 0));
+  carrier.reset(CARRIER_START_POS.clone(), Math.atan2(CARRIER_WAYPOINTS[0]!.x - CARRIER_START_POS.x, CARRIER_WAYPOINTS[0]!.z - CARRIER_START_POS.z));
 
   // Player F-18 airborne, flying east at 100 m/s, 500 m.
   const player = new Aircraft({

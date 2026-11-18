@@ -8,7 +8,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { AircraftAIController } from '../src/entities/AircraftAIController';
-import { HelicarrierController } from '../src/entities/HelicarrierController';
+import { HelicarrierController, CARRIER_START_POS, CARRIER_WAYPOINTS } from '../src/entities/HelicarrierController';
 import {
   generateHeights,
   heightAt,
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
   const groundH = (x: number, z: number): number => heightAt(x, z, heights);
   const carrier = new HelicarrierController(scene, world, {});
   await carrier.build();
-  carrier.reset(new THREE.Vector3(-500, 350, -900), Math.atan2(1900, 0));
+  carrier.reset(CARRIER_START_POS.clone(), Math.atan2(CARRIER_WAYPOINTS[0]!.x - CARRIER_START_POS.x, CARRIER_WAYPOINTS[0]!.z - CARRIER_START_POS.z));
   // Dummy player (the AI needs one; it flies straight and level).
   const player = new Aircraft({
     scene, world, spec: SPECS.fa18!, isPlayer: true, modelKey: 'fa18', events: {},
@@ -70,52 +70,66 @@ async function main(): Promise<void> {
   player.terrainHeightAt = groundH;
   player.resetAt(-1000, 500, -900, 90);
   player.setAirspeed(100);
-  // Enemy MiG-29 EAST of Alpha, at 122 m (ON the glide slope), 80 m/s, heading EAST (90 deg)
-  // — already on the extended centreline, aligned for a straight-in.
-  // Alpha touchdown is (-1605, 0, -900); the jet starts 4 km west of
-  // the touchdown on the centreline... no — EAST of the touchdown means
-  // x > -1605. Put it at (-3605, 300, -900): 2 km west of the touchdown
-  // on the centreline, heading east. That IS the final-approach fix.
-  const enemy = new Aircraft({
-    scene, world, spec: SPECS.mig29!, isPlayer: false, modelKey: 'mig29', events: {},
-  });
-  enemy.terrainHeightAt = groundH;
-  enemy.resetAt(-3605, 122, -900, 90);
-  enemy.setAirspeed(80);
-  enemy.thrTarget = 0.5;
-  const ai = new AircraftAIController(enemy, 'veteran', 'enemy', {
-    groundHeight: groundH,
-    originShift: new THREE.Vector3(0, 0, 0),
-  });
-  const wind = new THREE.Vector3(0, 0, 0);
-  const dt = 1 / 60;
-  let time = 0;
-  enemy.hp = 15; // damaged -> RTB immediately
-  let landed = false;
-  for (let i = 0; i < 60 * 180; i++) {
-    world.timestep = dt;
-    world.step(eq);
-    eq.drainCollisionEvents(() => {});
-    player.pitchIn = 0; player.rollIn = 0; player.yawIn = 0;
-    player.step(dt, wind, null);
-    const ctrl = ai.update(dt, player, carrier, time);
-    enemy.step(dt, ctrl, wind, groundH, null);
-    time += dt;
-    if (i % 600 === 0) {
-      console.log(
-        `t=${time.toFixed(0)}s state=${ai.state} alt=${enemy.pos.y.toFixed(0)}m ` +
-        `spd=${(enemy.ias * 1.944).toFixed(0)}kt pos=(${enemy.pos.x.toFixed(0)},${enemy.pos.z.toFixed(0)}) ` +
-        `grounded=${enemy.grounded} alive=${enemy.alive}`,
-      );
+  // Two scenarios (issue 4, third pass): (1) good position — at the
+  // final-approach fix, on the glide slope; (2) HIGH arrival — at the
+  // fix but 300 m altitude, ~128 m above the slope (the live failure:
+  // the damaged AI arrived 59-94 m high and flew past). Both must
+  // land (grounded, slow) on the Alpha runway.
+  const scenarios = [
+    { name: 'good position (on the glide slope)', y: 172 },
+    { name: 'high arrival (128 m above the slope)', y: 300 },
+  ];
+  let failures = 0;
+  for (const sc of scenarios) {
+    // Enemy MiG-29 at the final-approach fix — 2 km west of the Alpha
+    // touchdown ON the extended centreline, heading EAST (90 deg),
+    // 80 m/s. Alpha is (-2800, -1800) elev 50, hdg 90, len 650:
+    // touchdown = Alpha - 205 m along the landing direction =
+    // (-3005, 50, -1800); fix = touchdown - 2000 m = (-5005, 172,
+    // -1800). (The old start (-3605, 122, -900) was 900 m NORTH of
+    // the centreline and 600 m PAST the touchdown heading away — not
+    // a good position at all, which is why the jet circled.)
+    const enemy = new Aircraft({
+      scene, world, spec: SPECS.mig29!, isPlayer: false, modelKey: 'mig29', events: {},
+    });
+    enemy.terrainHeightAt = groundH;
+    enemy.resetAt(-5005, sc.y, -1800, 90);
+    enemy.setAirspeed(80);
+    enemy.thrTarget = 0.5;
+    const ai = new AircraftAIController(enemy, 'veteran', 'enemy', {
+      groundHeight: groundH,
+      originShift: new THREE.Vector3(0, 0, 0),
+    });
+    const wind = new THREE.Vector3(0, 0, 0);
+    const dt = 1 / 60;
+    let time = 0;
+    enemy.hp = 15; // damaged -> RTB immediately
+    let landed = false;
+    let landTime = 0;
+    for (let i = 0; i < 60 * 180; i++) {
+      world.timestep = dt;
+      world.step(eq);
+      eq.drainCollisionEvents(() => {});
+      player.pitchIn = 0; player.rollIn = 0; player.yawIn = 0;
+      player.step(dt, wind, null);
+      const ctrl = ai.update(dt, player, carrier, time);
+      enemy.step(dt, ctrl, wind, groundH, null);
+      time += dt;
+      if (enemy.grounded && enemy.ias < 10) { landed = true; landTime = time; break; }
+      if (!enemy.alive) break;
     }
-    if (enemy.grounded && enemy.ias < 10) { landed = true; break; }
-    if (!enemy.alive) break;
+    console.log(
+      landed
+        ? `PASS  RTB ${sc.name}: LANDED (grounded, slow) at t=${landTime.toFixed(0)} s, pos=(${enemy.pos.x.toFixed(0)},${enemy.pos.z.toFixed(0)})`
+        : `FAIL  RTB ${sc.name}: did NOT land — alt=${enemy.pos.y.toFixed(0)}m spd=${(enemy.ias * 1.944).toFixed(0)}kt grounded=${enemy.grounded} alive=${enemy.alive}`,
+    );
+    if (!landed) failures++;
+    enemy.dispose();
+    // Reset the player so the next scenario starts clean.
+    player.resetAt(-1000, 500, -900, 90);
+    player.setAirspeed(100);
   }
-  console.log(
-    landed
-      ? 'RTB GOOD-POSITION: LANDED (grounded, slow)'
-      : `RTB GOOD-POSITION: did NOT land — alt=${enemy.pos.y.toFixed(0)}m spd=${(enemy.ias * 1.944).toFixed(0)}kt grounded=${enemy.grounded} alive=${enemy.alive}`,
-  );
-  process.exit(landed ? 0 : 1);
+  console.log(failures === 0 ? 'ALL PROBE CHECKS PASSED' : `${failures} CHECK(S) FAILED`);
+  process.exit(failures === 0 ? 0 : 1);
 }
 main().catch((e) => { console.error(e); process.exit(2); });
