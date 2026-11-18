@@ -66,7 +66,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.1 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.2 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -437,6 +437,10 @@ const vfx = new CrashVFXManager(scene, {
   onShake: (amount) => {
     shakeT = Math.max(shakeT, amount);
   },
+  // Pass 6 (item 2): register persistent VFX with the floating origin
+  // so scorches/debris/plumes shift with the terrain instead of being
+  // left behind as stray black discs after an origin shift.
+  origin: floatingOrigin,
 });
 const weapons = new WeaponSystem(scene, rapierWorld, {
   sfx,
@@ -1500,7 +1504,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.1 · Vite + Rapier).
+// Footer version string (v4.2 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;

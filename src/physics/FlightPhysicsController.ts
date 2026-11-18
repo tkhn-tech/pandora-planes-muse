@@ -119,6 +119,11 @@ const ROTATION_RATE_MAX = 55 * D2R; // rad/s nose-up while the gear is on
  *  stall nose-drop; check via syncRates, which only BET
  *  implements). */
 const BET_STALL_NOSE_DROP_RATE = 0.3; // rad/s nose-down while stalled
+/** VTOL hover altitude-hold gain (pass 6, item 8): throttle units
+ *  per m/s of vertical-speed error. 0.05 -> a 2 m/s sink commands
+ *  +0.10 throttle (~1 m/s^2 of correction on the F-35A), firm
+ *  enough to hold altitude without fighting the 0.55/s spool. */
+const HOVER_VS_KP = 0.05;
 /** BET dying nose-drop rate, rad/s nose-down (probe-stall-respawn
  *  2b). The shared 0.15 rad/s dying bias (before the sync) is
  *  the dive driver; this extra is 0 — it is kept as a tuning
@@ -546,8 +551,26 @@ export class Aircraft {
   pitchIn = 0;
   rollIn = 0;
   yawIn = 0;
-  /** Throttle TARGET 0..1 (spooled into `throttle` at 0.55/s). */
-  thrTarget = 0;
+  /** Throttle TARGET 0..1 (spooled into `throttle` at 0.55/s).
+   *  A getter/setter (pass 6, item 8): the setter records the value
+   *  as the PILOT's command (`pilotThr`), so the hover altitude-hold
+   *  can read the pilot's throttle without reading back its own
+   *  auto-throttle output (which fed back and oscillated the
+   *  throttle 1.0 -> 0.71 -> 1.0 on a ~7 s period). The hold writes
+   *  the backing field `_thrTarget` directly, bypassing the setter.
+   *  External code (main.ts, probes) sets `thrTarget` as before. */
+  private _thrTarget = 0;
+  get thrTarget(): number {
+    return this._thrTarget;
+  }
+  set thrTarget(v: number) {
+    this._thrTarget = clamp(v, 0, 1);
+    this.pilotThr = this._thrTarget;
+  }
+  /** Last throttle commanded by the pilot (slider / keys / an
+   *  external `thrTarget` set) — the hover hold's climb/descent
+   *  command. Never written by the auto-throttle itself. */
+  pilotThr = 0;
   /** VTOL pad-landing credit flag (main.ts sets / clears it). */
   vtolCounted = false;
   /** Terrain height callback used by the 3-argument step overload.
@@ -1091,6 +1114,44 @@ export class Aircraft {
     const rollIn = controlRoll(controls);
     const thr = resolveThrottleTarget(controls);
     if (thr !== null) this.thrTarget = clamp(thr, 0, 1);
+    // VTOL hover altitude-hold (pass 6, item 8): the F-35A at VEC 90
+    // and 100% throttle lifted off the deck but sank and went down
+    // instead of hovering — the pilot cannot hold the ~94% hover
+    // point precisely on a slider, so it porpoised (climb at 96%,
+    // sink at 92%) and the sink half ended in a hard landing. There
+    // was an attitude FCS (hover auto-level) but no altitude hold.
+    // In a deep hover (vector >= 70 deg, slow, airborne) the
+    // throttle becomes an altitude command: the pilot's throttle
+    // sets the desired vertical speed relative to the hover point
+    // (100% -> +~2 m/s climb, hover point -> 0, idle -> -5 m/s
+    // descent), and a P loop on the vertical-speed error drives the
+    // actual throttle to hold it. Gated on !onSurface (previous
+    // step): on the deck the pilot's throttle rules, so a parked
+    // jet at vector 90 does not lift off by itself. Forward flight
+    // (vector < 70 or ias >= 25) is untouched.
+    if (
+      this.spec.vtol &&
+      this.vectorDeg >= 70 &&
+      this.ias < 25 &&
+      !this.onSurface &&
+      this.alive &&
+      !this.dying
+    ) {
+      const hoverThr = (this.spec.mass * G) / this.spec.thrustMax;
+      // The pilot's command is `pilotThr` (recorded by the thrTarget
+      // setter), NOT thrTarget itself — the hold writes thrTarget,
+      // so reading it back would feed the auto-throttle's own output
+      // into its command and oscillate (pass 6 diagnosis).
+      const vsDes = clamp((this.pilotThr - hoverThr) * 30, -5, 3);
+      const autoThr = clamp(
+        hoverThr + (vsDes - this.vel.y) * HOVER_VS_KP,
+        0,
+        1,
+      );
+      // Write the backing field directly: the thrTarget setter would
+      // record the auto-throttle output as the pilot's command.
+      this._thrTarget = autoThr;
+    }
     if (controls.flaps !== undefined) this.flaps = clamp(controls.flaps, 0, 30);
     if (controls.airbrake !== undefined) this.airbrake = clamp(controls.airbrake, 0, 1);
     if (controls.vector !== undefined) {
@@ -1330,6 +1391,14 @@ export class Aircraft {
       this.onSurface = true;
       this.grounded = true;
       this.onDeck = isDeck;
+      // Pass 6 (item 6): the BET stall flag LATCHES — it only
+      // clears once the jet has regained flying speed (v > 20) —
+      // so a jet that stalled, recovered and landed kept showing
+      // STALL while parked (6 kt, AoA 0 deg, throttle 0). A jet on
+      // the ground is not stalled: the wing is not flying. Clear
+      // it on contact. The stall nose-drop is gated on !onSurface
+      // anyway, so this cannot touch a departure.
+      this.stalled = false;
       // Hard-landing vertical speed, RELATIVE to the surface (issue
       // 8): impactVy and newVel.y are absolute, but a jet riding a
       // descending deck sinks at the deck's rate — a 10 m/s deck
@@ -1641,8 +1710,9 @@ export class Aircraft {
       const maxNoseDownRate = Math.max(0, -pitch / dt);
       rates.pitchRate = Math.min(rates.pitchRate, maxNoseDownRate);
     }
-    // Parked on the deck: zero the solver's aerodynamic rates
-    // (probe-respawn-carrier 4). A parked jet rides the deck
+    // Parked on a surface (runway or deck): zero the solver's
+    // aerodynamic rates (probe-respawn-carrier 4 for the deck;
+    // pass 6, item 1 for runways). A parked jet rides the deck
     // through a waypoint turn via deckYawRate (added below), but
     // the BET fin's weathercock yaw moment fights it: the heading
     // lags the carrier's yaw, the sideslip hits ±19 deg, the fin
@@ -1658,15 +1728,25 @@ export class Aircraft {
     // "sideslip" at 120 m aft) still rolled the jet to 15.7 deg
     // bank, which friction cannot resist (it acts on velocity,
     // not attitude), and it still slid off. Zeroing pitch and
-    // roll too holds the jet level on the deck. Gated on onDeck
-    // + onSurface + idle throttle: a jet taxiing (steerYawRate,
+    // roll too holds the jet level on the deck. Gated on
+    // onSurface + idle throttle: a jet taxiing (steerYawRate,
     // added below) or taking off (throttle up) keeps its
     // aerodynamic rates. BET only — the curve solver's prescribed
     // rates are already zero when parked (no input), so this is
     // a no-op for it, but it is gated on syncRates (BET) to be
     // explicit.
+    // Pass 6 (item 1): the same wind-driven roll killed parked
+    // jets on RUNWAYS, not just the deck — a 3 m/s wind drives a
+    // BET roll moment at ~0 airspeed, the controller prescribes
+    // the solver's angular velocity to Rapier (bypassing the gear
+    // contact that would hold a real jet level), and the parked
+    // jet slowly rolled onto one skid (bank 0 -> 17 deg in ~5 s)
+    // until the ground block's bank > 26 deg rule crashed it
+    // "hard landing" (probe-live-spawn: 9/18 fail at live-like
+    // variable dt, 5/18 even at fixed 1/60 — the old 5 s parked
+    // probes never ran long enough to see it; WIND=0 -> 0 fail).
+    // So the parked zeroing is no longer deck-only: any surface.
     if (
-      this.onDeck &&
       onSurface &&
       this.throttle < 0.1 &&
       typeof this.solver.syncRates === 'function'
@@ -1674,6 +1754,21 @@ export class Aircraft {
       rates.pitchRate = 0;
       rates.yawRate = 0;
       rates.rollRate = 0;
+    }
+    // Rolling on a surface at any throttle: the gear holds the
+    // wings level (pass 6, item 1). The aileron cannot roll a jet
+    // on its gear, and the wind moment must not start a roll
+    // during the takeoff roll either. Level the roll rate toward
+    // bank 0 (a gentle spring, max ~9 deg/s) so a banked
+    // touchdown settles level instead of freezing tilted. Pitch
+    // stays gated by the rotation clamp above (a jet must pitch
+    // to rotate); yaw is steering, added below. BET only.
+    if (onSurface && typeof this.solver.syncRates === 'function') {
+      const bankNow = new THREE.Euler().setFromQuaternion(
+        this.quat,
+        'YXZ',
+      ).z;
+      rates.rollRate = clamp(-bankNow * 2, -0.15, 0.15);
     }
     // Sync the solver's integrated rate state to the rates actually
     // applied (BET only — the curve solver has no rate state and
@@ -2065,7 +2160,13 @@ export class Aircraft {
    *  left fireballs; without fuel it crumples), debris scatters, and
    *  only then does the aircraft become dead — handleDeaths (via
    *  onCrash) does the explosion/scorch at THIS (impact) position,
-   *  not the position where the jet was shot down. */
+   *  not the position where the jet was shot down.
+   *  Pass 6 (item 3): the wreck stays VISIBLE. The old code hid the
+   *  group, so a terrain crash showed nothing — the jet vanished and
+   *  the camera showed empty terrain. A wreck is left on the ground
+   *  (it becomes the new jet on respawn, which restores it). The
+   *  group's pose is synced to the impact position so a jet that flew
+   *  into a hillside does not sit buried below the surface. */
   finishCrash(): void {
     if (!this.alive) return;
     this.crashedFromDying = true;
@@ -2077,7 +2178,8 @@ export class Aircraft {
     ) {
       this.detachWing();
     }
-    this.group.visible = false;
+    this.group.position.copy(this.pos);
+    this.group.quaternion.copy(this.quat);
     this.body.setEnabled(false);
     this.events.onCrash?.(this, this.dyingReason ?? 'crashed');
   }
@@ -2112,7 +2214,12 @@ export class Aircraft {
     ) {
       this.detachWing();
     }
-    this.group.visible = false;
+    // Pass 6 (item 3): the wreck stays VISIBLE (see finishCrash) and
+    // its pose is synced to the surface-clamped position, so a jet
+    // that sank through a runway or into a hillside reads as wreckage
+    // on the ground instead of vanishing.
+    this.group.position.copy(this.pos);
+    this.group.quaternion.copy(this.quat);
     this.body.setEnabled(false);
     if (this.ai) this.ai.state = 'dead';
     this.events.onCrash?.(this, reason);

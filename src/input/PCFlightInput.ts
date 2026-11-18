@@ -83,6 +83,18 @@ function clamp(v: number, lo: number, hi: number): number {
 export class PCFlightInput implements IFlightInputProvider {
   private readonly canvas: HTMLCanvasElement;
   private readonly keys = new Set<string>();
+  /** Latched discrete presses (pass 6, items 7/10b): onKeyDown records
+   *  a press here as well as in `keys`; consumeEvents() reads and
+   *  clears it. A tap shorter than one frame (keydown + keyup between
+   *  two consumeEvents calls — common on a slow device, where a frame
+   *  is 50-100 ms) was lost entirely, because consumeEvents only read
+   *  the live `keys` set and onKeyUp had already deleted the code.
+   *  That is why V did nothing for VTOL, R did nothing during the
+   *  wreck-watching camera, and quick W / ArrowUp taps never moved
+   *  the throttle / stick live while the on-screen controls worked.
+   *  Held keys (W/S/arrows/Space/B/brackets) still read from `keys`;
+   *  only the single-shot edge keys are latched. */
+  private readonly pressed = new Set<string>();
   private throttle = 0;
   private camMode = 0; // 0 chase, 1 cockpit, 2 free-orbit
   private lastPoll = performance.now();
@@ -172,6 +184,18 @@ export class PCFlightInput implements IFlightInputProvider {
 
     this.pollGamepad();
 
+    // Held keys (pass 6, item 10b): a tap shorter than one frame
+    // (keydown + keyup between two getControls calls) was lost
+    // entirely, because the live `keys` set was already empty when
+    // getControls ran — W never raised the throttle and ArrowUp
+    // never pitched from a quick tap. A key latched in `pressed`
+    // counts as held for this one call, then is consumed below, so
+    // a tap still moves the stick / throttle by the frame's slew.
+    // Single-shot edge keys are NOT consumed here — consumeEvents()
+    // owns them.
+    const held = (code: string): boolean =>
+      this.keys.has(code) || this.pressed.has(code);
+
     // Base: gamepad wins, else mouse yoke, else zero (keyboard adds below).
     let px = 0;
     let rx = 0;
@@ -187,12 +211,12 @@ export class PCFlightInput implements IFlightInputProvider {
     // sensitivity exponent shape it. This is the keyboard-only path —
     // the mouse yoke and gamepad above are analogue and unshaped.
     const kbPitchTarget =
-      (this.keys.has('ArrowDown') ? 1 : 0) - (this.keys.has('ArrowUp') ? 1 : 0);
+      (held('ArrowDown') ? 1 : 0) - (held('ArrowUp') ? 1 : 0);
     const kbRollTarget =
-      (this.keys.has('ArrowLeft') ? 1 : 0) -
-      (this.keys.has('ArrowRight') ? 1 : 0) +
-      (this.keys.has('KeyA') ? 1 : 0) -
-      (this.keys.has('KeyD') ? 1 : 0);
+      (held('ArrowLeft') ? 1 : 0) -
+      (held('ArrowRight') ? 1 : 0) +
+      (held('KeyA') ? 1 : 0) -
+      (held('KeyD') ? 1 : 0);
     const slew = (cur: number, target: number, rate: number): number => {
       const step = rate * dt;
       if (cur < target) return Math.min(target, cur + step);
@@ -210,22 +234,22 @@ export class PCFlightInput implements IFlightInputProvider {
 
     // Rudder: Q = left, E = right (yawIn > 0 = nose right, solver yaw).
     const yaw =
-      (this.keys.has('KeyE') ? 1 : 0) - (this.keys.has('KeyQ') ? 1 : 0);
+      (held('KeyE') ? 1 : 0) - (held('KeyQ') ? 1 : 0);
 
     // Throttle: incremental while held; null = no opinion this frame.
     let throttle: number | null = null;
     if (
-      this.keys.has('KeyW') ||
-      this.keys.has('ShiftLeft') ||
-      this.keys.has('ShiftRight')
+      held('KeyW') ||
+      held('ShiftLeft') ||
+      held('ShiftRight')
     ) {
       this.throttle = clamp(this.throttle + dt * 0.7, 0, 1);
       throttle = this.throttle;
     }
     if (
-      this.keys.has('KeyS') ||
-      this.keys.has('ControlLeft') ||
-      this.keys.has('ControlRight')
+      held('KeyS') ||
+      held('ControlLeft') ||
+      held('ControlRight')
     ) {
       this.throttle = clamp(this.throttle - dt * 0.7, 0, 1);
       throttle = this.throttle;
@@ -233,6 +257,17 @@ export class PCFlightInput implements IFlightInputProvider {
     if (this.gpThrDelta !== 0) {
       this.throttle = clamp(this.throttle + this.gpThrDelta * dt, 0, 1);
       throttle = this.throttle;
+    }
+
+    // Consume the held-key taps latched in `pressed` (one getControls
+    // call per tap): a tap is held for this call only. Edge keys stay
+    // latched for consumeEvents().
+    for (const k of [
+      'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD',
+      'KeyQ', 'KeyE', 'KeyW', 'KeyS', 'ShiftLeft', 'ShiftRight',
+      'ControlLeft', 'ControlRight',
+    ]) {
+      this.pressed.delete(k);
     }
 
     return {
@@ -262,28 +297,33 @@ export class PCFlightInput implements IFlightInputProvider {
       this.keys.has('BracketRight') && nowMs - this.lastFlapDownMs >= 250;
     if (flapDown) this.lastFlapDownMs = nowMs;
     const ev: PCInputEvents = {
-      fireHeld: this.keys.has('Space') || this.gpFire,
-      missilePressed: this.keys.has('KeyM') || this.gpEdge.missile,
-      flarePressed: this.keys.has('KeyF') || this.gpEdge.flare,
-      gearPressed: this.keys.has('KeyG') || this.gpEdge.gear,
-      hookPressed: this.keys.has('KeyH'),
-      cameraPressed: this.keys.has('KeyC'),
-      cameraResetPressed: this.keys.has('KeyR'),
+      fireHeld: this.keys.has('Space') || this.pressed.has('Space') || this.gpFire,
+      missilePressed: this.pressed.has('KeyM') || this.gpEdge.missile,
+      flarePressed: this.pressed.has('KeyF') || this.gpEdge.flare,
+      gearPressed: this.pressed.has('KeyG') || this.gpEdge.gear,
+      hookPressed: this.pressed.has('KeyH'),
+      cameraPressed: this.pressed.has('KeyC'),
+      cameraResetPressed: this.pressed.has('KeyR'),
       pausePressed:
-        this.keys.has('KeyP') || this.keys.has('Escape') || this.gpEdge.pause,
-      bombPressed: this.keys.has('KeyN'),
-      brakeHeld: this.keys.has('KeyB'),
+        this.pressed.has('KeyP') || this.pressed.has('Escape') || this.gpEdge.pause,
+      bombPressed: this.pressed.has('KeyN'),
+      brakeHeld: this.keys.has('KeyB') || this.pressed.has('KeyB'),
       flapsUpPressed: flapUp,
       flapsDownPressed: flapDown,
-      airbrakePressed: this.keys.has('KeyX'),
-      vtolPressed: this.keys.has('KeyV'),
+      airbrakePressed: this.pressed.has('KeyX'),
+      vtolPressed: this.pressed.has('KeyV'),
     };
     // Single-shot keys are consumed so a held key does not repeat.
     // BracketLeft / BracketRight are NOT here — they are held keys
-    // with their own 0.25 s repeat above.
+    // with their own 0.25 s repeat above. Space / KeyB are held keys
+    // too — they are cleared from `pressed` (the tap latch) only,
+    // NOT from `keys`, so holding them keeps firing / braking.
     for (const k of ['KeyM', 'KeyF', 'KeyG', 'KeyH', 'KeyC', 'KeyR', 'KeyP', 'Escape', 'KeyN', 'KeyX', 'KeyV']) {
       this.keys.delete(k);
+      this.pressed.delete(k);
     }
+    this.pressed.delete('Space');
+    this.pressed.delete('KeyB');
     this.gpEdge.missile = false;
     this.gpEdge.flare = false;
     this.gpEdge.gear = false;
@@ -302,6 +342,10 @@ export class PCFlightInput implements IFlightInputProvider {
     // Space scrolls the page — prevent it while flying.
     if (e.code === 'Space') e.preventDefault();
     this.keys.add(e.code);
+    // Latch the press (pass 6, items 7/10b): a tap shorter than one
+    // frame must still reach consumeEvents() even if keyup already
+    // removed the code from `keys`.
+    this.pressed.add(e.code);
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {

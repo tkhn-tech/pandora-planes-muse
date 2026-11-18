@@ -182,6 +182,43 @@ async function main(): Promise<void> {
     dispose(ac);
   }
 
+  // 2b. Hover altitude-hold (pass 6, item 8): the live F-35A at VEC
+  // 90 and 100% throttle lifted off the deck but sank and went down
+  // instead of hovering — the pilot cannot hold the ~94% hover point
+  // precisely on a slider, so it porpoised and the sink half ended
+  // in a hard landing. The throttle is now an altitude command in a
+  // deep hover: 100% must climb gently (never sink), and a low
+  // throttle must descend gently (a controlled descent, not a fall).
+  {
+    const ac = makeAircraft('f35a');
+    ac.resetAt(alpha.x, 150, alpha.z, alpha.hdg);
+    ac.vector = 90;
+    ac.throttle = 1.0;
+    ac.thrTarget = 1.0;
+    const startAlt = ac.pos.y;
+    for (let i = 0; i < 900; i++) substep(ac, 1 / 60);
+    check(
+      'F-35A hover at 100% throttle climbs, does not sink (altitude hold)',
+      ac.alive && ac.pos.y >= startAlt - 2 && ac.vsi > -0.5,
+      `alt=${ac.pos.y.toFixed(1)} m (start ${startAlt.toFixed(1)}) vsi=${ac.vsi.toFixed(2)} m/s`,
+    );
+    dispose(ac);
+  }
+  {
+    const ac = makeAircraft('f35a');
+    ac.resetAt(alpha.x, 150, alpha.z, alpha.hdg);
+    ac.vector = 90;
+    ac.throttle = 0.85;
+    ac.thrTarget = 0.85;
+    for (let i = 0; i < 600; i++) substep(ac, 1 / 60);
+    check(
+      'F-35A hover at 85% throttle descends gently, controlled (altitude hold)',
+      ac.alive && ac.vsi > -6 && ac.pos.y > 100,
+      `alt=${ac.pos.y.toFixed(1)} m vsi=${ac.vsi.toFixed(2)} m/s`,
+    );
+    dispose(ac);
+  }
+
   // 3. Transition: hover -> forward flight via the toggle's
   // lift-following vector slew (mirrors main.ts: the nozzle comes aft
   // at 36 deg/s but never below sin(vector) >= (1 - gload) / (T/W),

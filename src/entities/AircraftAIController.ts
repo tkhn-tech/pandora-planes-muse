@@ -178,9 +178,27 @@ export class AircraftAIController {
       } else if (this.role === 'enemy' && this.state !== 'evade' && this.state !== 'rtb') {
         // v1.1: never engage a grounded or spawn-protected player, and
         // never engage a dying (falling) one — it is untargetable.
+        // Pass 6 (item 11): a slow / hovering target is not going
+        // anywhere, so the AI commits from further away — the 2600 m
+        // 3D range let a hovering F-35A sit unengaged while the AI
+        // patrolled past it (the live test: 3 Veterans, 2.5 min,
+        // "NO LOCK" the whole time). And once engaged it STAYS engaged
+        // (hysteresis): the AI flies at a slow target at 90+ m/s,
+        // overshoots, and is 3+ km out while it turns back — with a
+        // single range it dropped to patrol on the overshoot and flew
+        // away instead of re-attacking, so it never closed to firing
+        // range. Disengage only beyond 5000 m (slow) / 4000 m (fast).
         const pFair =
           player.alive && !player.dying && !player.grounded && player.spawnProt <= 0;
-        this.state = pFair && ac.pos.distanceTo(player.pos) < 2600 ? 'engage' : 'patrol';
+        const slowTarget = player.ias < 50;
+        const engageRange = slowTarget ? 3500 : 2600;
+        const disengageRange = slowTarget ? 5000 : 4000;
+        const dist = ac.pos.distanceTo(player.pos);
+        if (this.state === 'engage') {
+          this.state = pFair && dist < disengageRange ? 'engage' : 'patrol';
+        } else {
+          this.state = pFair && dist < engageRange ? 'engage' : 'patrol';
+        }
       }
       if (this.state === 'patrol' || this.state === 'rtb') {
         if (this.rng() < 0.3) this.pickNav(player);
@@ -511,11 +529,24 @@ export class AircraftAIController {
       const toP = this.tmpB.copy(player.pos).sub(ac.pos);
       const d = toP.length();
       const ang = ac.fwd().angleTo(toP.normalize()) * R2D;
-      if (d < 900 && ang < 12) {
+      // Pass 6 (item 11): the 12 deg gun / 15 deg missile cones are
+      // too narrow for a slow / hovering target — the AI flies past
+      // at 90+ m/s and its nose is inside the cone only for a moment,
+      // so it never fires (live: "NO LOCK" for 2.5 min). A slow target
+      // is not manoeuvring away, so the cones widen for it (gun 20
+      // deg, missile 30 deg) and the missile reaches further (3000 m:
+      // the AI orbits a slow target at 1.5-3 km and never closes to
+      // the 2200 m envelope). A fast, manoeuvring target keeps the
+      // tight cones and range.
+      const slowTarget = player.ias < 50;
+      const gunCone = slowTarget ? 20 : 12;
+      const mslCone = slowTarget ? 30 : 15;
+      const mslRange = slowTarget ? 3000 : 2200;
+      if (d < 900 && ang < gunCone) {
         this.fireT = 1.2 / this.skill.burst;
         this.fireGun = true;
       }
-      if (d < 2200 && ang < 15 && ac.msl > 0 && this.rng() < 0.25) {
+      if (d < mslRange && ang < mslCone && ac.msl > 0 && this.rng() < 0.25) {
         this.fireT = 3;
         this.fireMissile = true;
       }

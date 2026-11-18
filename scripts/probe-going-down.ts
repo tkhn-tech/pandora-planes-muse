@@ -266,6 +266,16 @@ async function main(): Promise<void> {
       plumeTracked,
       plumeTracked ? 'plume world Y stayed within 5 m of the wreck' : 'plume separated from the wreck',
     );
+    // Pass 6 (item 3): the wreck itself must stay VISIBLE on the
+    // ground after impact (the old code hid the group, so the crash
+    // showed nothing — the jet vanished and the camera showed empty
+    // terrain). The group's pose is synced to the impact position.
+    check(
+      `${key}: wreck stays visible on the ground after impact`,
+      player.group.visible === true &&
+        Math.abs(player.group.position.y - player.pos.y) < 0.01,
+      `group.visible=${player.group.visible} group.y=${player.group.position.y.toFixed(2)} pos.y=${player.pos.y.toFixed(2)}`,
+    );
     // handleDeaths fires the explosion at impact — simulate it the
     // way main.ts does (the explosion is the onExplosion hook the
     // weapons system already fired for the fuel blast; here we count
@@ -314,6 +324,14 @@ async function main(): Promise<void> {
       !player.alive && Math.abs(player.pos.y - gh) < 0.01,
       `pos.y=${player.pos.y.toFixed(2)} ground=${gh.toFixed(2)} reason=${player.lastCrashReason}`,
     );
+    // Pass 6 (item 3): the wreck stays visible and its group pose
+    // is the clamped surface position, not buried below the terrain.
+    check(
+      'terrain crash: wreck stays visible at the surface position',
+      player.group.visible === true &&
+        Math.abs(player.group.position.y - gh) < 0.01,
+      `group.visible=${player.group.visible} group.y=${player.group.position.y.toFixed(2)} ground=${gh.toFixed(2)}`,
+    );
     check(
       'terrain crash: NOT a dying crash (no fall to spectate — the 3 s instant-crash spectate covers it)',
       player.crashedFromDying === false,
@@ -339,6 +357,12 @@ async function main(): Promise<void> {
       'hard-landing crash: wreck stays at the touchdown height (no spurious lift)',
       Math.abs(player2.pos.y - yBefore) < 0.01,
       `pos.y=${player2.pos.y.toFixed(2)} before=${yBefore.toFixed(2)}`,
+    );
+    check(
+      'hard-landing crash: wreck stays visible at the touchdown position',
+      player2.group.visible === true &&
+        Math.abs(player2.group.position.y - yBefore) < 0.01,
+      `group.visible=${player2.group.visible} group.y=${player2.group.position.y.toFixed(2)} before=${yBefore.toFixed(2)}`,
     );
     player2.dispose();
   }

@@ -16,6 +16,18 @@ export interface CrashVFXOptions {
   groundHeight?: (x: number, z: number) => number;
   /** Camera-shake hook (main.ts feeds this into the chase camera). */
   onShake?: (amount: number) => void;
+  /** Floating origin (pass 6, item 2): persistent VFX (scorch decals,
+   *  debris, free plumes) are registered with it so a shift moves them
+   *  with the terrain instead of leaving them at the wrong place —
+   *  a scorch left behind by a shift reads as a black disc on a
+   *  runway it never crashed on. Attached plumes are children of a
+   *  jet's group and move with it, so they are not registered. */
+  origin?: {
+    registerObject(obj: THREE.Object3D): void;
+    unregisterObject(obj: THREE.Object3D): void;
+    registerBody(body: RAPIER.RigidBody): void;
+    unregisterBody(body: RAPIER.RigidBody): void;
+  };
 }
 
 interface Boom {
@@ -160,6 +172,11 @@ export class CrashVFXManager {
     } else {
       group.position.copy(pos);
       this.scene.add(group);
+      // Free plume: register with the floating origin so a shift
+      // moves it with the world (it is a scene object, not a child
+      // of a jet). Attached plumes move with their parent and are
+      // not registered.
+      this.opts.origin?.registerObject(group);
       this.plumes.push({ group, life: 6, maxLife: 6, parent: null });
     }
     return group;
@@ -229,6 +246,7 @@ export class CrashVFXManager {
           z: (Math.random() - 0.5) * 4,
         }),
     );
+    this.opts.origin?.registerBody(body);
     world.createCollider(RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z), body);
     this.debris.push({ mesh, body, life: 10 });
     return body;
@@ -241,8 +259,15 @@ export class CrashVFXManager {
    *  a growing black disc the stuck jet sits on, which is what the
    *  v2 play-test read as a "black disc in the sky". Oldest decals
    *  are removed from the scene and disposed; the rest fade in
-   *  update() over their last 30 s. */
-  scorchDecal(pos: THREE.Vector3, radius = 8): THREE.Mesh {
+   *  update() over their last 30 s.
+   *  Pass 6 (item 2): the v4.1 ground was still covered in huge
+   *  dark discs — the repeated spawn-crash scorches (radius 8 = 16 m
+   *  across, at 0.45 opacity) read as black discs on the green
+   *  terrain, and they are not registered with the floating origin
+   *  so a shift leaves them at the wrong place. An aircraft crash
+   *  now leaves a smaller, fainter mark (radius 5, 0.35); the
+   *  carrier impact scorch still passes its own radius (30). */
+  scorchDecal(pos: THREE.Vector3, radius = 5): THREE.Mesh {
     const gh = this.opts.groundHeight
       ? this.opts.groundHeight(pos.x, pos.z)
       : pos.y;
@@ -254,19 +279,23 @@ export class CrashVFXManager {
         // 430+ px black ellipse straddling a runway in the v4
         // play-test, left by the sink crashes). A scorch is a darkened
         // patch, not a black hole: dark brown-grey, less opaque.
+        // Pass 6: 0.45 was still reading black from a chase cam, so
+        // 0.35 now, and the radius is smaller (see above).
         color: 0x2a241e,
         transparent: true,
-        opacity: 0.45,
+        opacity: 0.35,
         depthWrite: false,
       }),
     );
     decal.rotation.x = -Math.PI / 2;
     decal.position.set(pos.x, gh + 0.15, pos.z);
     this.scene.add(decal);
+    this.opts.origin?.registerObject(decal);
     this.scorches.push({ mesh: decal, age: 0 });
     while (this.scorches.length > MAX_SCORCH) {
       const old = this.scorches.shift()!;
       this.scene.remove(old.mesh);
+      this.opts.origin?.unregisterObject(old.mesh);
       old.mesh.geometry.dispose();
       (old.mesh.material as THREE.Material).dispose();
     }
@@ -304,9 +333,14 @@ export class CrashVFXManager {
       }
       if (p.life <= 0) {
         // Attached plumes are children of a moving object (a jet's
-        // group), not the scene — remove from their parent.
+        // group), not the scene — remove from their parent. Free
+        // plumes are scene objects registered with the origin —
+        // unregister them too.
         if (p.parent) p.parent.remove(p.group);
-        else this.scene.remove(p.group);
+        else {
+          this.scene.remove(p.group);
+          this.opts.origin?.unregisterObject(p.group);
+        }
         this.plumes.splice(i, 1);
       }
     }
@@ -323,6 +357,7 @@ export class CrashVFXManager {
         : -Infinity;
       if (d.life <= 0 || p.y < gh + 0.5) {
         this.scene.remove(d.mesh);
+        this.opts.origin?.unregisterBody(d.body);
         this.debrisWorld?.removeRigidBody(d.body);
         this.debris.splice(i, 1);
       }
@@ -334,12 +369,16 @@ export class CrashVFXManager {
       s.age += dt;
       if (s.age >= SCORCH_LIFE) {
         this.scene.remove(s.mesh);
+        this.opts.origin?.unregisterObject(s.mesh);
         s.mesh.geometry.dispose();
         (s.mesh.material as THREE.Material).dispose();
         this.scorches.splice(i, 1);
       } else if (s.age > SCORCH_LIFE - 30) {
         const fade = 1 - (s.age - (SCORCH_LIFE - 30)) / 30;
-        (s.mesh.material as THREE.MeshBasicMaterial).opacity = 0.55 * fade;
+        // Pass 6: the fade used 0.55 while the decal starts at 0.35,
+        // so a scorch got MORE opaque when it started fading. Use the
+        // same base opacity as the decal is created with.
+        (s.mesh.material as THREE.MeshBasicMaterial).opacity = 0.35 * fade;
       }
     }
   }
