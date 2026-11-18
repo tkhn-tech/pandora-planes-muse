@@ -174,6 +174,36 @@ async function main(): Promise<void> {
     pods.length === 4 && pods.every((p) => p.alive && p.hp === 100),
     `pods=${pods.length} hp=[${pods.map((p) => p.hp).join(',')}]`,
   );
+  // Pass 5: the rotor discs ship in RotorDark (baseColor 0.18) — a
+  // near-black disc Ø ~37 m next to the deck, which read as the
+  // "black discs" from a deck spawn. buildShieldPods brightens them
+  // (0x8a8f96 + emissive) so they read as machinery, never black.
+  // (carrier.pods returns only {hp, alive} — the disc meshes live
+  // in the carrier group as rotor_disc_*, so traverse for them.)
+  const discMats: THREE.MeshStandardMaterial[] = [];
+  carrier.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.name.startsWith('rotor_disc')) return;
+    const m = mesh.material as THREE.MeshStandardMaterial;
+    if (m && 'color' in m && 'emissive' in m) discMats.push(m);
+  });
+  const discBright =
+    discMats.length === 4 &&
+    discMats.every((m) => {
+      // three.js stores colours in linear-sRGB; perceived brightness
+      // is the sRGB luminance, so convert back before measuring
+      // (the raw linear luminance of #8a8f96 is only ~0.27).
+      const s = m.color.clone().convertLinearToSRGB();
+      const lum = 0.299 * s.r + 0.587 * s.g + 0.114 * s.b;
+      return lum > 0.4 && m.emissive.getHex() !== 0;
+    });
+  check(
+    'rotor discs brightened (not black) after build',
+    discBright,
+    discMats.length === 0
+      ? 'no disc materials found'
+      : `discs=${discMats.length} colors=[${discMats.map((m) => '#' + m.color.getHexString()).join(',')}] emissive=[${discMats.map((m) => '#' + m.emissive.getHexString()).join(',')}]`,
+  );
   const podWorld = carrier.podObjects.map((p) =>
     p.getWorldPosition(new THREE.Vector3()),
   );

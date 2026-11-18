@@ -207,7 +207,7 @@ async function main(): Promise<void> {
   // 1. Fresh placement, no wind (the v3 probe's condition).
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, noWind);
     const r = park30(ac, noWind, 'fresh, no wind');
     check(
@@ -221,10 +221,10 @@ async function main(): Promise<void> {
   // 2. Respawn-like reset (crash then resetAt, throttle 0), no wind.
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, noWind);
     ac.crash('test kill');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.thrTarget = 0;
     const r = park30(ac, noWind, 'respawn, no wind');
     check(
@@ -239,10 +239,10 @@ async function main(): Promise<void> {
   // (drag ~7-15 N on 20,242 kg) — the question is whether it moves.
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, liveWind);
     ac.crash('test kill');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.thrTarget = 0;
     const r = park30(ac, liveWind, 'respawn, 3 m/s wind');
     check(
@@ -258,10 +258,10 @@ async function main(): Promise<void> {
   // the jet (heading drift) even if it does not translate it.
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, liveWind);
     ac.crash('test kill');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.thrTarget = 0;
     const r = park30(ac, liveWind, 'respawn, crosswind');
     check(
@@ -281,10 +281,10 @@ async function main(): Promise<void> {
   // 30 s, no wind.
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, noWind);
     ac.crash('test kill');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.thrTarget = 0;
     ac.pitchIn = -1;
     ac.rollIn = 1;
@@ -326,10 +326,10 @@ async function main(): Promise<void> {
   // gust could have been present.
   {
     const ac = makeAircraft();
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60, noWind);
     ac.crash('test kill');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.thrTarget = 0;
     const x0 = ac.pos.x;
     const z0 = ac.pos.z;

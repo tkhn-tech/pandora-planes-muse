@@ -647,6 +647,10 @@ export class Aircraft {
    *  Both implement IAerodynamicsSolver, so the controller treats
    *  them identically. */
   private readonly solver: IAerodynamicsSolver;
+  /** True when the solver is the blade-element model (pass 5: the
+   *  AoA limiter below is BET-only — the curve solver's pitch rate
+   *  is prescribed from the input and its stall nose-drop caps it). */
+  private readonly isBet: boolean;
   /** Body-frame angular velocity (rad/s), read from the Rapier body
    *  in syncFromBody and fed to the BET solver as AeroState.angVel. */
   private readonly angVelBody = new THREE.Vector3();
@@ -683,6 +687,8 @@ export class Aircraft {
       opts.useBet !== false && opts.spec.archetype !== 'rotary'
         ? new BladeElementSolver(opts.spec)
         : new CurveAerodynamicsSolver();
+    this.isBet =
+      opts.useBet !== false && opts.spec.archetype !== 'rotary';
     this.rig = opts.rig ?? null;
     this.bombs = opts.spec.bombs ? 4 : 0;
     this.damageEntity = new DamageableEntity(zoneHpFor(opts.spec.key));
@@ -1163,7 +1169,14 @@ export class Aircraft {
     });
     this.aoaDeg = result.aoaDeg;
     this.gload = result.gLoad;
-    this.stalled = result.stalled;
+    // Pass 5 (item 6): the STALL warning showed spuriously in VTOL
+    // hover. The BET stall flag LATCHES (it only clears once the jet
+    // has regained flying speed, v > 20 m/s), so a flag set during
+    // the transition into hover never clears while hovering (v < 20)
+    // — and in hover the wing is not flying at all (the lift fan
+    // carries the jet), so a "stall" is meaningless. Gate the flag
+    // on forward flight: thrust vector below 70 deg (hover is 90).
+    this.stalled = result.stalled && this.vectorDeg < 70;
     this.spin = result.spin;
     this.spinArrow = result.spinArrow;
     this.spinDir = result.spinDir;
@@ -1371,7 +1384,16 @@ export class Aircraft {
       // climb (measured ~0.4 m/s aft drift) cannot walk it off the
       // stern. A jet taking off (throttle up) uses normal friction,
       // so deck takeoffs are unaffected.
-      const deckHold = isDeck && this.throttle < 0.1 && sp < 1;
+      // Pass 5 (item 5): the deck hold disengaged when the
+      // deck-relative speed exceeded 1 m/s, and the velocity transfer
+      // through a waypoint turn leaves a ~0.5-1.5 m/s residual — so a
+      // parked jet's hold would drop out mid-turn, the weak ground
+      // friction (0.3) could not hold it against the deck's motion,
+      // and it walked off the stern in 12-35 s (the v4 play-test).
+      // The throttle gate already distinguishes a parked jet from a
+      // taxiing one, so the speed gate is widened to 3 m/s: a parked
+      // jet drifting at up to 3 m/s is still a parked jet and is held.
+      const deckHold = isDeck && this.throttle < 0.1 && sp < 3;
       const fr = this.brake
         ? BRAKE_DECEL
         : deckHold
@@ -1550,6 +1572,32 @@ export class Aircraft {
       // on a deck alike.
       if (this.ias < S.rotateSpeedKt * 0.514444 || pitchIn >= -0.25) rates.pitchRate = 0;
       else rates.pitchRate = Math.max(rates.pitchRate, -ROTATION_RATE_MAX);
+    }
+    // AoA limiter (BET only, pass 5): a held full pull must not run
+    // the AoA past the stall into a backflip. The BET is a moment
+    // model — at full elevator the tail moment overwhelms the pitch
+    // damping, so the pitch rate stays high while the AoA builds: a
+    // held pull on takeoff ran the F-22 to AoA 158 deg (deep stall,
+    // fall back onto the runway) and the other jets to a 43-51 deg
+    // wallow (probe-takeoff-trace). The curve solver never has this
+    // problem (its pitch rate is prescribed from the input and its
+    // stall nose-drop caps it). The limiter tapers the nose-up rate
+    // to zero as the AoA approaches 50 deg — past the 35 deg
+    // peak-CL stall, so the stall flag, the stall nose-drop and the
+    // stall-down probe (which needs AoA > 40 deg) all still work,
+    // but far below the backflip. Applied before syncRates so the
+    // solver's integrated omega is fed the limited rate, not the
+    // runaway one. A pilot who releases the pull recovers normally.
+    // The taper starts AT the 35 deg peak-CL stall (not 30): a
+    // 30 deg taper already cut the pitch rate by 15% at 33 deg and
+    // capped the low-speed stall test at maxAoA 33.1 deg — below
+    // the 35 deg stall flag — and let the stall-down jet descend
+    // gently and land instead of crashing (probe-bet + probe-
+    // stall-respawn regressions). At 35 deg the factor is 1.0 (no
+    // limiting), so the stall flag and stall-down both work; the
+    // taper only bites above the stall, where a backflip lives.
+    if (this.isBet && rates.pitchRate < 0 && this.aoaDeg > 35) {
+      rates.pitchRate *= clamp((50 - this.aoaDeg) / 15, 0, 1);
     }
     // Low and airborne, no pull: zero the nose-up rate. A jet that
     // runs off the runway end at ~195 kt with no input pitches
@@ -2037,11 +2085,26 @@ export class Aircraft {
   /** Instant vanish (v2 crash): hard landing / terrain impact when the
    *  jet was NOT already dying — it is already on the ground, so there
    *  is no fall to spectate. A dying jet never reaches here; its ground
-   *  contact calls finishCrash() instead. */
+   *  contact calls finishCrash() instead.
+   *  Pass 5 (item 3): the v4 play-test's terrain crash showed NOTHING
+   *  — the jet just vanished and the picker opened. Two causes: (a)
+   *  the crash position is BELOW the terrain (the jet sank through the
+   *  runway / into a hillside), so handleDeaths' explosion spawned
+   *  underground and was hidden by the terrain, and the camera's
+   *  spectate/chase target was below ground too. The wreck position
+   *  is now clamped UP to the exact heightfield surface, so the
+   *  explosion, scorch and debris all read at the surface. (b) an
+   *  instant crash never engaged the spectate camera — main.ts
+   *  handleDeaths now does that for the player. */
   crash(reason: string): void {
     if (!this.alive) return;
     this.alive = false;
     this.lastCrashReason = reason;
+    // Lift a below-surface wreck to the surface (terrain crash / sink
+    // through a runway) so the death VFX and the camera target the
+    // surface, not a point buried under it.
+    const gh = this.terrainHeightAt(this.pos.x, this.pos.z);
+    if (this.pos.y < gh) this.pos.y = gh;
     if (
       (this.damageZones.wingL > WING_DETACH_FATAL ||
         this.damageZones.wingR > WING_DETACH_FATAL) &&

@@ -119,7 +119,7 @@ async function main(): Promise<void> {
   // 1. Hover vertical balance at 94% (mirrors takeoff driver §C).
   {
     const ac = makeAircraft('f35a');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     ac.vector = 90;
     ac.thrTarget = 0.94;

@@ -66,7 +66,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.0 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.1 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -769,14 +769,22 @@ window.addEventListener('pointerup', () => {
   firing = false;
 });
 const brakeBtn = $('brakeBtn');
-brakeBtn?.addEventListener('pointerdown', () => {
-  touchBrake = true;
-  brakeBtn.classList.add('on');
+// Pass 5 (item 5): the Brake button was momentary (pointerdown sets
+// it, a global pointerup clears it), so on a phone the jet could only
+// be held while a finger stayed on the button — and the play-test
+// found it "does not hold it (momentary, not a latch)". It is now a
+// LATCH like gear/hook: tap to engage (stays on, button lit), tap
+// again to release. The keyboard brake (KeyB, held) is unchanged.
+brakeBtn?.addEventListener('click', () => {
+  touchBrake = !touchBrake;
+  brakeBtn.classList.toggle('on', touchBrake);
 });
 window.addEventListener('pointerup', () => {
   firing = false;
-  touchBrake = false;
-  brakeBtn?.classList.remove('on');
+  // Pass 5 (item 5): do NOT clear touchBrake here — the Brake button
+  // is a latch now (click toggles it); a global pointerup would
+  // release it the moment the finger lifts, which is exactly the
+  // momentary behaviour the play-test reported.
 });
 toggleBtn('bombBtn', () => {
   if (!player) return;
@@ -855,8 +863,19 @@ function setSpectateBanner(show: boolean, reason?: string, killer?: string): voi
   const tx = document.getElementById('spectateText');
   if (!el) return;
   if (show) {
-    const who = killer ? ` — shot down by ${killer}` : '';
-    if (tx) tx.textContent = `SHOT DOWN${who} · watching the wreck`;
+    // Pass 5 (item 3): the banner hardcoded "SHOT DOWN" even for a
+    // terrain/hard-landing crash. A shoot-down (dyingReason, killer)
+    // still reads SHOT DOWN; an instant crash reads WENT DOWN with
+    // its reason (terrain / hard landing), so the player knows what
+    // happened while the camera holds on the wreck.
+    const isShotDown =
+      killer !== undefined ||
+      (reason !== undefined &&
+        (reason === 'shot down' || reason === 'fuel explosion'));
+    const label = isShotDown
+      ? `SHOT DOWN${killer ? ` — shot down by ${killer}` : ''}`
+      : `WENT DOWN${reason ? ` — ${reason}` : ''}`;
+    if (tx) tx.textContent = `${label} · watching the wreck`;
     if (reason) el.title = reason;
     el.classList.add('show');
   } else {
@@ -1026,7 +1045,18 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
     // hang. Convert back to scene coords here.
     const idx = choice === 'bravo' ? 1 : choice === 'charlie' ? 2 : 0;
     const r = RUNWAY_TABLE[idx]!;
-    player.resetAt(r.x - shift.x, r.elev + 2, r.z - shift.z, r.hdg);
+    // Pass 5 (item 1): spawn the gear feet ON the runway box top
+    // (elev + 0.05), not 0.25 m inside it. resetAt(y) puts the centre
+    // at y and the gear feet at y - 2.2, so y = elev + 2.25 lands the
+    // feet exactly on the box top — the deck spawn's convention
+    // (deckTopY + 2.2 = feet at the deck). The old elev + 2 buried the
+    // gear 0.25 m into the box; Rapier has to push it back out every
+    // substep, and on a slow phone the contact loses to the
+    // controller's per-frame gravity increment (-88 fpm sink, crash
+    // in 10-27 s live on Alpha/Bravo). Charlie's spawn worked because
+    // its plateau/terrain let the contact win; the box top is the
+    // same 0.05 m above the heightfield on all three.
+    player.resetAt(r.x - shift.x, r.elev + 2.25, r.z - shift.z, r.hdg);
   }
   player.thrTarget = 0;
   pcInput.setThrottle(0);
@@ -1109,6 +1139,12 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // STALL survive three restarts — the solver reset on respawn clears
   // the state, this clears the banners).
   clearTransientUI();
+  // Pass 5 (item 6): the spectate banner ("WENT DOWN / SHOT DOWN —
+  // watching the wreck") was NOT cleared by clearTransientUI, so it
+  // survived a full round restart (Apply & Restart) and showed at
+  // the start of a fresh round. A new round is never spectating.
+  spectating = false;
+  setSpectateBanner(false);
   clearAircraftList(enemies);
   clearAircraftList(traffic);
   worldGen.resetOrigin();
@@ -1220,7 +1256,9 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
     player.vel.copy(dv);
   } else {
-    player.resetAt(r0.x, r0.elev + 2, r0.z, r0.hdg);
+    // Runway spawn — gear feet on the box top (elev + 2.25, see
+    // respawnPlayer above for why not elev + 2).
+    player.resetAt(r0.x, r0.elev + 2.25, r0.z, r0.hdg);
   }
   player.gear = true;
   $('gearBtn')?.classList.add('on');
@@ -1462,7 +1500,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.0 · Vite + Rapier).
+// Footer version string (v4.1 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1646,7 +1684,13 @@ function playerInput(dt: number): void {
       pickRespawn(highlightedRespawnChoice());
     } else if (spectating || !p.alive) {
       skipSpectate();
-    } else if (stuckHintActive) {
+    } else if (stuckTime > 2) {
+      // Pass 5 (item 7): R used to require stuckHintActive, which is
+      // only set after the 10 s stuck toast fires — so pressing R in
+      // the first 10 s of being beached just reset the camera and did
+      // nothing. R now opens the picker as soon as the jet has been
+      // beached for > 2 s (stuckTime accumulates only while beached
+      // and resets the moment the jet moves / takes off).
       showRespawnPicker(true);
     } else {
       camOrbit = { yaw: 0, pitch: 0.32 };
@@ -1801,26 +1845,38 @@ function handleDeaths(): void {
       vfx.spawnExplosion(a.pos.clone(), 1 + a.fuel);
       sfx('boom');
       vfx.scorchDecal(a.pos.clone());
-      // Debris scatter for a dying crash (5-10 Rapier bodies thrown
-      // outward at 10-30 m/s — the box fallback when no segment mesh).
-      if (a.crashedFromDying) {
-        for (let i = 0; i < 4; i++) {
-          const ang = Math.random() * Math.PI * 2;
-          const sp = 10 + Math.random() * 20;
-          vfx.spawnDebris(
-            null,
-            rapierWorld,
-            a.pos.clone(),
-            new THREE.Vector3(
-              Math.cos(ang) * sp,
-              5 + Math.random() * 10,
-              Math.sin(ang) * sp,
-            ),
-          );
-        }
+      // Debris scatter (pass 5, item 3): was gated on
+      // crashedFromDying, so an instant terrain/hard-landing crash
+      // left NO wreckage — the jet just vanished. A terrain crash is
+      // a crash too: it scatters debris at the (now surface-clamped)
+      // impact position, so the wreck reads on the ground.
+      for (let i = 0; i < 4; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const sp = 10 + Math.random() * 20;
+        vfx.spawnDebris(
+          null,
+          rapierWorld,
+          a.pos.clone(),
+          new THREE.Vector3(
+            Math.cos(ang) * sp,
+            5 + Math.random() * 10,
+            Math.sin(ang) * sp,
+          ),
+        );
       }
       if (a.isPlayer) {
         hud.toast('YOU WENT DOWN', 'Choose where to respawn.');
+        // Pass 5 (item 3): an instant crash (hard landing / terrain)
+        // never engaged the spectate camera — the jet vanished and the
+        // chase camera had nothing to follow. Engage spectate for the
+        // 3 s until the picker so the camera holds on the wreck site
+        // (the wreck position is surface-clamped by crash(), so the
+        // camera targets the surface, not a point under the terrain).
+        // A dying crash already spectates from the dying detection.
+        if (!a.crashedFromDying && !spectating) {
+          spectating = true;
+          setSpectateBanner(true, a.lastCrashReason ?? undefined);
+        }
         // A dying crash (shot down, fell, impacted) shows the picker
         // 2 s after impact (the spectate already showed the fall); an
         // instant crash (hard landing / terrain) keeps the 3 s window.
@@ -1994,13 +2050,20 @@ function animate(): void {
   // and no respawn timer ever fires. After 10 s of it, hint that R
   // opens the respawn picker. A jet parked on a runway/deck is
   // grounded/onDeck, so it never triggers.
+  // Pass 5 (item 6): the detector fired in a VTOL HOVER — a hovering
+  // jet is alive, not grounded, not on a deck, and ~0 kt, which is
+  // exactly the beached signature. Gate it on being NEAR THE GROUND
+  // (AGL < 10 m): a beached jet is on a slope at ground level, a
+  // hovering jet is hundreds of metres up.
   if (player) {
+    const agl = player.pos.y - heightfieldGroundHeight(player.pos.x, player.pos.z);
     const beached =
       player.alive &&
       !player.dying &&
       !player.grounded &&
       !player.onDeck &&
-      player.vel.length() < 1;
+      player.vel.length() < 1 &&
+      agl < 10;
     if (beached) {
       stuckTime += dt;
       if (stuckTime > 10 && !stuckToastShown) {
@@ -2075,9 +2138,20 @@ function animate(): void {
   // flickers false while the jet rolls on the ground, so the score
   // ticked ~1/s at 6 kt rolling after a respawn. AGL is the exact
   // heightfield surface, so it cannot flicker.
+  // Pass 5 (item 9): the AGL gate alone was not enough — a jet
+  // PARKED ON THE DECK sits at y=350 over terrain at ~43 m, so its
+  // "AGL" is ~307 m and the score ticked ~1/s while parked on the
+  // deck at 0% throttle (and a hovering jet, airborne at ~0 kt,
+  // ticked too). The score is a flight/survival counter: it now
+  // requires the jet to be actually flying — airborne (not grounded,
+  // not on a deck), above 10 m, AND moving (> 20 m/s). Parked and
+  // hovering no longer tick.
   if (
     player?.alive &&
+    !player.grounded &&
+    !player.onDeck &&
     player.pos.y - heightfieldGroundHeight(player.pos.x, player.pos.z) > 10 &&
+    player.vel.length() > 20 &&
     Math.floor(elapsed) !== Math.floor(prevElapsed)
   ) {
     score += 1;

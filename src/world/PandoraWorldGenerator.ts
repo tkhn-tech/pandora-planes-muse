@@ -298,10 +298,20 @@ export class PandoraWorldGenerator {
     // pointing away from the sun gets ~0 light whatever its colour,
     // so the island materials now also carry a small emissive: the
     // shadowed faces read as dark rock/grass, never pure black.
-    // Scatter spans the 12 km map (islands within ±4800 m).
-    const rockMat = new THREE.MeshLambertMaterial({ color: 0x7d6f5e, emissive: 0x2a241c });
-    const topMat = new THREE.MeshLambertMaterial({ color: 0x4a8a52, emissive: 0x16240f });
-    const rootMat = new THREE.MeshLambertMaterial({ color: 0x4a3a2a, emissive: 0x1a120a });
+    // Pass 5 (item 2): the v4 play-test says that emissive was still
+    // too weak — the islands STILL read as huge pure-black inverted
+    // cones (one lit island read as brown rock, most pure black), and
+    // a dark disc/ellipse on the ground. A shadowed face shows only
+    // emissive + hemisphere-ground*diffuse (~0.13), so the old
+    // emissives (0x2a241c ~ 0.15) left the total at ~0.28 — dark
+    // enough to read as black against a bright sky on a phone. The
+    // emissives are now strong enough that the shadowed faces read
+    // as clearly visible dark rock/grass from every angle and
+    // altitude, including from the deck (carrier ~350 m, islands
+    // 260-520 m). The diffuse colours are lightened too.
+    const rockMat = new THREE.MeshLambertMaterial({ color: 0x9a8a76, emissive: 0x6a5a48 });
+    const topMat = new THREE.MeshLambertMaterial({ color: 0x5a9a62, emissive: 0x2a4a26 });
+    const rootMat = new THREE.MeshLambertMaterial({ color: 0x6a5a48, emissive: 0x54402c });
     for (let i = 0; i < ISLAND_COUNT; i++) {
       const x = (rand() - 0.5) * (WORLD_SIZE * 0.8);
       const z = (rand() - 0.5) * (WORLD_SIZE * 0.8);

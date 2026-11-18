@@ -218,7 +218,7 @@ async function main(): Promise<void> {
   // ---- 1. BET takeoff, all 6 aircraft ----
   for (const key of ['fa18', 'f35a', 'f22', 'f15e', 'mig29', 'su34'] as const) {
     const ac = makeAircraft(key);
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     ac.flaps = 0;
     ac.thrTarget = 1;
@@ -297,7 +297,7 @@ async function main(): Promise<void> {
   // ---- 3. BET F-35A hover at 94% (auto-level PD) ----
   {
     const ac = makeAircraft('f35a');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     ac.vector = 90;
     ac.thrTarget = 0.94;

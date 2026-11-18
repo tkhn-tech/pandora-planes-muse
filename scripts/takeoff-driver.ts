@@ -339,7 +339,7 @@ async function main(): Promise<void> {
     for (const flaps of [0, 30]) {
       const ac = makeAircraft(key);
       // --- spawn settle: 2 s, no input ---
-      ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
       let gGround = 0;
       for (let i = 0; i < 120; i++) {
         substep(ac, 1 / 60);
@@ -487,7 +487,7 @@ async function main(): Promise<void> {
   // 94% the jet just sits weightless on its gear; at 100% it climbs).
   {
     const ac = makeAircraft('f35a');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60); // settle
     ac.vector = 90;
     ac.thrTarget = 1.0;
@@ -506,7 +506,7 @@ async function main(): Promise<void> {
   }
   {
     const ac = makeAircraft('f35a');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     ac.vector = 90;
     ac.thrTarget = 0.94;
@@ -528,7 +528,7 @@ async function main(): Promise<void> {
   {
     // 74% (the old light-mass hover throttle) must NOT lift at combat mass.
     const ac = makeAircraft('f35a');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     ac.vector = 90;
     ac.thrTarget = 0.74;
@@ -544,7 +544,7 @@ async function main(): Promise<void> {
   // ---- D. Slow-frame case: dt = 0.05 substeps (the timestep fix) ----
   {
     const ac = makeAircraft('fa18');
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 40; i++) substep(ac, 0.05); // 2 s at 20 fps
     const settled = ac.alive && Math.abs(ac.pos.y - (alpha.elev + 2.2)) < 0.3;
     ac.flaps = 30;

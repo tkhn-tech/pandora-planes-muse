@@ -249,9 +249,14 @@ export class CrashVFXManager {
     const decal = new THREE.Mesh(
       new THREE.CircleGeometry(radius, 24),
       new THREE.MeshBasicMaterial({
-        color: 0x0a0a0a,
+        // Pass 5 (item 2): was 0x0a0a0a at 0.55 — a pure-black disc
+        // on the ground, which read as one of the "black discs" (a
+        // 430+ px black ellipse straddling a runway in the v4
+        // play-test, left by the sink crashes). A scorch is a darkened
+        // patch, not a black hole: dark brown-grey, less opaque.
+        color: 0x2a241e,
         transparent: true,
-        opacity: 0.55,
+        opacity: 0.45,
         depthWrite: false,
       }),
     );
@@ -282,11 +287,16 @@ export class CrashVFXManager {
     if (this.flash.intensity > 0) {
       this.flash.intensity = Math.max(0, this.flash.intensity - dt * 220);
     }
-    // Plumes drift up and fade out.
+    // Plumes drift up and fade out — but only FREE plumes. An attached
+    // plume is parented to a falling wreck; drifting its local Y up
+    // 1.5 m/s lifts the fire 9 m off the wreck over its 6 s life
+    // (pass 5: the attached plume separated from the wreck in the
+    // going-down probe, so the fire visibly floated above the fall).
+    // The wreck's own motion carries an attached plume.
     for (let i = this.plumes.length - 1; i >= 0; i--) {
       const p = this.plumes[i];
       p.life -= dt;
-      p.group.position.y += dt * 1.5;
+      if (!p.parent) p.group.position.y += dt * 1.5;
       const fade = Math.max(0, p.life / p.maxLife);
       for (const child of p.group.children) {
         const spr = child as THREE.Sprite;

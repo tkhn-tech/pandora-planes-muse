@@ -242,7 +242,7 @@ async function main(): Promise<void> {
     } else {
       const idx = target === 'bravo' ? 1 : target === 'charlie' ? 2 : 0;
       const r = RUNWAY_TABLE[idx]!;
-      ac.resetAt(r.x - shift.x, r.elev + 2, r.z - shift.z, r.hdg);
+      ac.resetAt(r.x - shift.x, r.elev + 2.25, r.z - shift.z, r.hdg);
     }
   };
 
@@ -252,7 +252,7 @@ async function main(): Promise<void> {
     const idx = target === 'bravo' ? 1 : target === 'charlie' ? 2 : 0;
     const r = RUNWAY_TABLE[idx]!;
     // Park the jet on Alpha first, then kill it and respawn at the target.
-    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
+    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2.25, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
     for (let t = 0; t < 2; t += 0.05) substep(ac, 0.05);
     ac.crash('test kill');
     respawnAt(ac, target, 1);
@@ -298,7 +298,7 @@ async function main(): Promise<void> {
       carrier.update(1 / 60);
       if (Math.abs(carrier.yawRate) > 0.11) turned = true;
     }
-    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
+    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2.25, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
     for (let t = 0; t < 2; t += 1 / 60) substep(ac, 1 / 60);
     ac.crash('test kill');
     respawnAt(ac, 'carrier', 1);
@@ -317,7 +317,7 @@ async function main(): Promise<void> {
   // ---- 5. Carrier choice with count 0 falls back to Alpha ----
   {
     const ac = makeJet();
-    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
+    ac.resetAt(RUNWAY_TABLE[0]!.x, RUNWAY_TABLE[0]!.elev + 2.25, RUNWAY_TABLE[0]!.z, RUNWAY_TABLE[0]!.hdg);
     for (let t = 0; t < 2; t += 0.05) substep(ac, 0.05);
     ac.crash('test kill');
     respawnAt(ac, 'carrier', 0);

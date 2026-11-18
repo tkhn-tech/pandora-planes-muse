@@ -224,8 +224,17 @@ async function main(): Promise<void> {
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
     );
     // Force the carrier to ground + 5 m: it must die (below ground + 10).
-    c.pos.y = triH(c.pos.x, c.pos.z) + 5;
-    c.update(0.05);
+    // Pass 5 (item 4): the round-start grace window (5 s) lets
+    // terrain-following climb a low carrier out before the net can
+    // fire, so pin it at ground + 5 m for 6 s (past the grace) — a
+    // carrier that is STILL below ground + 10 after the grace dies.
+    // (A healthy carrier never sits that low: terrain-following
+    // targets max(350, ahead + 150).)
+    for (let i = 0; i < 120; i++) {
+      c.pos.y = triH(c.pos.x, c.pos.z) + 5;
+      c.update(0.05);
+      if (!c.alive) break;
+    }
     const diedLow = !c.alive;
     // Reset and force it to ground + 50 m: it must NOT die.
     c.reset(

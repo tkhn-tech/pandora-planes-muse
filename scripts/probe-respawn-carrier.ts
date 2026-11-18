@@ -387,6 +387,57 @@ async function main(): Promise<void> {
     ac.dispose();
   }
 
+  // ---- 3. Deck hold with a velocity-transfer residual (pass 5,
+  // item 5) ----
+  // A parked jet on the deck through a waypoint turn: the velocity
+  // transfer leaves a ~0.5-1.5 m/s deck-relative residual, which used
+  // to exceed the old deckHold gate (sp < 1) and disengage the hold
+  // — the weak ground friction (0.3) could not hold it against the
+  // deck's motion, so it walked off the stern in 12-35 s (v4
+  // play-test). The gate is now sp < 3 (the throttle gate already
+  // distinguishes a parked jet from a taxiing one). Give the jet a
+  // 2 m/s sideways deck-relative drift at spawn and require it to
+  // stay on the deck for 30 s through the turn.
+  {
+    carrier.reset(
+      new THREE.Vector3(
+        CARRIER_WAYPOINTS[0]!.x - 300,
+        CARRIER_START_POS.y,
+        CARRIER_WAYPOINTS[0]!.z,
+      ),
+      Math.PI / 2,
+    );
+    const ac = makeAircraft('fa18');
+    deckSpawn(ac);
+    // 2 m/s sideways (to the carrier's starboard) on top of the deck
+    // point velocity — the transfer residual.
+    const right = new THREE.Vector3(Math.cos(carrier.yaw), 0, -Math.sin(carrier.yaw));
+    const dv = ac.vel.clone().addScaledVector(right, 2);
+    ac.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
+    ac.vel.copy(dv);
+    const startLocal = carrier.localPosition(ac.pos);
+    let crashReason: string | null = null;
+    const crashOf = (a: Aircraft): string | null =>
+      (a as unknown as { __crash: () => string | null }).__crash();
+    for (let i = 0; i < 30 * 60; i++) {
+      substep(ac, 1 / 60);
+      if (!ac.alive) {
+        crashReason = crashOf(ac);
+        break;
+      }
+    }
+    const endLocal = carrier.localPosition(ac.pos);
+    const drift = startLocal && endLocal
+      ? Math.hypot(endLocal.x - startLocal.x, endLocal.z - startLocal.z)
+      : Infinity;
+    check(
+      'deck hold: parked jet with a 2 m/s transfer residual stays on the deck for 30 s through a turn',
+      ac.alive && ac.onDeck && drift < 5,
+      `alive=${ac.alive} onDeck=${ac.onDeck} crash=${crashReason ?? 'none'} drift=${drift.toFixed(1)} m (limit 5 m)`,
+    );
+    ac.dispose();
+  }
+
   console.log(failures === 0 ? '\nALL RESPAWN-CARRIER CHECKS PASSED' : `\n${failures} RESPAWN-CARRIER CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

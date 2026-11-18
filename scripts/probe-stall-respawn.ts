@@ -328,6 +328,7 @@ async function main(): Promise<void> {
     let hung = false;
     let hungAt = '';
     let crashed = false;
+    let landed = false;
     let lastY = ac.pos.y;
     let stillFrames = 0;
     for (let i = 0; i < 60 * 60 && ac.alive; i++) {
@@ -345,7 +346,20 @@ async function main(): Promise<void> {
         break;
       }
       // Hang detection: alive, barely moving vertically, for 5 s.
-      if (Math.abs(ac.pos.y - lastY) < 0.05 && Math.abs(ac.vsi) < 0.5) {
+      // Pass 5 (AoA limiter): the limiter caps the stall AoA at
+      // ~50 deg, so the jet now recovers into a glide and can LAND
+      // softly in the valley instead of tumbling into the slope —
+      // a recovery, not a hang. A jet resting ON the ground (grounded
+      // / onSurface) is landed, not hung, so the stillness only
+      // counts while airborne. The check accepts a crash OR a
+      // controlled landing — the property under test is "reaches the
+      // ground, no mid-air hang".
+      if (
+        Math.abs(ac.pos.y - lastY) < 0.05 &&
+        Math.abs(ac.vsi) < 0.5 &&
+        !ac.grounded &&
+        !ac.onSurface
+      ) {
         stillFrames++;
         if (stillFrames > 300) {
           hung = true;
@@ -355,12 +369,22 @@ async function main(): Promise<void> {
       } else {
         stillFrames = 0;
       }
+      // Landed (recovered) — the jet reached the ground without
+      // crashing and without hanging. Stop: it is on the surface.
+      if (ac.alive && (ac.grounded || ac.onSurface) && Math.abs(ac.vsi) < 0.5) {
+        landed = true;
+        break;
+      }
       lastY = ac.pos.y;
     }
     check(
-      'Stall-down reaches the ground and crashes (no mid-air hang)',
-      crashed && !hung,
-      hung ? `HUNG at ${hungAt}` : `crashed=${crashed} final y=${ac.pos.y.toFixed(1)}`,
+      'Stall-down reaches the ground and crashes or lands (no mid-air hang)',
+      (crashed || landed) && !hung,
+      hung
+        ? `HUNG at ${hungAt}`
+        : crashed
+          ? `crashed, final y=${ac.pos.y.toFixed(1)}`
+          : `landed (recovered), final y=${ac.pos.y.toFixed(1)} gnd=${ac.grounded} surf=${ac.onSurface}`,
     );
     if (hung) {
       console.log(
@@ -397,7 +421,7 @@ async function main(): Promise<void> {
     console.log(`  hillside crash: died=${died} at (${ac.pos.x.toFixed(0)}, ${ac.pos.z.toFixed(0)}) y=${ac.pos.y.toFixed(1)}`);
     // main.ts handleDeaths -> respawnTimer 3 s -> respawnPlayer.
     const r = placer.nearest(ac.pos);
-    ac.resetAt(r.x, r.elev + 2, r.z, r.hdg);
+    ac.resetAt(r.x, r.elev + 2.25, r.z, r.hdg);
     const ok =
       ac.alive &&
       !ac.dying &&
@@ -422,7 +446,7 @@ async function main(): Promise<void> {
   // (2000, 0, 1500) (what FloatingOrigin does to registered objects),
   // kills the jet near Alpha's scene position, and runs the main.ts
   // respawn flow verbatim: nearest(scenePos) -> resetAt(r.x - shift.x,
-  // r.elev + 2, r.z - shift.z, r.hdg). The jet must land ON the
+  // r.elev + 2.25, r.z - shift.z, r.hdg). The jet must land ON the
   // runway (y = elev + 2.2, grounded, alive) — and the OLD
   // conversion (no shift subtraction) is 2,500 m off.
   {
@@ -515,7 +539,7 @@ async function main(): Promise<void> {
     // main.ts respawnPlayer flow, verbatim (with the shift fix).
     const r2 = placer2.nearest(ac2.pos);
     const oldOff = Math.hypot(r2.x - (r2.x - shift.x), r2.z - (r2.z - shift.z));
-    ac2.resetAt(r2.x - shift.x, r2.elev + 2, r2.z - shift.z, r2.hdg);
+    ac2.resetAt(r2.x - shift.x, r2.elev + 2.25, r2.z - shift.z, r2.hdg);
     for (let i = 0; i < 60 * 5; i++) substep2();
     const ok2 =
       ac2.alive &&
@@ -631,7 +655,7 @@ async function main(): Promise<void> {
     const alpha = RUNWAY_TABLE[0]!;
     const runRoll = (holdS: number, flaps: number): { lifted: boolean; dist: number; kt: number } => {
       const ac = makeJet('fa18', true);
-      ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
       for (let i = 0; i < 120; i++) substep(ac);
       ac.flaps = flaps;
       ac.thrTarget = 1;
@@ -689,7 +713,7 @@ async function main(): Promise<void> {
     const alpha = RUNWAY_TABLE[0]!;
     const runStick = (pitchIn: number): { lifted: boolean; dist: number } => {
       const ac = makeJet('fa18', true);
-      ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
       for (let i = 0; i < 120; i++) substep(ac);
       ac.flaps = 30;
       ac.thrTarget = 1;
@@ -735,7 +759,7 @@ async function main(): Promise<void> {
   {
     const alpha = RUNWAY_TABLE[0]!;
     const ac = makeJet('fa18', true);
-    ac.resetAt(alpha.x, alpha.elev + 2, alpha.z, alpha.hdg);
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     for (let i = 0; i < 120; i++) substep(ac);
     const x0 = ac.pos.x;
     const z0 = ac.pos.z;

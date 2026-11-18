@@ -273,6 +273,15 @@ export class HelicarrierController {
   dying = false;
   /** Seconds since dying started. */
   dyingT = 0;
+  /** Seconds since the last reset() (pass 5, item 4 — CARRIER DOWN
+   *  false alarm at round start). The instant terrain-death safety
+   *  net (`pos.y < groundY + 10`) can fire on the FIRST frame after a
+   *  reset if the carrier spawns over high ground, before
+   *  terrain-following (which climbs only 15 m/s) can lift it clear.
+   *  The net is therefore suppressed for a grace window after every
+   *  reset so a fresh round can never kill the carrier before it has
+   *  had a chance to climb. */
+  private sinceReset = 999;
   /** True once the wreck has hit the ground (impactDone). The deck
    *  reads as absent from then on (deckHeightAt -> -Infinity) even
    *  though alive stays true while the wreck smokes. */
@@ -437,6 +446,29 @@ export class HelicarrierController {
       else if (/^pod_housing/i.test(mesh.name)) housings.push(mesh);
     });
     if (rings.length === 0 || discs.length === 0) return false;
+    // Pass 5: the rotor discs ship in RotorDark (baseColor 0.18) —
+    // a near-black disc Ø ~37 m right next to the deck. From a deck
+    // spawn they read as the "black discs" Nicholas reported (the v3
+    // island fix brightened the islands, not these). Brighten the
+    // shared disc/hub materials and give them a small emissive so
+    // they read as machinery, never as black holes, from any angle
+    // or lighting. The materials are shared across the four pods
+    // (GLB material index 6 = RotorDark, 5 = RotorHub), so setting
+    // them once covers all four.
+    for (const d of discs) {
+      const mat = d.material as THREE.MeshStandardMaterial | null;
+      if (mat && 'color' in mat) {
+        mat.color.setHex(0x8a8f96);
+        if ('emissive' in mat) mat.emissive.setHex(0x2e3134);
+      }
+    }
+    for (const h of hubs) {
+      const mat = h.material as THREE.MeshStandardMaterial | null;
+      if (mat && 'color' in mat) {
+        mat.color.setHex(0x6a6e73);
+        if ('emissive' in mat) mat.emissive.setHex(0x222528);
+      }
+    }
     // Ring centres in model space (the pivot each rotor spins about).
     const ringCentres = rings.map((r) => {
       const g = r.geometry;
@@ -685,6 +717,10 @@ export class HelicarrierController {
     this.dyingT = 0;
     this.impactDone = false;
     this.wreckT = 0;
+    // Pass 5 (item 4): restart the round-start grace window (see
+    // sinceReset) — a fresh round must not kill the carrier on its
+    // first frames.
+    this.sinceReset = 0;
     // Cruise velocity along the reset heading — NOT zero. The deck
     // spawn (and velocityAt) runs between reset() and the first
     // update(), and update() recomputes vel from the yaw anyway, so
@@ -744,11 +780,18 @@ export class HelicarrierController {
 
   update(dt: number): void {
     if (!this.active || !this.alive) return;
+    this.sinceReset += dt;
     // Dying (issue 9) runs FIRST, before waypoint steering and
     // terrain-following: a dying carrier must sink, not steer or
     // climb. (Terrain-following above the dying branch lifted the
     // wreck back up to cruise altitude after impact.)
-    const lift0 = this.podList.filter((p) => p.alive).length / 4;
+    // Pass 5 (item 4): only enter dying when the carrier HAS pods.
+    // podList is empty until build() loads the model — an empty list
+    // reads as lift 0 ("all pods dead") and would kill a carrier
+    // whose model had not finished building yet.
+    const lift0 = this.podList.length > 0
+      ? this.podList.filter((p) => p.alive).length / 4
+      : 1;
     if (lift0 <= 0.01 && !this.dying) {
       this.dying = true;
       this.dyingT = 0;
@@ -807,7 +850,13 @@ export class HelicarrierController {
     // should prevent it). An instant death is kept here: a carrier
     // that somehow hits terrain was never shot down, so there is no
     // dying sequence to play.
-    if (this.pos.y < groundY + 10) {
+    // Pass 5 (item 4): suppressed for 5 s after a reset (the
+    // sinceReset grace window). At round start the carrier sits at
+    // y=350 and terrain-following climbs only 15 m/s, so a spawn
+    // over high ground would otherwise die on the first frame —
+    // before it had any chance to climb — and fire a spurious
+    // CARRIER DOWN. After the grace window the net is fully live.
+    if (this.sinceReset > 5 && this.pos.y < groundY + 10) {
       this.alive = false;
       this.options.onCarrierDown?.();
       // Deck body stays where it is; the flight physics treats a dead

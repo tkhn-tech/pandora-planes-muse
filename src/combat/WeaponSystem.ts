@@ -224,6 +224,12 @@ export class WeaponSystem {
     byPlayer: boolean,
   ): void {
     if (!target.alive || target.dying) return;
+    // Pass 5: applyDamage guards a grounded / spawn-protected player,
+    // but the ignition rolls below ran anyway — a fuel explosion next
+    // to a parked (spawn-protected) player called startDying directly
+    // and killed it. The same guard applies to the kill/fire rolls.
+    const protectedPlayer =
+      target.isPlayer && (target.grounded || target.isSpawnProtected());
     let killReason: string | null = null;
     for (const a of zoneAnchors(target)) {
       // Anchor in world coordinates.
@@ -237,7 +243,7 @@ export class WeaponSystem {
       target.applyDamage(dmg, a.zone, byPlayer, true);
       // Ignition / spar-break rolls, per zone — all of them run now,
       // not just the first zone's.
-      if (a.zone === 'fuel' && d <= 3 && Math.random() < 0.25) {
+      if (a.zone === 'fuel' && d <= 3 && !protectedPlayer && Math.random() < 0.25) {
         // Immediate fuel explosion: the jet is destroyed (big
         // fireball) and falls as a burning wreck. The kill is
         // recorded, not applied — the loop finishes first.
@@ -246,11 +252,12 @@ export class WeaponSystem {
       }
       if (
         (a.zone === 'engine' || a.zone === 'engineL' || a.zone === 'engineR') &&
+        !protectedPlayer &&
         Math.random() < 0.15
       ) {
         target.startFire('engine', a.zone);
       }
-      if ((a.zone === 'wingL' || a.zone === 'wingR') && d <= 5 && Math.random() < 0.3) {
+      if ((a.zone === 'wingL' || a.zone === 'wingR') && d <= 5 && !protectedPlayer && Math.random() < 0.3) {
         // Spar break: the wing separates (damage-model §2, §6 step 4).
         target.applyDamage(60, a.zone, byPlayer, true);
       }
