@@ -171,6 +171,10 @@ export class AircraftAIController {
     this.decideT -= dt;
     if (this.decideT <= 0) {
       this.decideT = 0.1 + this.rng() * 0.05;
+      // Pass 8 (item 2): hoisted to the decide block so the bomb-entry
+      // gate below can use it too (it was scoped to the engage branch).
+      const pFair =
+        player.alive && !player.dying && !player.grounded && player.spawnProt <= 0;
       if (ac.hp < 20 && this.state !== 'rtb') this.state = 'rtb';
       else if (ac.hp < 35 && this.state === 'engage') {
         this.state = 'evade';
@@ -188,8 +192,6 @@ export class AircraftAIController {
         // single range it dropped to patrol on the overshoot and flew
         // away instead of re-attacking, so it never closed to firing
         // range. Disengage only beyond 5000 m (slow) / 4000 m (fast).
-        const pFair =
-          player.alive && !player.dying && !player.grounded && player.spawnProt <= 0;
         const slowTarget = player.ias < 50;
         const engageRange = slowTarget ? 3500 : 2600;
         const disengageRange = slowTarget ? 5000 : 4000;
@@ -206,10 +208,17 @@ export class AircraftAIController {
       // Bombing run: a jet with bombs (Su-34) in patrol has a chance to
       // attack the player's runway instead of circling. Target is Alpha,
       // the player's home base.
+      // Pass 8 (item 2): gated on pFair — the bomb state has no
+      // grounded/spawn-protection check of its own, so a Su-34 in
+      // patrol at round start rolled straight into a bombing run on
+      // Alpha while the player was still parked and spawn-protected
+      // (probe-ai-live: e1 was 'bomb' at t=0). A bombing run is an
+      // attack on the player, so it needs a fair target like engage.
       if (
         this.role === 'enemy' &&
         ac.bombs > 0 &&
         this.state === 'patrol' &&
+        pFair &&
         this.rng() < 0.25
       ) {
         this.state = 'bomb';
@@ -237,8 +246,13 @@ export class AircraftAIController {
     // Steering goal + wanted speed per state. RTB flies the landing
     // pattern (rtbGoal), the bomb run flies its phases (bombGoal);
     // engage/evade/patrol keep the v2 goals.
+    // Pass 8 (item 2): patrol at 100 m/s, not 130 — at 130 m/s
+    // (250 kt) the AI's runway-to-runway patrol circuits run 10-23 km
+    // from the player (probe-ai-live: e0/e1 at 17-23 km), far outside
+    // the 12 km map and out of engagement for a whole 2.5 min round.
+    // 100 m/s keeps the patrol inside the map and near the action.
     let goal: THREE.Vector3 = this.navTarget;
-    let speedWant = 130;
+    let speedWant = 100;
     let gearDown = false;
     let hookDown = false;
     let vsCap = 15; // vertical-speed demand cap (m/s); bomb dive raises it
@@ -508,8 +522,17 @@ export class AircraftAIController {
     const landingFinal =
       this.state === 'rtb' && this.rtbPhase !== 'approach';
     if (!landingFinal) {
-      const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), 260);
-      if (this.groundHeight(ahead.x, ahead.z) > ac.pos.y - 80) pitchIn = -1;
+      // Pass 8 (item 2): the look-ahead scales with speed — 260 m is
+      // under 2 s of flight at the AI's 130-150 m/s, so a jet chasing
+      // a low player into a rising range front cannot climb out in
+      // time (probe-ai-live, low-altitude run: e0 dead at 35.3 s,
+      // e1 at ~100 s). Five seconds of flight plus a 120 m trigger
+      // margin gives the pull-up room to work. The hard floor stays
+      // at ground + 60 m so the Su-34's bomb dive (which must go low)
+      // is not interrupted.
+      const lookAhead = Math.max(260, ac.ias * 5);
+      const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), lookAhead);
+      if (this.groundHeight(ahead.x, ahead.z) > ac.pos.y - 120) pitchIn = -1;
       const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
       if (
         ac.pos.y < this.groundHeight(ac.pos.x, ac.pos.z) + 60 ||

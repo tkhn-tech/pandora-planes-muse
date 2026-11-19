@@ -778,6 +778,13 @@ export class HelicarrierController {
     return max;
   }
 
+  // Pass 8 (item 3): public read of the terrain-following look-ahead
+  // (max ground 2500 m ahead) for the ?debug=1 carrier readout — the
+  // number that decides whether the carrier climbs.
+  get lookAheadGround(): number {
+    return this.groundAhead(2500);
+  }
+
   update(dt: number): void {
     if (!this.active || !this.alive) return;
     this.sinceReset += dt;

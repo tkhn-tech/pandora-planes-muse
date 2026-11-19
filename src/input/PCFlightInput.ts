@@ -145,6 +145,13 @@ export class PCFlightInput implements IFlightInputProvider {
     canvas.addEventListener('pointermove', this.onPointerMove);
     canvas.addEventListener('pointerup', this.onPointerUp);
     canvas.addEventListener('pointercancel', this.onPointerUp);
+    // Pass 8 (item 1): the canvas never calls setPointerCapture, so a
+    // pointerup OUTSIDE the canvas never reaches the canvas listener
+    // and yoke.active sticks true with a frozen dx/dy — a permanent
+    // full pitch+roll deflection on the next life. A window-level
+    // release catches the pointerup wherever it lands.
+    window.addEventListener('pointerup', this.onPointerUp);
+    window.addEventListener('pointercancel', this.onPointerUp);
   }
 
   /** Free-orbit drag belongs to main.ts; tell this provider the mode so
@@ -169,6 +176,11 @@ export class PCFlightInput implements IFlightInputProvider {
   }
 
   calibrate(): void {
+    // Pass 8 (item 1): a calibration is a fresh neutral state — clear
+    // the yoke engagement as well as the deflection, so a yoke stuck
+    // active from a previous life cannot carry a frozen deflection
+    // into the new one.
+    this.yoke.active = false;
     this.yoke.dx = 0;
     this.yoke.dy = 0;
   }

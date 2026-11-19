@@ -331,7 +331,13 @@ async function main(): Promise<void> {
     let landed = false;
     let lastY = ac.pos.y;
     let stillFrames = 0;
-    for (let i = 0; i < 60 * 60 && ac.alive; i++) {
+    // 120 s (was 60 s): pass 7's hands-off auto-level keeps the
+    // recovered jet's wings level, so instead of tumbling into the
+    // slope it recovers into a glide and skims the terrain — it
+    // needs the extra time to settle onto the valley floor or meet
+    // the rising slope. The property under test is unchanged: it
+    // must reach the ground (crash or land), not hang mid-air.
+    for (let i = 0; i < 60 * 120 && ac.alive; i++) {
       substep(ac);
       if (i % 30 === 0) {
         console.log(

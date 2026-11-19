@@ -51,6 +51,14 @@ interface DebrisPiece {
   mesh: THREE.Object3D;
   body: RAPIER.RigidBody;
   life: number;
+  // Pass 8 (item 5): age since spawn. Debris is spawned AT the
+  // surface-clamped crash position with an upward velocity (5-15
+  // m/s) — in the first 0.05 s step a slow piece rises only 0.25 m,
+  // so the old `p.y < gh + 0.5` ground-removal test fired on frame
+  // one and the debris vanished before it was ever seen (the live
+  // "no debris" finding). Ground removal only applies once the piece
+  // has had time to rise AND is actually falling back.
+  age: number;
 }
 
 function radialTexture(stops: [number, string][]): THREE.CanvasTexture {
@@ -248,7 +256,7 @@ export class CrashVFXManager {
     );
     this.opts.origin?.registerBody(body);
     world.createCollider(RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z), body);
-    this.debris.push({ mesh, body, life: 10 });
+    this.debris.push({ mesh, body, life: 10, age: 0 });
     return body;
   }
 
@@ -345,9 +353,14 @@ export class CrashVFXManager {
       }
     }
     // Debris: sync mesh from its Rapier body; remove on ground/expiry.
+    // Pass 8 (item 5): a piece is only "on the ground" once it has
+    // risen and is falling back (age > 0.5 s AND vertical velocity
+    // below zero) — a fresh piece at the surface with an upward
+    // velocity is still in its launch arc, not resting on the ground.
     for (let i = this.debris.length - 1; i >= 0; i--) {
       const d = this.debris[i];
       d.life -= dt;
+      d.age += dt;
       const p = d.body.translation();
       const q = d.body.rotation();
       d.mesh.position.set(p.x, p.y, p.z);
@@ -355,7 +368,8 @@ export class CrashVFXManager {
       const gh = this.opts.groundHeight
         ? this.opts.groundHeight(p.x, p.z)
         : -Infinity;
-      if (d.life <= 0 || p.y < gh + 0.5) {
+      const fallingBack = d.age > 0.5 && d.body.linvel().y < 0;
+      if (d.life <= 0 || (fallingBack && p.y < gh + 0.5)) {
         this.scene.remove(d.mesh);
         this.opts.origin?.unregisterBody(d.body);
         this.debrisWorld?.removeRigidBody(d.body);

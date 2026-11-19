@@ -651,6 +651,11 @@ export class Aircraft {
   bombs: number;
   failures: AircraftFailures = {};
   lastCrashReason: string | null = null;
+  // Pass 8 (item 1): the vertical speed and bank at the moment of the
+  // crash, so the ?debug=1 spawn trace can report the actual numbers
+  // behind a "WENT DOWN — terrain" instead of just the reason string.
+  lastCrashVs = 0;
+  lastCrashBankDeg = 0;
 
   private readonly world: RAPIER.World;
   private readonly deck?: DeckProvider;
@@ -1095,6 +1100,14 @@ export class Aircraft {
     turbAcc?: THREE.Vector3 | null,
   ): void {
     if (!this.alive) return;
+    // Pass 8 (item 1): a body that is not enabled is not placed yet
+    // (a fresh Aircraft before its first resetAt, or a wreck whose
+    // body was disabled by crash()/finishCrash()). Rapier does not
+    // integrate a disabled body, so syncFromBody would read a stale
+    // translation and the solver would integrate forces against a
+    // frozen position. Do not step it — this is the defense-in-depth
+    // half of the pre-spawn exoneration (probe-prespawn).
+    if (!this.body.isEnabled()) return;
     this.simTime += dt;
     if (this.gunCd > 0) this.gunCd -= dt;
     if (this.flareCd > 0) this.flareCd -= dt;
@@ -1326,6 +1339,11 @@ export class Aircraft {
     // (measured 0.16 m — 1 cm over the 0.15 m gate — which flipped
     // onSurface false and broke the coupling). A runway never moves,
     // so it keeps the tight 0.15 m gate.
+    // (Pass 7 tried 1.5 m / 0.5 m: the wider deck gate kept a jet
+    // "on the deck" too long for the deck-takeoff probe to read it
+    // airborne, and the wider runway gate let a single ArrowUp tap
+    // lift the jet — both reverted; the deck-ride / score fixes
+    // below come from the coupling, not the gate width.)
     const surfTol = isDeck ? 0.5 : 0.15;
     // Pre-coupling (issue 8): apply the vertical deck coupling
     // BEFORE the onSurface velocity gate, based on position only.
@@ -1363,6 +1381,24 @@ export class Aircraft {
     // in the onSurface branch). Captured before the branch updates
     // the flag.
     const prevOnSurface = this.onSurface;
+    // Pass 8 (item 4) — deck-gate HYSTERESIS. The gate is a position
+    // check (deck 0.5 m): when terrain-following crests a climb the
+    // deck can drop away from the jet by >1 m in one 0.05 s substep
+    // (the jet's stale +15 m/s climb velocity vs the deck reversing
+    // to -10 m/s), the gate flips false, the vertical coupling (which
+    // only runs inside the branch) stops, the jet never re-engages,
+    // and it falls off in 20-60 s. The fix is hysteresis, not a
+    // wider gate: a jet ENTERS the deck contact at 0.5 m (unchanged
+    // — a uniform 1.5 m widening was tried in pass 7 and reverted,
+    // it kept a jet "on the deck" too long for probe-carrier-deck),
+    // but once it is riding the deck it only EXITS at 1.5 m, so a
+    // brief 1.25 m drop keeps the coupling engaged and the jet is
+    // pulled back onto the deck. A genuinely departed jet still
+    // reads airborne past deckTopY + 5 (the hysteresis band is 1.5 m,
+    // not 5 m). The pre-coupling band above stays at surfTol — only
+    // the exit gate widens.
+    const wasOnDeck = prevOnSurface && this.onDeck;
+    const exitTol = wasOnDeck ? 1.5 : surfTol;
     // On the deck, a slow jet (parked / taxiing, below half stall
     // speed relative to the deck) is on the surface by position
     // alone — the relVy <= 0.5 gate is waived. The deck's vertical
@@ -1375,7 +1411,7 @@ export class Aircraft {
     const onSurfaceVel =
       relVy <= 0.5 || (isDeck && spPre < S.stallSpeed * 0.5);
     if (
-      (this.pos.y <= floorY + gearH + surfTol && onSurfaceVel) ||
+      (this.pos.y <= floorY + gearH + exitTol && onSurfaceVel) ||
       restingTilted
     ) {
       // Touching a surface. Rapier resolves the penetration — this
@@ -1668,21 +1704,37 @@ export class Aircraft {
     if (this.isBet && rates.pitchRate < 0 && this.aoaDeg > 35) {
       rates.pitchRate *= clamp((50 - this.aoaDeg) / 15, 0, 1);
     }
-    // Low and airborne, no pull: zero the nose-up rate. A jet that
-    // runs off the runway end at ~195 kt with no input pitches
-    // itself up to its ~5 deg trim AoA (tail downwash + LEX
-    // nose-up moment) and flies off the end (2c, at 660 m). Held
-    // level it sinks onto the slope like the curve solver's jet.
-    // With a pull this does NOT apply — a real rotation gets full
-    // pitch authority once airborne (capping it at 12 deg/s to
-    // 10 m made every takeoff run past 650 m). Above 10 m the
-    // pilot has full authority; the bank-hold / max-turn checks
-    // fly at 200 m, so the gate cannot touch them.
+    // No pull, no pitch-up (pass 7, item 2). The gate zeroes the
+    // (below 10 m AGL — the original gate: a jet that runs off the
+    // runway end with no input sinks onto the slope instead of
+    // flying off, and a single ArrowUp tap does not run away into
+    // a liftoff) OR the pitch is already 5 deg nose-up or more
+    // while the wings are near level (|bank| < 45 deg — the
+    // altitude loop: hands-off at altitude the jet climbs at its
+    // trim AoA, the speed bleeds, and the phugoid grows into a
+    // loop — v4.2: F-22 rolled inverted, Bank 165–177 deg, and
+    // dived at −25,454 fpm with NO input). The bank condition
+    // keeps the gate out of a banked turn: the max-turn AoA hold
+    // pitches up at ~12 deg AoA and 80 deg bank to hold altitude,
+    // and the gate was zeroing that nose-up rate whenever the
+    // hold's pitchIn went >= −0.25, dropping the MiG-29 turn rate
+    // to 14.9 deg/s (band 15–24). (An AoA < 5 deg condition was
+    // tried first and failed the other way: the F-22's hands-off
+    // AoA runs >= 5 deg, so the gate never bit and it inverted on
+    // all three runways.) Below 5 deg nose-up and above 10 m the
+    // nose-up rate is free, so a jet pushed nose-down can pitch
+    // back up to level. With a pull this does NOT apply — a real
+    // rotation / turn gets full pitch authority.
+    const pitchNow = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x;
+    const bankNow = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z;
+    const pitchedUp =
+      pitchNow < (-5 * Math.PI) / 180 &&
+      Math.abs(bankNow) < (45 * Math.PI) / 180;
     if (
       !onSurface &&
-      this.pos.y - floorY < 10 &&
       rates.pitchRate < 0 &&
-      pitchIn >= -0.25
+      pitchIn >= -0.25 &&
+      (this.pos.y - floorY < 10 || pitchedUp)
     ) {
       rates.pitchRate = 0;
     }
@@ -1755,6 +1807,20 @@ export class Aircraft {
       rates.yawRate = 0;
       rates.rollRate = 0;
     }
+    // Pass 7 (item 7): a jet on the ground is not stalled — the
+    // wing is not flying — so clear the stall flag EVERY step on a
+    // surface, not only on a new contact. The pass-6 fix cleared it
+    // in notifyContact, which fires only on a contact START; the
+    // solver's flag LATCHES (it only clears once v > 20 AND AoA <
+    // peak − 3), so a jet that stalled, recovered and landed kept
+    // showing STALL while parked (v4.2: F-22 parked on Charlie at
+    // 6 kt, AoA 0 deg, STALL showing; F-35A dead on Alpha, STALL
+    // showing). The solver re-asserts the flag each step while the
+    // latch holds, so the clear must run each step too. The stall
+    // nose-drop is gated on !onSurface, so this cannot touch a
+    // departure; on liftoff the solver's latch clears once the jet
+    // has flying speed and a low AoA.
+    if (onSurface) this.stalled = false;
     // Rolling on a surface at any throttle: the gear holds the
     // wings level (pass 6, item 1). The aileron cannot roll a jet
     // on its gear, and the wind moment must not start a roll
@@ -1769,18 +1835,60 @@ export class Aircraft {
         'YXZ',
       ).z;
       rates.rollRate = clamp(-bankNow * 2, -0.15, 0.15);
+      // Pass 7 (item 1/2): with no steering input the gear holds
+      // the HEADING too. The BET fin's weathercock yaw moment
+      // otherwise yaws a rolling jet freely — a hands-off takeoff
+      // roll veers off the runway side (the v4.2 F-22 veered right
+      // of the centreline, and the Charlie jet yawed ~65 deg with
+      // no input at 0% throttle), and off the runway the gear
+      // hits the heightfield skirt, which is the spawn/takeoff
+      // death path. A parked jet is already covered by the idle-
+      // throttle zeroing above; this covers the rolling jet at any
+      // throttle. Steering (rollIn) still yaws it via
+      // steerYawRate below.
+      if (Math.abs(rollIn) <= 0.1) rates.yawRate = 0;
     }
-    // Sync the solver's integrated rate state to the rates actually
-    // applied (BET only — the curve solver has no rate state and
-    // omits syncRates). The rotation clamp above and the dying bias
-    // override the solver's rates; without the sync the BET solver
-    // keeps integrating from a rate the body never flew — the thrust
-    // moment winds the pitch rate up behind the clamp and the jet
-    // rotates on its own above Vr, and the dying nose-down bias
-    // never reaches the solver's damping model. Sync AFTER the
-    // clamp/bias above, BEFORE the steer/deck yaw are added: those
-    // are controller additions, not aerodynamic rates, and must not
-    // pollute the solver's state.
+    // Airborne auto-level (pass 7, item 2): with no roll input the
+    // wings return gently to level. The BET has no dihedral and
+    // only CLP = −2.0 of roll damping, so any bank — a gust, a
+    // contact kick, the wind — grows into a spiral dive: the
+    // hands-off probe showed banks building 22 → 41 → 62 → 109
+    // deg and the jet diving, and the v4.2 play-test's F-22 rolled
+    // inverted (Bank 165–177 deg) with NO input. A real fighter's
+    // FCS holds the bank hands-off; this is the same behaviour as
+    // a gentle spring (max ~14 deg/s) added to the solver's roll
+    // rate, so the solver's dynamics still contribute but the bank
+    // cannot run away. Gated on no roll input (|rollIn| < 0.1) so
+    // a commanded bank (turns, the AI, the max-turn checks) is
+    // untouched; gated off while dying / stalled / in VTOL hover
+    // (the hover FCS has its own auto-level). Gated on rollIn
+    // EXACTLY 0 (not < 0.1): the max-turn probe holds its 80 deg
+    // bank with a feedback rollIn that goes to ~0 on target, and a
+    // < 0.1 gate let the auto-level fight the bank-hold and drop
+    // the turn rate below its band (probe-bet: fa18 13.0, mig29
+    // 13.6 deg/s). A released stick / centred stick reads exactly
+    // 0, so hands-off still gets the auto-level. Also gated on
+    // |bank| < 45 deg: it must not fight a deliberate steep bank
+    // (the 80 deg bank-hold) even in the instants the feedback
+    // rollIn reads exactly 0 — the spring only returns moderate
+    // banks to level, and the spiral is slow enough below 45 deg
+    // that the spring catches it before it gets there.
+    if (
+      !onSurface &&
+      typeof this.solver.syncRates === 'function' &&
+      rollIn === 0 &&
+      !this.dying &&
+      !this.stalled &&
+      this.vectorDeg < 70
+    ) {
+      const bankNow = new THREE.Euler().setFromQuaternion(
+        this.quat,
+        'YXZ',
+      ).z;
+      if (Math.abs(bankNow) < (45 * Math.PI) / 180) {
+        rates.rollRate += clamp(-bankNow * 2, -0.25, 0.25);
+      }
+    }
     this.solver.syncRates?.(rates);
     // BET stall / dying nose-drop (rate biases, AFTER the sync).
     // The BET solver has no emergent nose-down departure past
@@ -2202,18 +2310,27 @@ export class Aircraft {
     if (!this.alive) return;
     this.alive = false;
     this.lastCrashReason = reason;
+    // Pass 8 (item 1): snapshot the vertical speed and bank at the
+    // crash moment for the debug spawn trace (vsi is the current
+    // vertical speed; bank from the quaternion, YXZ like the
+    // hard-landing check).
+    this.lastCrashVs = this.vsi;
+    this.lastCrashBankDeg =
+      Math.abs(new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z) *
+      (180 / Math.PI);
     // Lift a below-surface wreck to the surface (terrain crash / sink
     // through a runway) so the death VFX and the camera target the
     // surface, not a point buried under it.
     const gh = this.terrainHeightAt(this.pos.x, this.pos.z);
     if (this.pos.y < gh) this.pos.y = gh;
-    if (
-      (this.damageZones.wingL > WING_DETACH_FATAL ||
-        this.damageZones.wingR > WING_DETACH_FATAL) &&
-      !this.wingDetached
-    ) {
-      this.detachWing();
-    }
+    // Pass 8 (item 5): an instant crash tears the airframe apart. A
+    // terrain / hard-landing impact arrives with no prior damage zones
+    // set, so the old conditional detach (which needed wing damage
+    // past the fatal threshold) never fired and the wreck looked
+    // intact and undamaged — the live "intact jet, no fire" finding.
+    // Detach a wing and the tail unconditionally: the impact does it.
+    if (!this.wingDetached) this.detachWing();
+    if (!this.tailDetached) this.detachTail();
     // Pass 6 (item 3): the wreck stays VISIBLE (see finishCrash) and
     // its pose is synced to the surface-clamped position, so a jet
     // that sank through a runway or into a hillside reads as wreckage

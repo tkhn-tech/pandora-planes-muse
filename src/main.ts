@@ -66,7 +66,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.2 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.3 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -178,6 +178,15 @@ function lockTone(on: boolean, rate = 0): void {
 // ---- debug capture (?debug=1, template ~442–470) ----
 const DEBUG_ON = /[?&]debug(=|&|$)/.test(location.search);
 const debugLog: string[] = [];
+// Pass 8 (item 1): spawn trace — the first 3 s after a spawn, sampled
+// per frame (VSI, AoA, onSurface, grounded, bank, pos.y, floorY), shown
+// in the ?debug=1 panel. The live Alpha/Bravo spawn death was never
+// reproduced in a driver across two passes, so the next live test
+// reports these numbers instead of just "WENT DOWN — terrain". The
+// trace restarts on every spawn (respawnPlayer / startRound) and a
+// crash appends the death reason with the actual vs/bank values.
+let spawnTrace: string[] = [];
+let spawnTraceT = Infinity; // seconds since spawn; Infinity = inactive
 const modelStatus: Record<string, { state: string; tris?: number; error?: string }> = {
   fa18: { state: 'pending' },
   f35a: { state: 'pending' },
@@ -341,10 +350,25 @@ const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
           );
         }
         vfx.scorchDecal(worldPos.clone(), 30);
-        hud.toast('CARRIER DOWN', 'A helicarrier is lost.');
+        // Pass 8 (item 3): the toast names WHICH carrier and that this
+        // is the ground impact (the start of the wreck), not the
+        // write-off ~10 s later — the old identical 'CARRIER DOWN'
+        // on both paths made one death read as two, and gave no way to
+        // tell which of the three carriers was lost.
+        hud.toast(
+          `CARRIER ${i + 1} IMPACT`,
+          `Helicarrier ${i + 1} (loop ×${scale}) hit the ground.`,
+        );
       },
       onCarrierDown: () => {
-        hud.toast('CARRIER DOWN', 'A helicarrier is lost.');
+        // Pass 8 (item 3): named, and distinct from the impact toast
+        // above — this is the ~10 s-later write-off. The debug panel
+        // (updateDebugPanel) carries the carrier's clearance and pod
+        // HP at the time, so a live test can say which carrier and why.
+        hud.toast(
+          `CARRIER ${i + 1} DOWN`,
+          `Helicarrier ${i + 1} (loop ×${scale}) is lost.`,
+        );
       },
     });
   },
@@ -609,6 +633,31 @@ const joy = { x: 0, y: 0, active: false, id: -1 };
   };
   joyEl?.addEventListener('pointerup', joyEnd);
   joyEl?.addEventListener('pointercancel', joyEnd);
+}
+
+// Pass 8 (item 1): (re)start the spawn trace — called on every spawn
+// (respawnPlayer / startRound) so the ?debug=1 panel shows the first
+// 3 s of the CURRENT life, not a stale one.
+function startSpawnTrace(): void {
+  spawnTrace = [];
+  spawnTraceT = 0;
+}
+
+// Pass 8 (item 1): reset every flight input to neutral on a spawn, so
+// a stuck or residual input from the previous life cannot deflect the
+// fresh jet. The PC mouse yoke engages on any canvas pointerdown and
+// a pointerup outside the canvas never reaches it, so yoke.active can
+// stick true with a frozen deflection; the touch joystick is a
+// module-level object that respawnPlayer never cleared; tilt holds a
+// calibration offset. A new life starts with neutral controls.
+function resetFlightInputs(): void {
+  joy.active = false;
+  joy.x = 0;
+  joy.y = 0;
+  const knob = $('joyKnob');
+  if (knob) knob.style.transform = '';
+  pcInput.calibrate();
+  tiltInput.calibrate();
 }
 
 // Free-orbit drag + pinch zoom on the canvas (template ~1855–1885).
@@ -1023,13 +1072,22 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   vfx.clearAttached(player.group);
   const choice: RespawnTargetId = target ?? lastRespawnChoice;
   const shift = floatingOrigin.cumulativeShift;
-  if (choice === 'carrier' && heliCountActive > 0) {
-    // Deck respawn (issue 4): the primary carrier's CURRENT position
+  // Pass 8 (item 4): a deck respawn needs a LIVE carrier. The old
+  // check was only `heliCountActive > 0` — after a CARRIER DOWN the
+  // primary carrier is dead (its deck is gone: deckHeightAt returns
+  // -Infinity for a dead carrier), so the jet respawned at the dead
+  // wreck's deck position, on the ground with no deck under it, and
+  // arrived dead/frozen with the HUD stuck on stale values. Fall
+  // back to Alpha when no active carrier is alive.
+  const liveCarrier = carriers.find((c) => c.active && c.alive) ?? null;
+  if (choice === 'carrier' && liveCarrier) {
+    // Deck respawn (issue 4): the carrier's CURRENT position
     // and yaw, 120 m aft of the deck centre, with the deck point
     // velocity (issue 3 — the linear velocity alone leaves the jet
     // behind when the carrier turns). A carrier choice with 0
-    // carriers falls through to the Alpha runway below.
-    const c = carrier;
+    // carriers (or all carriers dead) falls through to the Alpha
+    // runway below.
+    const c = liveCarrier;
     const fwd = new THREE.Vector3(Math.sin(c.yaw), 0, Math.cos(c.yaw));
     const sx = c.pos.x - fwd.x * 120;
     const sz = c.pos.z - fwd.z * 120;
@@ -1065,6 +1123,12 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   player.thrTarget = 0;
   pcInput.setThrottle(0);
   hud.syncThrottle(0);
+  // Pass 8 (item 1): a new life starts with neutral controls — clear
+  // any stuck yoke / deflected touch joystick / tilt offset from the
+  // previous life so it cannot deflect the fresh jet.
+  resetFlightInputs();
+  // Pass 8 (item 1): restart the spawn trace for this life.
+  startSpawnTrace();
   camMode = 0;
   pcInput.setCameraMode(0);
   clearTransientUI();
@@ -1264,6 +1328,13 @@ async function startRound(next: SandboxConfig): Promise<void> {
     // respawnPlayer above for why not elev + 2).
     player.resetAt(r0.x, r0.elev + 2.25, r0.z, r0.hdg);
   }
+  // Pass 8 (item 1): a new round starts with neutral controls (see
+  // resetFlightInputs — a stuck yoke / deflected joystick / tilt
+  // offset from the menu or a previous round must not deflect the
+  // fresh jet).
+  resetFlightInputs();
+  // Pass 8 (item 1): restart the spawn trace for this round.
+  startSpawnTrace();
   player.gear = true;
   $('gearBtn')?.classList.add('on');
 
@@ -1303,7 +1374,16 @@ async function startRound(next: SandboxConfig): Promise<void> {
       ey = 650 + Math.random() * 350;
       ez = player.pos.z + Math.sin(a) * d;
     }
-    e.resetAt(ex, ey, ez, Math.random() * 360);
+    // Pass 8 (item 2): enemies spawn FACING the player (head-on
+    // intercept), not on a random heading. A random heading let the
+    // first two fly AWAY at 150 m/s for ~18 s before the engage turn
+    // brought them back — by then they were 2-5 km out and patrolling
+    // 10-23 km away (probe-ai-live). Facing the player, they close at
+    // 150 + player speed from the first second. Heading is
+    // atan2(dx, dz) in the game's convention (fwd = sin/cos of hdg).
+    const hdgToPlayer =
+      (Math.atan2(player.pos.x - ex, player.pos.z - ez) * 180) / Math.PI;
+    e.resetAt(ex, ey, ez, hdgToPlayer);
     // Air spawn: the jet is flying, not hovering at 0 kt (setAirspeed —
     // below stall speed the wing cannot hold 1 g and no steering law
     // can turn it).
@@ -1504,7 +1584,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.2 · Vite + Rapier).
+// Footer version string (v4.3 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1512,7 +1592,10 @@ $('helpScreen')?.addEventListener('click', (e) => {
 
 // ---- time of day / sky / night glow ----
 function updateSky(dt: number): void {
-  todH = (todH + dt / 60) % 24; // 1 game minute per real second
+  // Pass 8 (item 7): 1 game minute per 4 real seconds (was 1 per
+  // second) — a full day now takes ~96 min instead of 24, so a round
+  // no longer runs from daylight to near-darkness in ~8 min.
+  todH = (todH + dt / 240) % 24; // 1 game minute per 4 real seconds
   const day = clamp(Math.sin(((todH - 6) / 12) * Math.PI), 0, 1);
   nightF = 1 - day;
   const sunEl = Math.sin(((todH - 6) / 12) * Math.PI);
@@ -1573,8 +1656,14 @@ function updateCamera(dt: number): void {
       .clone()
       .addScaledVector(velDir, -dist)
       .addScaledVector(new THREE.Vector3(0, 1, 0), dist * 0.34);
+    // Pass 8 (item 5): keep the sightline clear, like the chase camera
+    // — the camera floor alone lets a ridge between the camera and the
+    // wreck hide the wreck (the live "flat voids" view, where the
+    // camera showed empty terrain). Sample the midpoint too.
+    const mid = p.pos.clone().addScaledVector(velDir, -dist * 0.5);
     const floor = Math.max(
       heightfieldGroundHeight(want.x, want.z) + 6,
+      heightfieldGroundHeight(mid.x, mid.z) + 8,
       p.pos.y + 2,
     );
     if (want.y < floor) want.y = floor;
@@ -1649,7 +1738,20 @@ function playerInput(dt: number): void {
   if (vtolTarget !== null && p.spec.vtol) {
     let goal = vtolTarget;
     if (vtolTarget === 0) {
-      const liftFrac = Math.max(0, Math.min(1, p.gload));
+      // Pass 7 (item 8): above the stall speed the wing can fly the
+      // jet on its own, so the nozzle may come all the way down —
+      // the pilot pulls to catch the load. Below the stall speed
+      // the real lift (gload) governs, so the nozzle cannot outrun
+      // the wing. The old gload-only floor stalled the vector at
+      // ~73 deg at 200+ kt: the jet was descending unloaded
+      // (gload ~ 0), so the floor demanded sin(vector) >= 1 and
+      // the nozzle never came down — even though the wing could
+      // fly it at that speed. The jet then descended at −3,500 to
+      // −5,500 fpm and crashed into a hillside.
+      const liftFrac =
+        p.ias >= p.spec.stallSpeed
+          ? 1
+          : Math.max(0, Math.min(1, p.gload));
       const tw =
         (p.throttle * p.spec.thrustMax) / (p.spec.mass * 9.81);
       const need = (1 - liftFrac) / Math.max(tw, 0.01);
@@ -1849,6 +1951,17 @@ function handleDeaths(): void {
       vfx.spawnExplosion(a.pos.clone(), 1 + a.fuel);
       sfx('boom');
       vfx.scorchDecal(a.pos.clone());
+      // Pass 8 (item 5): an instant crash sets no damage zones and no
+      // fire, and the animate plume loop skips dead aircraft — so the
+      // wreck showed no fire or smoke, only the 0.9 s explosion sprite
+      // (the live "no fire/explosion/debris/scorch" finding). Attach a
+      // fire + smoke plume to the wreck's group so it burns visibly
+      // for the spectate window (6 s life; respawnPlayer clears
+      // attached plumes on the next life).
+      if (!a.crashedFromDying) {
+        vfx.spawnSmoke(a.pos.clone(), 0xff7722, a.group);
+        vfx.spawnSmoke(a.pos.clone(), 0x1a1a1a, a.group);
+      }
       // Debris scatter (pass 5, item 3): was gated on
       // crashedFromDying, so an instant terrain/hard-landing crash
       // left NO wreckage — the jet just vanished. A terrain crash is
@@ -1869,6 +1982,16 @@ function handleDeaths(): void {
         );
       }
       if (a.isPlayer) {
+        // Pass 8 (item 1): log the crash with the ACTUAL numbers
+        // (reason + vertical speed + bank at the crash moment) so the
+        // ?debug=1 panel shows why the jet went down instead of just
+        // the reason string. Appended to the spawn trace too, so the
+        // trace reads as a complete 3 s story ending in the death.
+        const crashLine = `CRASH ${a.lastCrashReason ?? '-'} vs=${a.lastCrashVs.toFixed(2)}m/s bank=${a.lastCrashBankDeg.toFixed(1)}deg y=${a.pos.y.toFixed(1)}`;
+        debugLog.push(crashLine);
+        if (debugLog.length > 30) debugLog.shift();
+        spawnTrace.push(crashLine);
+        spawnTraceT = Infinity; // stop sampling this life
         hud.toast('YOU WENT DOWN', 'Choose where to respawn.');
         // Pass 5 (item 3): an instant crash (hard landing / terrain)
         // never engaged the spectate camera — the jet vanished and the
@@ -1991,6 +2114,16 @@ function animate(): void {
   }
   const prevElapsed = elapsed;
   elapsed += rawDt;
+  // Pass 8 (item 1): the floating-origin shift fires at the START of
+  // the frame, not the end. At the end of the frame player.pos is
+  // stale (pre-shift) until the next step's syncFromBody, so the
+  // score, camera and HUD read a position up to 2x the shift away
+  // for one frame (probe-spawn-shift caught this: a -109 m clearance
+  // reading that was pure staleness). At the start of the frame
+  // player.pos is fresh (synced in the previous frame's last step),
+  // so the shift is computed from the true position and every read
+  // after the substeps sees the shifted position.
+  worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
   applyFailure(elapsed);
   updateSky(rawDt);
   const turb = cfg.weather.turbulence;
@@ -2134,8 +2267,26 @@ function animate(): void {
       vfx.spawnSmoke(c.pos.clone(), 0xff7722);
     }
   }
-  worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
   worldGen.update(rawDt, windVec);
+  // Pass 8 (item 1): spawn trace sampling — one line per frame for the
+  // first 3 s after a spawn (VSI, AoA, onSurface, grounded, bank,
+  // pos.y, floorY). Sampled here, after the substeps, so the values
+  // are the post-step state. The trace is shown in the ?debug=1 panel
+  // (updateDebugPanel) and a crash appends its reason + vs/bank.
+  if (DEBUG_ON && player && spawnTraceT < 3) {
+    spawnTraceT += rawDt;
+    const bankDeg =
+      Math.abs(new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').z) *
+      (180 / Math.PI);
+    const floorY = Math.max(
+      heightfieldGroundHeight(player.pos.x, player.pos.z),
+      deckProvider.deckHeightAt(player.pos.x, player.pos.z),
+    );
+    spawnTrace.push(
+      `t=${spawnTraceT.toFixed(2)} vsi=${player.vsi.toFixed(2)} aoa=${player.aoaDeg.toFixed(1)} surf=${player.onSurface ? 1 : 0} gnd=${player.grounded ? 1 : 0} bank=${bankDeg.toFixed(1)} y=${player.pos.y.toFixed(1)} floor=${floorY.toFixed(1)}`,
+    );
+    if (spawnTrace.length > 180) spawnTrace.shift();
+  }
   // Survival score: +1 per second alive AND AIRBORNE (research §6 — the
   // old version paid +1/s while the jet sat stuck on the runway).
   // Gated on AGL > 10 m (live finding 7), not !grounded: grounded
@@ -2150,12 +2301,29 @@ function animate(): void {
   // requires the jet to be actually flying — airborne (not grounded,
   // not on a deck), above 10 m, AND moving (> 20 m/s). Parked and
   // hovering no longer tick.
+  // Pass 8 (item 6): the speed gate uses the DECK-RELATIVE speed
+  // when the jet is on or just above a deck. A jet riding the deck
+  // reads the carrier's ~40 m/s as absolute velocity, so it ticked
+  // whenever grounded/onDeck flickered false (the deck-gate drop).
+  // The deck-relative speed is ~0 for a parked jet and only a
+  // genuinely flying jet reads > 20 m/s. The hysteresis fix (item 4)
+  // stops the flicker; this is the belt-and-braces half.
+  const deckYForScore = player
+    ? deckProvider.deckHeightAt(player.pos.x, player.pos.z)
+    : -Infinity;
+  const speedForScore =
+    player && deckYForScore > -Infinity && player.pos.y - deckYForScore < 5
+      ? player.vel
+          .clone()
+          .sub(deckProvider.velocityAt(player.pos.x, player.pos.z))
+          .length()
+      : (player?.vel.length() ?? 0);
   if (
     player?.alive &&
     !player.grounded &&
     !player.onDeck &&
     player.pos.y - heightfieldGroundHeight(player.pos.x, player.pos.z) > 10 &&
-    player.vel.length() > 20 &&
+    speedForScore > 20 &&
     Math.floor(elapsed) !== Math.floor(prevElapsed)
   ) {
     score += 1;
@@ -2235,6 +2403,18 @@ function updateDebugPanel(): void {
     ...modelLines,
     `origin shift: ${worldGen.originShift.x.toFixed(0)}, ${worldGen.originShift.z.toFixed(0)} · gamepad: ${pcInput.gamepadName || 'none'} · tilt: ${tiltInput.isEnabled ? 'on' : 'off'}`,
     `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · spawn ${cfg.spawn} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
+    // Pass 8 (item 3): per-carrier live readout — y vs ground vs
+    // look-ahead ground, alive/dying, pod HP. If a CARRIER DOWN toast
+    // fires, this says which carrier and what its clearance was.
+    ...carriers.map((c, i) => {
+      const g = heightfieldGroundHeight(c.pos.x, c.pos.z);
+      const pods = c.pods.map((p) => `${p.hp}`).join('/');
+      return `carrier ${i + 1} (×${CARRIER_LOOP_SCALES[i]}): y=${c.pos.y.toFixed(0)} gnd=${g.toFixed(0)} ahead2500=${c.lookAheadGround.toFixed(0)} clr=${(c.pos.y - g).toFixed(0)} ${c.active ? (c.alive ? (c.dying ? 'DYING' : 'flying') : 'DEAD') : 'inactive'} pods=[${pods}]`;
+    }),
+    // Pass 8 (item 1): the spawn trace — first 3 s after the spawn.
+    spawnTrace.length
+      ? '--- spawn trace (first 3 s) ---\n' + spawnTrace.slice(-12).join('\n')
+      : '(no spawn trace yet)',
     debugLog.length
       ? '--- warnings ---\n' + debugLog.slice(-8).join('\n')
       : '(no warnings yet)',

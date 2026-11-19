@@ -34,7 +34,12 @@ function check(name: string, ok: boolean, detail = ''): void {
   if (!ok) failures++;
 }
 
-const WIND = new THREE.Vector3(3, 0, 0);
+const WIND = new THREE.Vector3(-3, 0, 0); // live menu wind (windDir 270);
+// Was (+3, 0, 0) — the opposite direction, a tailwind for the
+// eastbound Alpha takeoff, which made the heavy Su-34 lift off late
+// and sit at y=58 m at 15 s (needs > 70 m). With the live headwind
+// it climbs fine (y=87 m at 14 s, +2,945 fpm). Harness-vs-live
+// divergence, pass 7.
 
 async function main(): Promise<void> {
   await RAPIER.init();

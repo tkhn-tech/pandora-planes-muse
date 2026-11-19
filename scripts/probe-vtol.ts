@@ -9,8 +9,10 @@
 //   2. pilot roll authority IN hover + hands-off auto-level,
 //   3. forward-flight transition (gradual vector slew, as the toggle
 //      does) without dropping out of the sky,
-//   4. no auto-level in forward flight (control check: a banked F-18
-//      keeps its bank with no input — hoverBlend is 0 there).
+//   4. forward flight auto-levels hands-off (pass 7, item 2 —
+//      was "no auto-level in forward flight"; the BET spiral
+//      divergence made that unplayable, so forward flight now
+//      returns the bank toward 0 with no roll input, like hover).
 //
 // Usage: node_modules/.bin/esbuild scripts/probe-vtol.ts --bundle
 //   --platform=node --format=esm --outfile=/tmp/probe-vtol.mjs
@@ -271,8 +273,13 @@ async function main(): Promise<void> {
     dispose(ac);
   }
 
-  // 4. Control: no auto-level in forward flight. A banked F-18 with
-  // no input keeps its bank (hoverBlend is 0 at vector 0).
+  // 4. Control: forward flight DOES auto-level hands-off (pass 7,
+  // item 2). A banked F-18 with no input returns toward level —
+  // the BET has no dihedral and only CLP = −2.0 of roll damping,
+  // so without the auto-level any bank grows into a spiral dive
+  // (v4.2: F-22 rolled inverted hands-off, Bank 165–177 deg).
+  // This check used to assert NO auto-level in forward flight
+  // (the bank persists); that was the old behaviour and the bug.
   {
     const ac = makeAircraft('fa18');
     ac.resetAt(alpha.x, 300, alpha.z, alpha.hdg);
@@ -285,8 +292,8 @@ async function main(): Promise<void> {
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60);
     const bank1 = bankOf(ac);
     check(
-      'F-18 forward flight: NO auto-level (bank persists, no input)',
-      Math.abs(bank1 - bank0) < 12 && Math.abs(bank1) > 10,
+      'F-18 forward flight: auto-level returns bank toward 0 hands-off (pass 7, item 2)',
+      Math.abs(bank1) < Math.abs(bank0) - 5,
       `bank ${bank0.toFixed(1)} deg -> ${bank1.toFixed(1)} deg over 2 s hands-off`,
     );
     dispose(ac);

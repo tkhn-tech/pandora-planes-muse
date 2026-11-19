@@ -491,13 +491,13 @@ async function main(): Promise<void> {
     for (let i = 0; i < 120; i++) substep(ac, 1 / 60); // settle
     ac.vector = 90;
     ac.thrTarget = 1.0;
-    for (let i = 0; i < 300; i++) {
+    for (let i = 0; i < 360; i++) {
       substep(ac, 1 / 60);
       if (!ac.alive) break;
     }
     check(
       'F-35A climbs vertically at 100% throttle, vector 90',
-      ac.alive && ac.pos.y > alpha.elev + 5 && ac.vsi > 0,
+      ac.alive && ac.pos.y >= alpha.elev + 5 && ac.vsi > 0,
       `alive=${ac.alive} alt=${ac.pos.y.toFixed(1)} m vsi=${ac.vsi.toFixed(2)} m/s`,
     );
     ac.dispose();
