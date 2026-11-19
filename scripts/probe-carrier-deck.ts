@@ -334,7 +334,12 @@ async function main(): Promise<void> {
       const b = owners.get(h2);
       const hit = a instanceof Aircraft ? a : b instanceof Aircraft ? b : null;
       if (!hit || !hit.alive) return;
-      hit.notifyContact(hit.vel.y, false);
+      // Pass 10: the contact's other side decides isDeck (main.ts
+      // pattern). Hardcoding false made a deck spawn on a descending
+      // carrier read as a 10 m/s hard landing — the jet inherits the
+      // deck's descent rate, so the relative impact is ~0, not 10.
+      const other = hit === a ? b : a;
+      hit.notifyContact(hit.vel.y, other === 'deck');
     });
   };
   const substep = (ac: Aircraft, dt: number): void => {

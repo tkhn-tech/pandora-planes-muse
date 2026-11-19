@@ -742,7 +742,10 @@ export class HelicarrierController {
     this.vtolCounted = new WeakSet();
     this.group.position.copy(this.pos);
     this.group.rotation.set(0, this.yaw, 0);
-    this.syncDeckBody();
+    // Teleport, not sync: the carrier jumps to the start position
+    // (pass 10 — a setNextKinematicTranslation here would derive a
+    // huge velocity from the jump distance for one step).
+    this.teleportDeckBody();
   }
 
   /** Take this carrier fully out of the game (issue 5 — its count
@@ -942,16 +945,52 @@ export class HelicarrierController {
 
   private syncDeckBody(): void {
     if (!this.deckBody) return;
-    // Position-based: translation + rotation only. Rapier derives the
-    // body's velocity from the displacement for contact resolution,
-    // so a jet standing on the deck is carried up/down/around with
-    // it. Do NOT set linvel/angvel here — for a position-based body
-    // they are ignored, and setting them alongside the translation
-    // was the double-move that put the physical deck ahead of the
-    // logical position.
-    this.deckBody.setTranslation({ x: this.pos.x, y: this.pos.y, z: this.pos.z }, true);
+    // Position-based, moved with setNextKinematicTranslation /
+    // setNextKinematicRotation — NOT setTranslation / setRotation.
+    // Pass 10 (item 1): setTranslation teleports the body and Rapier
+    // derives NO velocity from it (measured: linvel stays 0 after a
+    // setTranslation move + step), so the contact solver saw the deck
+    // as STATIONARY even while it climbed at 15 m/s. The only thing
+    // lifting the jet was the controller's vertical coupling, which
+    // runs AFTER world.step and lags a substep — so at every
+    // terrain-following climb start the deck rose 0.75 m per substep
+    // into the gear posts and the jet sank up to 0.58 m INTO the deck
+    // for ~0.4 s (probe-deck-ride-long: clip at t=87.1 s, min gap
+    // -0.58 m, both jets) — the "clip through" Nicholas reported.
+    // setNextKinematicTranslation makes Rapier derive the body's
+    // velocity from the displacement (measured: a 0.75 m move reads
+    // back as 45 m/s at dt=1/60), so the contact solver pushes the
+    // jet up/down with the deck's true velocity and the coupling
+    // becomes a fine trim. The body is moved by setting its NEXT
+    // position in update(), before world.step() — exactly the API's
+    // intended use. Teleports (reset) must use teleportDeckBody()
+    // instead, or the first step after the jump derives a huge
+    // velocity from the old position.
+    this.deckBody.setNextKinematicTranslation(
+      { x: this.pos.x, y: this.pos.y, z: this.pos.z },
+    );
     const q = this.group.quaternion;
-    this.deckBody.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+    this.deckBody.setNextKinematicRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
+  }
+
+  /**
+   * Teleport the deck body to the carrier's current pose with NO
+   * derived velocity (current == next, so the next step reads
+   * velocity 0). Used by reset(): the carrier jumps from wherever
+   * the last round left it to the start position, and a
+   * setNextKinematicTranslation there would derive a velocity of
+   * (jump distance)/dt for one step — enough to fling a jet that
+   * spawns onto the deck in the same frame.
+   */
+  private teleportDeckBody(): void {
+    if (!this.deckBody) return;
+    const t = { x: this.pos.x, y: this.pos.y, z: this.pos.z };
+    const q = this.group.quaternion;
+    const r = { x: q.x, y: q.y, z: q.z, w: q.w };
+    this.deckBody.setTranslation(t, true);
+    this.deckBody.setRotation(r, true);
+    this.deckBody.setNextKinematicTranslation(t);
+    this.deckBody.setNextKinematicRotation(r);
   }
 
   /** v2 carrierLocal: world point -> carrier-local (x, z). */

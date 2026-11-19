@@ -66,7 +66,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.4 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.5 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -807,7 +807,9 @@ toggleBtn('gearBtn', () => {
     hud.toast('GEAR JAMMED', 'The gear will not move.');
     return;
   }
-  player.gear = !player.gear;
+  // Manual override: the pilot's command holds off the automatic
+  // gear (pass 10, item 3) for 8 s.
+  player.setGearManual(!player.gear);
   $('gearBtn')?.classList.toggle('on', player.gear);
 });
 toggleBtn('hookBtn', () => {
@@ -1362,6 +1364,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // Pass 8 (item 1): restart the spawn trace for this round.
   startSpawnTrace();
   player.gear = true;
+  player.clearGearManual();
   $('gearBtn')?.classList.add('on');
 
   // Enemies: mix of MiG-29 and Su-34.
@@ -1610,7 +1613,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.4 · Vite + Rapier).
+// Footer version string (v4.5 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -2377,6 +2380,9 @@ function animate(): void {
         lockTarget: player.lockTarget,
         belowMinReleaseAlt: ccip?.belowMinAlt ?? false,
       });
+      // The automatic gear (pass 10, item 3) can move the gear without
+      // a button press — keep the button's state in step with it.
+      $('gearBtn')?.classList.toggle('on', player.gear);
       const pipper = weapons.computeLeadPipper(
         player,
         player.lockTarget,
