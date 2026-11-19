@@ -159,6 +159,19 @@ async function main(): Promise<void> {
       ac.alive && Math.abs(ac.vsi) < 1.5 && hoverAlt > 120,
       `alt=${hoverAlt.toFixed(1)} m vsi=${ac.vsi.toFixed(2)} m/s`,
     );
+    // Pass 9 (item 8): long hover — the live 40 s hover sank 335 ft
+    // -> 321 ft (~20 fpm, 0.1 m/s) with the P loop alone. The
+    // integral term must close that steady-state sink: after a
+    // further 40 s the altitude drift must be under 3 m (vs ~4 m
+    // live) and the final VSI near zero.
+    const longStart = ac.pos.y;
+    for (let i = 0; i < 2400; i++) substep(ac, 1 / 60);
+    const longDrift = ac.pos.y - longStart;
+    check(
+      'F-35A 40 s hover: integral term closes the steady-state sink',
+      ac.alive && Math.abs(longDrift) < 3 && Math.abs(ac.vsi) < 0.5,
+      `drift=${longDrift.toFixed(2)} m over 40 s (live: -4.3 m) vsi=${ac.vsi.toFixed(2)} m/s alt=${ac.pos.y.toFixed(1)} m`,
+    );
     // Pilot authority in hover: 0.3 s of full right roll must move
     // the bank (pre-FCS qAuth was ~0 at zero airspeed, so the stick
     // did nothing in hover).

@@ -234,6 +234,83 @@ async function main(): Promise<void> {
     ac.dispose();
   }
 
+  // Pass 9 (item 7): the v4.3 live test had ROTATE stuck ON while
+  // parked, while dead, and while airborne in VTOL hover — states
+  // where the getter must be false. The getter is correct and the
+  // live stick was the double-shifted height query holding onSurface
+  // true while airborne; these checks pin the OFF states so a
+  // regression is caught.
+  {
+    const spec = SPECS['f35a']!;
+    const ac = new Aircraft({
+      scene,
+      world,
+      spec,
+      isPlayer: true,
+      modelKey: spec.modelKey,
+    });
+    ac.terrainHeightAt = heightAt;
+    await ac.attachModel();
+    const rwy = RUNWAY_TABLE.find((r) => r.name === 'Charlie')!;
+    // Parked on the runway, 0 kt: OFF.
+    ac.resetAt(rwy.x, rwy.elev + 2.2, rwy.z, rwy.hdg);
+    ac.thrTarget = 0;
+    ac.brake = true;
+    for (let i = 0; i < 120; i++) {
+      world.timestep = 1 / 60;
+      world.step(eventQueue);
+      ac.step(1 / 60, wind, null);
+    }
+    check(
+      'rotate-cue OFF while parked (0 kt on the runway)',
+      !ac.rotateCue,
+      `ias=${(ac.ias * 1.944).toFixed(0)} kt onSurf=${ac.onSurface}`,
+    );
+    // Airborne in VTOL hover (vector 90, slow, 100 m up): OFF.
+    ac.resetAt(rwy.x, rwy.elev + 100, rwy.z, rwy.hdg);
+    ac.vectorDeg = 90;
+    ac.thrTarget = 0.94;
+    ac.brake = false;
+    for (let i = 0; i < 300; i++) {
+      world.timestep = 1 / 60;
+      world.step(eventQueue);
+      ac.step(1 / 60, wind, null);
+    }
+    check(
+      'rotate-cue OFF while airborne in VTOL hover',
+      !ac.rotateCue,
+      `ias=${(ac.ias * 1.944).toFixed(0)} kt onSurf=${ac.onSurface} vec=${ac.vectorDeg} y=${ac.pos.y.toFixed(1)}`,
+    );
+    // Dead (crashed): OFF — the getter requires alive.
+    ac.crash('terrain');
+    check('rotate-cue OFF while dead', !ac.rotateCue, `alive=${ac.alive}`);
+    // Fast and airborne (247 kt, the live reading): OFF.
+    const ac2 = new Aircraft({
+      scene,
+      world,
+      spec,
+      isPlayer: true,
+      modelKey: spec.modelKey,
+    });
+    ac2.terrainHeightAt = heightAt;
+    await ac2.attachModel();
+    ac2.resetAt(rwy.x, rwy.elev + 150, rwy.z, rwy.hdg);
+    ac2.setAirspeed(247 / 1.944);
+    ac2.thrTarget = 1;
+    for (let i = 0; i < 120; i++) {
+      world.timestep = 1 / 60;
+      world.step(eventQueue);
+      ac2.step(1 / 60, wind, null);
+    }
+    check(
+      'rotate-cue OFF while flying at 247 kt (airborne)',
+      !ac2.rotateCue,
+      `ias=${(ac2.ias * 1.944).toFixed(0)} kt onSurf=${ac2.onSurface} y=${ac2.pos.y.toFixed(1)}`,
+    );
+    ac.dispose();
+    ac2.dispose();
+  }
+
   console.log(failures === 0 ? '\nALL ROTATE-CUE CHECKS PASSED' : `\n${failures} ROTATE-CUE CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

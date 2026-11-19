@@ -37,16 +37,21 @@ export class FloatingOrigin {
   }
 
   registerObject(obj: THREE.Object3D): void {
+    // Idempotent (pass 9): registering the same object twice moved it
+    // by -2*shift per shift. A repeat registration is a no-op.
+    if (this.objects.includes(obj)) return;
     this.objects.push(obj);
   }
 
   registerBody(body: RigidBody): void {
+    if (this.bodies.includes(body)) return;
     this.bodies.push(body);
   }
 
   /** Register a bare logical position (e.g. player.pos, an AI navTarget, a
    *  carrier waypoint) so it is shifted with the world. */
   registerVector(v: THREE.Vector3): void {
+    if (this.vectors.includes(v)) return;
     this.vectors.push(v);
   }
 
@@ -66,8 +71,11 @@ export class FloatingOrigin {
   }
 
   /** Called with the shift vector after every applyShift (e.g. so the world
-   *  generator can update its groundHeight frame). */
+   *  generator can update its groundHeight frame). Idempotent by
+   *  reference: the same callback registered twice would double-count
+   *  the shift (pass 9). */
   registerCallback(cb: (shift: THREE.Vector3) => void): void {
+    if (this.callbacks.includes(cb)) return;
     this.callbacks.push(cb);
   }
 

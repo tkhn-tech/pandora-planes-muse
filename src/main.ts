@@ -66,7 +66,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.3 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.4 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -310,6 +310,13 @@ runwayPlacer.setOriginShift(floatingOrigin.cumulativeShift);
 // are concentric and never overlap — with its own start index, so the
 // carriers are spread around their circuits instead of stacked.
 const CARRIER_LOOP_SCALES = [1.0, 0.75, 1.25];
+/** Deck-spawn offset (m aft of the carrier group origin). The aft
+ *  deck rect reaches local z = -128.8 (deck_top meshes), so 85 m aft
+ *  is 16 m inside the stern with ~265 m of deck ahead. The old 120 m
+ *  was only 8.8 m from the stern, and the live deck spawn fell off
+ *  the stern to the terrain under the carrier and slid at the
+ *  carrier's 78 kt (pass 9, item 4). */
+const DECK_SPAWN_AFT_M = 85;
 const CARRIER_START_INDEXES = [0, 2, 4];
 const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
   (scale, i) => {
@@ -637,10 +644,14 @@ const joy = { x: 0, y: 0, active: false, id: -1 };
 
 // Pass 8 (item 1): (re)start the spawn trace — called on every spawn
 // (respawnPlayer / startRound) so the ?debug=1 panel shows the first
-// 3 s of the CURRENT life, not a stale one.
+// 3 s of the CURRENT life, not a stale one. Pass 9 (item 7): the
+// warnings section (debugLog) is cleared here too — it accumulated
+// every "CRASH terrain ..." line across rounds and restarts and was
+// never cleared (5-6 stale lines by the end of a session).
 function startSpawnTrace(): void {
   spawnTrace = [];
   spawnTraceT = 0;
+  debugLog.length = 0;
 }
 
 // Pass 8 (item 1): reset every flight input to neutral on a spawn, so
@@ -957,6 +968,11 @@ function skipSpectate(): void {
 type RespawnTargetId = 'alpha' | 'bravo' | 'charlie' | 'carrier';
 const RESPAWN_CHOICE_KEY = 'pandora-planes-last-respawn';
 let lastRespawnChoice: RespawnTargetId = 'alpha';
+// Pass 9 (item 2): the ?debug=1 panel's "spawn ..." label. It showed
+// cfg.spawn (the MENU choice) so it always read "spawn alpha" even
+// after a Bravo/Charlie/deck respawn. This tracks the ACTUAL current
+// spawn target, set in respawnPlayer/startRound.
+let lastSpawnLabel: RespawnTargetId = 'alpha';
 try {
   const saved = localStorage.getItem(RESPAWN_CHOICE_KEY);
   if (saved === 'alpha' || saved === 'bravo' || saved === 'charlie' || saved === 'carrier') {
@@ -1071,6 +1087,7 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   // carry the previous life's fire.
   vfx.clearAttached(player.group);
   const choice: RespawnTargetId = target ?? lastRespawnChoice;
+  lastSpawnLabel = choice;
   const shift = floatingOrigin.cumulativeShift;
   // Pass 8 (item 4): a deck respawn needs a LIVE carrier. The old
   // check was only `heliCountActive > 0` — after a CARRIER DOWN the
@@ -1082,15 +1099,21 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   const liveCarrier = carriers.find((c) => c.active && c.alive) ?? null;
   if (choice === 'carrier' && liveCarrier) {
     // Deck respawn (issue 4): the carrier's CURRENT position
-    // and yaw, 120 m aft of the deck centre, with the deck point
-    // velocity (issue 3 — the linear velocity alone leaves the jet
-    // behind when the carrier turns). A carrier choice with 0
+    // and yaw, DECK_SPAWN_AFT_M aft of the deck centre, with the deck
+    // point velocity (issue 3 — the linear velocity alone leaves the
+    // jet behind when the carrier turns). A carrier choice with 0
     // carriers (or all carriers dead) falls through to the Alpha
-    // runway below.
+    // runway below. 85 m aft is 16 m inside the stern edge (the aft
+    // deck rect reaches local z = -128.8) with ~265 m of deck ahead;
+    // the old 120 m was only 8.8 m from the stern, and the live deck
+    // spawn fell off the stern to the terrain under the carrier and
+    // slid at the carrier's 78 kt (pass 9) — the extra stern margin
+    // plus the fixed origin shift (correct deck/ground detection)
+    // keeps the jet on the deck.
     const c = liveCarrier;
     const fwd = new THREE.Vector3(Math.sin(c.yaw), 0, Math.cos(c.yaw));
-    const sx = c.pos.x - fwd.x * 120;
-    const sz = c.pos.z - fwd.z * 120;
+    const sx = c.pos.x - fwd.x * DECK_SPAWN_AFT_M;
+    const sz = c.pos.z - fwd.z * DECK_SPAWN_AFT_M;
     player.resetAt(sx, c.deckTopY + 2.2, sz, (c.yaw * 180) / Math.PI);
     const dv = deckProvider.velocityAt(sx, sz);
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
@@ -1298,20 +1321,21 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // but a stale saved config could still ask for it).
   const r0: RunwayDef = worldGen.runways[0]!;
   if (cfg.spawn === 'carrier' && heliCount > 0) {
-    // Deck spawn: 120 m aft of the deck centre (the full deck ahead for
-    // the roll), facing the bow at the carrier's heading, inheriting the
-    // carrier's cruise velocity so the jet rides the deck instead of
-    // sliding off the stern (the deck moves at 40 m/s from the first
-    // update; a zero-velocity spawn would be left behind). Works for all
-    // four jets — the F-35A's VTOL home is the deck. The arresting-wire
-    // logic applies on landing exactly as for a carrier trap.
+    // Deck spawn: DECK_SPAWN_AFT_M aft of the deck centre (the full
+    // deck ahead for the roll), facing the bow at the carrier's
+    // heading, inheriting the carrier's cruise velocity so the jet
+    // rides the deck instead of sliding off the stern (the deck moves
+    // at 40 m/s from the first update; a zero-velocity spawn would be
+    // left behind). Works for all four jets — the F-35A's VTOL home is
+    // the deck. The arresting-wire logic applies on landing exactly as
+    // for a carrier trap.
     const fwd = new THREE.Vector3(
       Math.sin(carrier.yaw),
       0,
       Math.cos(carrier.yaw),
     );
-    const sx = carrier.pos.x - fwd.x * 120;
-    const sz = carrier.pos.z - fwd.z * 120;
+    const sx = carrier.pos.x - fwd.x * DECK_SPAWN_AFT_M;
+    const sz = carrier.pos.z - fwd.z * DECK_SPAWN_AFT_M;
     player.resetAt(sx, carrier.deckTopY + 2.2, sz, carrier.yaw * R2D);
     // Inherit the DECK-POINT velocity at the spawn point (issue 3):
     // the linear cruise velocity plus the yaw-rotation term. At round
@@ -1323,10 +1347,12 @@ async function startRound(next: SandboxConfig): Promise<void> {
     const dv = deckProvider.velocityAt(sx, sz);
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
     player.vel.copy(dv);
+    lastSpawnLabel = 'carrier';
   } else {
     // Runway spawn — gear feet on the box top (elev + 2.25, see
     // respawnPlayer above for why not elev + 2).
     player.resetAt(r0.x, r0.elev + 2.25, r0.z, r0.hdg);
+    lastSpawnLabel = 'alpha';
   }
   // Pass 8 (item 1): a new round starts with neutral controls (see
   // resetFlightInputs — a stuck yoke / deflected joystick / tilt
@@ -1584,7 +1610,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.3 · Vite + Rapier).
+// Footer version string (v4.4 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -2402,7 +2428,7 @@ function updateDebugPanel(): void {
     `PANDORA ${VERSION_FOOTER} ?debug — FPS ${fpsEMA.toFixed(0)} · sim dt ${lastDt.toFixed(3)}s · rapier: on`,
     ...modelLines,
     `origin shift: ${worldGen.originShift.x.toFixed(0)}, ${worldGen.originShift.z.toFixed(0)} · gamepad: ${pcInput.gamepadName || 'none'} · tilt: ${tiltInput.isEnabled ? 'on' : 'off'}`,
-    `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · spawn ${cfg.spawn} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
+    `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · spawn ${lastSpawnLabel} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
     // Pass 8 (item 3): per-carrier live readout — y vs ground vs
     // look-ahead ground, alive/dying, pod HP. If a CARRIER DOWN toast
     // fires, this says which carrier and what its clearance was.
