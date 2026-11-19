@@ -123,7 +123,18 @@ const BET_STALL_NOSE_DROP_RATE = 0.3; // rad/s nose-down while stalled
  *  per m/s of vertical-speed error. 0.05 -> a 2 m/s sink commands
  *  +0.10 throttle (~1 m/s^2 of correction on the F-35A), firm
  *  enough to hold altitude without fighting the 0.55/s spool. */
+/** VTOL hover integral gain (pass 9, item 8): the P loop alone leaves
+ *  a steady-state sink (~20 fpm live, 335 ft -> 321 ft over 40 s) —
+ *  holding a constant vertical speed needs throttle slightly above
+ *  hoverThr, which a pure P loop only produces while an error
+ *  persists. The integral term accumulates the VS error and closes
+ *  that gap. Clamped to +/-0.05 throttle (the windup limit) and
+ *  reset whenever the hold is inactive, so it cannot carry a stale
+ *  offset into forward flight. 0.01/s per (m/s) of error: a 0.1 m/s
+ *  sink adds 0.001/s, reaching the ~0.005 needed in ~5 s. */
 const HOVER_VS_KP = 0.05;
+const HOVER_VS_KI = 0.01;
+const HOVER_VS_INT_MAX = 0.05;
 /** BET dying nose-drop rate, rad/s nose-down (probe-stall-respawn
  *  2b). The shared 0.15 rad/s dying bias (before the sync) is
  *  the dive driver; this extra is 0 — it is kept as a tuning
@@ -571,6 +582,10 @@ export class Aircraft {
    *  external `thrTarget` set) — the hover hold's climb/descent
    *  command. Never written by the auto-throttle itself. */
   pilotThr = 0;
+  /** VTOL hover integral accumulator (pass 9, item 8): the accumulated
+   *  vertical-speed error (m/s·s) for the hover altitude-hold's
+   *  integral term. Reset whenever the hold is inactive. */
+  hoverVsInt = 0;
   /** VTOL pad-landing credit flag (main.ts sets / clears it). */
   vtolCounted = false;
   /** Terrain height callback used by the 3-argument step overload.
@@ -1156,14 +1171,30 @@ export class Aircraft {
       // so reading it back would feed the auto-throttle's own output
       // into its command and oscillate (pass 6 diagnosis).
       const vsDes = clamp((this.pilotThr - hoverThr) * 30, -5, 3);
+      // Pass 9 (item 8): integral term. The P loop alone leaves a
+      // steady-state sink (~20 fpm live) because holding a constant
+      // VS needs throttle slightly above hoverThr, which a pure P
+      // loop only produces while an error persists. Accumulate the
+      // VS error (clamped against windup) and add it.
+      const vsErr = vsDes - this.vel.y;
+      this.hoverVsInt = clamp(
+        this.hoverVsInt + vsErr * dt * HOVER_VS_KI,
+        -HOVER_VS_INT_MAX,
+        HOVER_VS_INT_MAX,
+      );
       const autoThr = clamp(
-        hoverThr + (vsDes - this.vel.y) * HOVER_VS_KP,
+        hoverThr + vsErr * HOVER_VS_KP + this.hoverVsInt,
         0,
         1,
       );
       // Write the backing field directly: the thrTarget setter would
       // record the auto-throttle output as the pilot's command.
       this._thrTarget = autoThr;
+    } else {
+      // Hold inactive (forward flight, on the deck, dead, dying):
+      // drop the integral so a stale offset cannot carry into the
+      // next hover.
+      this.hoverVsInt = 0;
     }
     if (controls.flaps !== undefined) this.flaps = clamp(controls.flaps, 0, 30);
     if (controls.airbrake !== undefined) this.airbrake = clamp(controls.airbrake, 0, 1);
@@ -1174,7 +1205,15 @@ export class Aircraft {
       this.gear = controls.gear;
     }
     if (controls.hook !== undefined) this.hook = controls.hook;
-    this.brake = controls.brake ?? false;
+    // Brake: only overwrite when the controls carry it. The
+    // template-form step (main.ts and the probes) never passes brake
+    // — it is set directly on the field by the UI latch — so the old
+    // unconditional `controls.brake ?? false` reset it to false every
+    // step and the brake NEVER worked live (the button latched red
+    // but the jet kept rolling/sliding; pass 9, item 4). Flaps,
+    // airbrake, vector, gear and hook above are all conditional for
+    // the same reason; brake was the one exception.
+    if (controls.brake !== undefined) this.brake = controls.brake;
 
     // Throttle spool (v2, 0.55/s).
     this.throttle += clamp(

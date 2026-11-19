@@ -60,6 +60,10 @@ export class PandoraWorldGenerator {
   private readonly scene: THREE.Scene;
   private readonly world: RAPIER.World;
   private origin: FloatingOrigin | null = null;
+  /** True once the _originShift callback has been registered (see
+   *  registerWithFloatingOrigin) — the callback must be registered
+   *  exactly once, or _originShift double-counts every shift. */
+  private originCallbackRegistered = false;
 
   /** Scene-frame offset accumulator: scene coords + originShift =
    *  original-frame coords (v2 groundH). Kept in sync with the
@@ -90,7 +94,18 @@ export class PandoraWorldGenerator {
   constructor(scene: THREE.Scene, world: RAPIER.World, origin?: FloatingOrigin) {
     this.scene = scene;
     this.world = world;
-    if (origin) this.registerWithFloatingOrigin(origin);
+    // Store the origin link only — do NOT register here. The owner
+    // calls registerWithFloatingOrigin() once, after build(), when the
+    // terrain mesh / islands / clouds / flora / terrain body exist.
+    // Registering here AND after build() registered the _originShift
+    // callback twice, so _originShift grew at 2x cumulativeShift and
+    // every ground query (spawn clamp, terrain safety net, carrier
+    // terrain-following / death check, ?debug=1 readout) sampled the
+    // terrain a full shift away from the true position — the pass-9
+    // Alpha spawn death (net saw terrain 161.2 at Alpha), the carrier
+    // death (gnd 416 where the true terrain is 43), the Charlie
+    // airborne spawn and the Bravo dead-end spawn.
+    if (origin) this.origin = origin;
   }
 
   /**
@@ -630,10 +645,17 @@ export class PandoraWorldGenerator {
     for (const s of this.clouds) origin.registerObject(s);
     for (const m of this.floraMeshes) origin.registerObject(m);
     if (this.terrainBody) origin.registerBody(this.terrainBody);
-    origin.registerCallback((shift) => {
-      this._originShift.x += shift.x;
-      this._originShift.z += shift.z;
-    });
+    // Idempotent: the _originShift callback is registered only once, so
+    // calling this again (e.g. after a rebuild) cannot double-count the
+    // shift — that double-count was the pass-9 Alpha/carrier spawn
+    // deaths (originShift grew at 2x cumulativeShift).
+    if (!this.originCallbackRegistered) {
+      origin.registerCallback((shift) => {
+        this._originShift.x += shift.x;
+        this._originShift.z += shift.z;
+      });
+      this.originCallbackRegistered = true;
+    }
   }
 
   /**

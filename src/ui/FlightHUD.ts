@@ -96,6 +96,18 @@ export class FlightHUD {
     );
     set('hudG', ac.gload.toFixed(1));
     set('hudFuel', Math.round(ac.fuel * 100) + '%');
+    // ROTATE cue (BET §3): green, shown while the gear is on a surface
+    // and the jet is at/above its per-spec rotation speed. Pass 9
+    // (item 7): this toggle sits FIRST, before the damage chips and
+    // the warn section — it is the only thing that clears the cue, and
+    // in v4.3 it stayed ON while parked, dead, hovering and flying at
+    // 247 kt (a regression from v4.2, where it cleared after liftoff).
+    // The getter itself is correct (probe-rotate-cue) and the live
+    // stick was the double-shifted height query holding onSurface
+    // true while airborne; putting the toggle first means a throw in
+    // a later section can no longer freeze the cue ON either.
+    const rc = this.el['rotateCue'];
+    if (rc) rc.classList.toggle('show', ac.alive && ac.rotateCue);
     const fuelEl = this.el['hudFuel'];
     if (fuelEl?.parentElement) {
       fuelEl.parentElement.classList.toggle('warn', ac.fuel < 0.2);
@@ -206,11 +218,6 @@ export class FlightHUD {
         w.textContent = '';
       }
     }
-
-    // ROTATE cue (BET §3): green, shown while the gear is on a surface
-    // and the jet is at/above its per-spec rotation speed.
-    const rc = this.el['rotateCue'];
-    if (rc) rc.classList.toggle('show', ac.alive && ac.rotateCue);
 
     // Lock indicator.
     const li = this.el['lockInd'];
