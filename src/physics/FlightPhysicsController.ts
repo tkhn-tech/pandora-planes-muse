@@ -387,7 +387,17 @@ function countTris(root: THREE.Object3D): number {
 }
 
 /** Centre the loaded scene on its bbox centre and scale it to
- *  targetLen along Z (v2 normalizeAircraft verbatim). */
+ *  targetLen along Z (v2 normalizeAircraft verbatim), then align the
+ *  model's belly with the physics belly (-0.8 m).
+ *
+ *  Pass 10 (item 3): the bbox centre is NOT the CG — the tall tail
+ *  pushes it up — so a bbox-centred model sat 0.9–1.8 m too low: the
+ *  F-18/F-15E bellies were 0.35–0.41 m UNDERGROUND on their gear and
+ *  the physics gear feet (-2.2 m) were hidden inside the fuselage.
+ *  Shifting the belly onto the physics belly (-0.8 m) puts the gear
+ *  feet 1.4 m below it, exactly where the physics gear posts are.
+ *  Skipped for the Ford (targetLen 333 — a carrier hull, not an
+ *  airframe). */
 function normalizeAircraft(
   obj: THREE.Object3D,
   targetLen: number,
@@ -405,6 +415,11 @@ function normalizeAircraft(
   box.getCenter(ctr);
   inner.position.sub(ctr);
   const s = targetLen / Math.max(size.z, 0.01);
+  if (targetLen < 100) {
+    // Belly (bbox min.y, inner frame, pre-scale) onto -0.8 m:
+    // inner.position.y += -0.8/s - (box.min.y - ctr.y).
+    inner.position.y += -0.8 / s - (box.min.y - ctr.y);
+  }
   wrap.scale.setScalar(s);
   return { group: wrap, scale: s, size: size.clone().multiplyScalar(s) };
 }
@@ -625,6 +640,14 @@ export class Aircraft {
   airbrake = 0;
   vectorDeg = 0;
   gear = true;
+  /** Sim time until which a manual gear command (G key / gear button)
+   *  overrides the automatic gear — the auto logic resumes after it.
+   *  Pass 10, item 3. */
+  private gearManualUntil = 0;
+  /** Floor height under the aircraft this step (terrain or carrier
+   *  deck, whichever is higher) — set by the ground block, read by
+   *  autoGear() for AGL. Pass 10, item 3. */
+  floorY = 0;
   hook = false;
   brake = false;
   /** Sim seconds; spawn protection ends at spawnProtectedUntil. */
@@ -1234,6 +1257,7 @@ export class Aircraft {
         ? this.deck.deckHeightAt(this.pos.x, this.pos.z)
         : -Infinity;
     const floorY = Math.max(terrainH, deckY);
+    this.floorY = floorY;
     const isDeck = deckY > terrainH;
 
     const result = this.solver.solve({
@@ -2039,6 +2063,7 @@ export class Aircraft {
       }
     }
 
+    this.autoGear();
     this.updateRig(dt, controls);
   }
 
@@ -2054,6 +2079,50 @@ export class Aircraft {
     this.flareCd = 1.5;
     this.events.onFlares?.(this);
     return true;
+  }
+
+  /** Manual gear command (G key / gear button): sets the gear and
+   *  holds off the automatic gear for 8 s so the pilot's command
+   *  wins. Pass 10, item 3. */
+  setGearManual(v: boolean): void {
+    this.gear = v;
+    this.gearManualUntil = this.simTime + 8;
+  }
+
+  /** Clear a manual gear override (respawn) so the auto gear resumes. */
+  clearGearManual(): void {
+    this.gearManualUntil = 0;
+  }
+
+  /** Automatic gear (pass 10, item 3) — the gear follows flight
+   *  state, no pilot input needed:
+   *  - down on the ground / taxi / takeoff roll (onSurface);
+   *  - down in VTOL hover (F-35A lands vertically on it);
+   *  - stowing shortly after liftoff (AGL > 30 m and climbing, or
+   *    AGL > 100 m);
+   *  - deploying on approach (AGL < 120 m, < 130 kt, descending).
+   *  A manual command (setGearManual) overrides it for 8 s; a gear
+   *  jam (failGearJam) holds it down. Runs before updateRig so the
+   *  rig animates the new state in the same step. */
+  private autoGear(): void {
+    if (!this.alive || this.dying || this.failGearJam) return;
+    if (this.simTime < this.gearManualUntil) return;
+    const agl = this.pos.y - this.floorY;
+    if (this.onSurface) {
+      this.gear = true;
+      return;
+    }
+    if (this.spec.vtol && this.vectorDeg >= 70 && this.ias < 25) {
+      this.gear = true;
+      return;
+    }
+    if (this.gear && agl > 30 && (this.vel.y > 0 || agl > 100)) {
+      this.gear = false;
+      return;
+    }
+    if (!this.gear && agl < 120 && this.ias < 130 * 0.514444 && this.vel.y < 0) {
+      this.gear = true;
+    }
   }
 
   /** Animate bound control surfaces / rotors (v2 updateRig via the rig). */
@@ -2477,6 +2546,7 @@ export class Aircraft {
     this.airbrake = 0;
     this.vectorDeg = 0;
     this.gear = true;
+    this.gearManualUntil = 0;
     this.hook = false;
     this.brake = false;
     this.aoaDeg = 0;
