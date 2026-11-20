@@ -51,6 +51,7 @@ import { AircraftAIController } from './entities/AircraftAIController';
 import { SPECS } from './aircraft/AircraftSpec';
 import {
   buildCockpit,
+  cockpitCameraQuaternion,
   cockpitEyeFor,
   fixCanopyMaterials,
 } from './aircraft/CockpitBuilder';
@@ -76,7 +77,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.6 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.6.1 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -1669,7 +1670,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.6 · Vite + Rapier).
+// Footer version string (v4.6.1 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1802,13 +1803,18 @@ function updateCamera(dt: number): void {
   } else if (camMode === 1) {
     // Cockpit: per-jet eye from the GLB canopy bboxes (CockpitBuilder)
     // — the old fixed (fwd x5, up x2.2) floated 0.66 m above the
-    // F-22's canopy and the F-35A has no canopy at all.
+    // F-22's canopy and the F-35A has no canopy at all. The camera
+    // looks along the aircraft's forward: a three.js camera looks
+    // down its local -Z, so copying p.quat alone points it AFT and
+    // the v4.6 cockpit view showed the seat / headrest filling the
+    // frame (no panel, no HUD) — cockpitCameraQuaternion flips it
+    // 180° about Y so it looks forward.
     const eye = cockpitEyeFor(p.spec.modelKey);
     camera.position
       .copy(p.pos)
       .addScaledVector(fwd, eye.z)
       .addScaledVector(up, eye.y);
-    camera.quaternion.copy(p.quat);
+    camera.quaternion.copy(cockpitCameraQuaternion(p.quat));
   } else {
     const cx =
       p.pos.x + Math.sin(camOrbit.yaw) * Math.cos(camOrbit.pitch) * camDist;

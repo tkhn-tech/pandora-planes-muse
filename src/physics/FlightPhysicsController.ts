@@ -73,7 +73,7 @@ import {
   type AircraftSpec,
   type ModelKey,
 } from '../aircraft/AircraftSpec';
-import { AircraftRigBindings } from '../aircraft/AircraftRigBindings';
+import { AircraftRigBindings, separateIncludedGear } from '../aircraft/AircraftRigBindings';
 import { DamageableEntity } from '../combat/DamageableEntity';
 
 const D2R = Math.PI / 180;
@@ -401,11 +401,19 @@ function countTris(root: THREE.Object3D): number {
  *  Shifting the belly onto the physics belly (-0.8 m) puts the gear
  *  feet 1.4 m below it, exactly where the physics gear posts are.
  *  Skipped for the Ford (targetLen 333 — a carrier hull, not an
- *  airframe). */
+ *  airframe).
+ *
+ *  F-18 included gear (2026-11-20): the F-18 GLB's bbox min is its
+ *  included gear wheels, NOT its belly — aligning the bbox min put
+ *  the belly at +0.56 m and the wheels 1.4 m short of the deck.
+ *  `bellyAlign` (spec.bellyAlign) aligns the fuselage belly instead:
+ *  rawY (raw GLB frame) lands on targetY in the aircraft frame, so
+ *  the included wheels reach the physics gear feet. */
 function normalizeAircraft(
   obj: THREE.Object3D,
   targetLen: number,
   noseRotY: number,
+  bellyAlign?: { rawY: number; targetY: number },
 ): { group: THREE.Group; scale: number; size: THREE.Vector3 } {
   const inner = new THREE.Group();
   inner.add(obj);
@@ -422,7 +430,11 @@ function normalizeAircraft(
   if (targetLen < 100) {
     // Belly (bbox min.y, inner frame, pre-scale) onto -0.8 m:
     // inner.position.y += -0.8/s - (box.min.y - ctr.y).
-    inner.position.y += -0.8 / s - (box.min.y - ctr.y);
+    // With bellyAlign, the fuselage belly (rawY) lands on targetY
+    // instead — the bbox min may be the included gear wheels.
+    const alignY = bellyAlign?.rawY ?? box.min.y;
+    const target = bellyAlign?.targetY ?? -0.8;
+    inner.position.y += target / s - (alignY - ctr.y);
   }
   wrap.scale.setScalar(s);
   return { group: wrap, scale: s, size: size.clone().multiplyScalar(s) };
@@ -1068,8 +1080,18 @@ export class Aircraft {
             scene3,
             targetLen,
             NOSE_ROT_Y[this.modelKey],
+            this.spec.bellyAlign,
           );
           group = norm.group;
+          // F-18 included gear: separate the GLB's own gear from the
+          // airframe into named gear groups the rig binds and
+          // animates (Nicholas's repeated request, 2026-11-20). Runs
+          // on the template, before it is cached and cloned, so every
+          // aircraft gets it. The rig then skips its procedural legs
+          // for the bound slots — the F-18 shows ONLY its own gear.
+          if (this.spec.includedGear) {
+            separateIncludedGear(group, this.spec.includedGear);
+          }
         }
         template = { group, tris: countTris(group), failed: false };
         Aircraft.modelCache.set(this.modelKey, template);

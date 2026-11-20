@@ -15,7 +15,7 @@ import {
   controlYaw,
   type FlightControls,
 } from '../physics/IAerodynamicsSolver';
-import type { AircraftSpec } from './AircraftSpec';
+import type { AircraftSpec, IncludedGearStation } from './AircraftSpec';
 
 const D2R = Math.PI / 180;
 
@@ -142,6 +142,186 @@ function surfaceAbove(group: THREE.Group, x: number, z: number): number {
   return local.y * s;
 }
 
+/**
+ * Separate a GLB's own (baked-in) landing gear from its airframe mesh
+ * into named gear groups the rig can bind and animate.
+ *
+ * Why this exists (2026-11-20): Nicholas's F/A-18F GLB carries its
+ * own gear — nose twin wheels + 2 main wheels — baked into the
+ * "ground" airframe mesh (no separate gear nodes; the gear is short,
+ * its wheel bottoms 1.36 m above the physics gear feet). Pass 11
+ * claimed "no included gear exists", measured on the NORMALIZED
+ * model where normalizeAircraft had already aligned the wheel
+ * bottoms to -0.8 m, so of course nothing was below -0.8. The gear
+ * is real (see the purple circles in Nicholas's screenshot) and must
+ * be used instead of the procedural legs: the F-18 shows ONLY its
+ * own 3 gear legs. The other player GLBs were re-verified the same
+ * way (MeshoptDecoder, raw GLB, gear stations): F-22/F-15E carry
+ * only a flat "landingOff" belly fairing, the F-35A's lowest point
+ * is its belly — no included gear, procedural legs stay.
+ *
+ * How: the airframe mesh (largest by bbox volume) has its triangles
+ * split by centroid in the aircraft frame (after normalize): a
+ * triangle whose centroid is inside a station box and below its
+ * capY belongs to that gear. The gear triangles become new meshes
+ * named gear_front / gear_L / gear_R (matching RIG_PATTERNS, so the
+ * rig binds them and animates them with the existing gearDeploy
+ * factor); the remaining triangles stay on the airframe mesh. capY
+ * is the fuselage / wing underside at the station minus a 0.05 m
+ * safety margin, so no airframe triangle is ever cut into the gear —
+ * the gear strut is cut 0.05 m short of the airframe, an invisible
+ * gap in the fuselage's shadow.
+ *
+ * The gear geometry is baked into the group (aircraft) frame, so the
+ * rig's position.y slide (gearRetractLocal) moves it in aircraft
+ * metres. The airframe keeps its local-frame geometry and transform.
+ * Only position / normal / uv are carried over — the F-18's airframe
+ * has no other attributes. Returns per-slot triangle counts (0 for a
+ * station that matched nothing — a wrong station box, caught by
+ * probe-gear).
+ */
+export function separateIncludedGear(
+  group: THREE.Group,
+  stations: IncludedGearStation[],
+): {
+  separated: boolean;
+  gearTris: Partial<Record<'gear_front' | 'gear_L' | 'gear_R', number>>;
+  airframeTris: number;
+} {
+  group.updateWorldMatrix(true, true);
+  // Airframe = the largest mesh by bbox volume.
+  let airframe: THREE.Mesh | null = null;
+  let bestV = -1;
+  group.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh) return;
+    const bb = new THREE.Box3().setFromObject(m);
+    const sz = new THREE.Vector3();
+    bb.getSize(sz);
+    const v = sz.x * sz.y * sz.z;
+    if (v > bestV) {
+      bestV = v;
+      airframe = m;
+    }
+  });
+  if (!airframe) return { separated: false, gearTris: {}, airframeTris: 0 };
+  const geo = (airframe as THREE.Mesh).geometry as THREE.BufferGeometry;
+  const posAttr = geo.attributes.position as THREE.BufferAttribute | undefined;
+  if (!posAttr) return { separated: false, gearTris: {}, airframeTris: 0 };
+  // Relative matrix: airframe local -> group (aircraft) frame.
+  const rel = new THREE.Matrix4()
+    .copy(group.matrixWorld)
+    .invert()
+    .multiply((airframe as THREE.Mesh).matrixWorld);
+  const normalMat = new THREE.Matrix3().getNormalMatrix(rel);
+  const index = geo.index;
+  const triCount = index ? index.count / 3 : posAttr.count / 3;
+  const normAttr = geo.attributes.normal as THREE.BufferAttribute | undefined;
+  const uvAttr = geo.attributes.uv as THREE.BufferAttribute | undefined;
+  interface Bucket {
+    pos: number[];
+    norm: number[];
+    uv: number[];
+    hasUv: boolean;
+  }
+  const airBucket: Bucket = { pos: [], norm: [], uv: [], hasUv: false };
+  const gearBuckets = new Map<string, Bucket>();
+  for (const st of stations) {
+    gearBuckets.set(st.slot, { pos: [], norm: [], uv: [], hasUv: false });
+  }
+  const vLocal = new THREE.Vector3();
+  const vGroup = new THREE.Vector3();
+  const nLocal = new THREE.Vector3();
+  const nGroup = new THREE.Vector3();
+  const centroid = new THREE.Vector3();
+  const pushVert = (bucket: Bucket, vi: number, toGroup: boolean): void => {
+    vLocal.fromBufferAttribute(posAttr, vi);
+    if (toGroup) {
+      vGroup.copy(vLocal).applyMatrix4(rel);
+      bucket.pos.push(vGroup.x, vGroup.y, vGroup.z);
+    } else {
+      bucket.pos.push(vLocal.x, vLocal.y, vLocal.z);
+    }
+    if (normAttr) {
+      nLocal.fromBufferAttribute(normAttr, vi);
+      if (toGroup) {
+        nGroup.copy(nLocal).applyMatrix3(normalMat).normalize();
+        bucket.norm.push(nGroup.x, nGroup.y, nGroup.z);
+      } else {
+        bucket.norm.push(nLocal.x, nLocal.y, nLocal.z);
+      }
+    }
+    if (uvAttr) {
+      bucket.uv.push(uvAttr.getX(vi), uvAttr.getY(vi));
+      bucket.hasUv = true;
+    }
+  };
+  let airTris = 0;
+  const gearTris: Partial<Record<'gear_front' | 'gear_L' | 'gear_R', number>> = {};
+  for (let t = 0; t < triCount; t++) {
+    const vi = [0, 1, 2].map((k) => (index ? index.getX(t * 3 + k) : t * 3 + k));
+    // Centroid and max vertex height in the group (aircraft) frame.
+    // A triangle is gear only when its centroid is inside a station
+    // box AND all three vertices are below the cap — a large
+    // airframe triangle straddling the cap plane (its centroid below
+    // the cap but a vertex above it) must stay with the airframe,
+    // or the wing / fuselage gets a hole where the strut passes
+    // through (a probe ray through the gear_R station read the wing
+    // interior at +0.22 m instead of the underside at -1.20 m).
+    centroid.set(0, 0, 0);
+    let maxY = -Infinity;
+    for (const v of vi) {
+      vLocal.fromBufferAttribute(posAttr, v);
+      vGroup.copy(vLocal).applyMatrix4(rel);
+      centroid.add(vGroup);
+      maxY = Math.max(maxY, vGroup.y);
+    }
+    centroid.multiplyScalar(1 / 3);
+    let slot: IncludedGearStation | null = null;
+    for (const st of stations) {
+      if (
+        centroid.x >= st.x0 &&
+        centroid.x <= st.x1 &&
+        centroid.z >= st.z0 &&
+        centroid.z <= st.z1 &&
+        maxY < st.capY
+      ) {
+        slot = st;
+        break;
+      }
+    }
+    if (slot) {
+      const bucket = gearBuckets.get(slot.slot)!;
+      for (const v of vi) pushVert(bucket, v, true);
+      gearTris[slot.slot] = (gearTris[slot.slot] ?? 0) + 1;
+    } else {
+      for (const v of vi) pushVert(airBucket, v, false);
+      airTris++;
+    }
+  }
+  const buildGeo = (bucket: Bucket): THREE.BufferGeometry => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(bucket.pos, 3));
+    if (bucket.norm.length) {
+      g.setAttribute('normal', new THREE.Float32BufferAttribute(bucket.norm, 3));
+    }
+    if (bucket.hasUv && bucket.uv.length) {
+      g.setAttribute('uv', new THREE.Float32BufferAttribute(bucket.uv, 2));
+    }
+    return g;
+  };
+  (airframe as THREE.Mesh).geometry = buildGeo(airBucket);
+  for (const st of stations) {
+    const bucket = gearBuckets.get(st.slot)!;
+    if (!bucket.pos.length) continue;
+    const mesh = new THREE.Mesh(buildGeo(bucket), (airframe as THREE.Mesh).material);
+    mesh.name = st.slot;
+    mesh.castShadow = false;
+    group.add(mesh);
+  }
+  return { separated: true, gearTris, airframeTris: airTris };
+}
+
 /** One procedural gear leg: a strut from just inside the belly down to
  *  a wheel whose foot sits at GEAR_FOOT_Y (-2.2 m, the physics gear
  *  height). The leg is a Group at (x, 0, z) in the model frame; its
@@ -226,20 +406,19 @@ export class AircraftRigBindings {
       if (node) this.bound[slot] = node;
       else this.missing.push(slot);
     }
-    // Procedural landing gear (pass 10): NO player GLB has gear
-    // meshes — verified 2026-11-20 by loading the raw GLBs with no
-    // rig involved (fa18: 4 named meshes, f22: 3, f35a: 2, f15e: 3 —
-    // Weapon_pack/Canopy/ground/helmet002 etc., none below the belly
-    // at -0.8 m and none unnamed; the F-22/F-15E "landingOff" meshes
-    // are flat belly gear-door fairings, the gear-UP configuration,
-    // and stay visible as the belly panel). The 9 "unnamed gear
-    // meshes" in the pass-11 brief were the pass-10 procedural legs'
-    // own children (strut 40 tris / wheel 72 tris / hub 40 tris),
-    // measured by a diagnostic that ran AFTER the rig built them —
-    // there is no included gear to bind, so the gear stays
-    // procedural: strut + wheel x3 at the physics gear-post stations.
-    // A GLB that did have named gear meshes keeps them instead (they
-    // are bound above).
+    // Procedural landing gear (pass 10): for jets whose GLB has no
+    // gear meshes, the gear is procedural (strut + wheel x3, built
+    // here at the physics gear-post stations). The F-18 is the
+    // exception — its GLB carries its own gear, separated into
+    // gear_front / gear_L / gear_R by separateIncludedGear() in
+    // attachModel, which the pattern bind above already bound, so
+    // the loop below skips those slots (`if (this.bound[slot])
+    // continue`) and the F-18 shows ONLY its own gear. The F-22 /
+    // F-15E "landingOff" meshes are flat belly gear-door fairings,
+    // the gear-UP configuration, and stay visible as the belly
+    // panel; the F-35A's lowest point is its belly. A GLB that did
+    // have named gear meshes keeps them instead (they are bound
+    // above).
     //
     // Pass 11: the strut tops used to stop at bellyY + 0.25 (-0.55 m),
     // but the airframe surface at the posts sits HIGHER than the
@@ -257,10 +436,39 @@ export class AircraftRigBindings {
       ['gear_L', -GEAR_MAIN_X, -0.15 * spec.length, 0.35],
       ['gear_R', GEAR_MAIN_X, -0.15 * spec.length, 0.35],
     ];
-    // Belly (lowest fuselage point), measured before the gear is
-    // attached. normalizeAircraft aligns it to the physics belly
-    // (-0.8 m).
-    this.bellyY = new THREE.Box3().setFromObject(group).min.y;
+    // Belly (lowest fuselage point). normalizeAircraft aligns it to
+    // the physics belly (-0.8 m) — or to spec.bellyAlign.targetY for
+    // the F-18, whose airframe carries appendages below the fuselage
+    // belly (a centreline ventral feature at -1.63 m, stores at
+    // -1.45 m), so the bbox min is NOT the belly there. Excludes any
+    // separated GLB gear groups (their wheels reach the physics
+    // feet, -2.2 m) and any procedural legs, so the belly stays the
+    // airframe's lowest point on the other jets.
+    if (spec.bellyAlign) {
+      this.bellyY = spec.bellyAlign.targetY;
+    } else {
+      group.updateWorldMatrix(true, true);
+      const bb = new THREE.Box3();
+      let any = false;
+      group.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh) return;
+        let p: THREE.Object3D | null = o;
+        while (p) {
+          if (
+            p.name === 'gear_front' ||
+            p.name === 'gear_L' ||
+            p.name === 'gear_R' ||
+            p.name.startsWith('gear_leg_')
+          )
+            return;
+          p = p.parent;
+        }
+        bb.expandByObject(m);
+        any = true;
+      });
+      this.bellyY = any ? bb.min.y : new THREE.Box3().setFromObject(group).min.y;
+    }
     // The model group may carry a normalize scale (uniform): a leg
     // built in spec-metre units and parented under it would be
     // scaled and displaced (MiG-29: x4.6 — its legs used to float
