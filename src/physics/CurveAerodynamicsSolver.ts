@@ -65,12 +65,14 @@
 //
 // Differences vs the template's two scalars (flagged, deliberate):
 //   * wingDmg was one scalar, so asymmetric roll was always same-signed.
-//     Here asym roll uses (wingL − wingR): symmetric damage flies
-//     straight, one-sided damage rolls toward the dead side. Authority
-//     loss still uses the average.
+//     Here asym roll uses (wingR − wingL): symmetric damage flies
+//     straight, one-sided damage rolls toward the dead side — the
+//     physical left wing is +X, so a dead left wing (wingL) must roll
+//     the jet LEFT (negative roll rate), which (wingR − wingL) gives.
+//     Authority loss still uses the average.
 //   * engineDmg was one scalar. Here thrust uses the L/R average and the
-//     single-engine-out yaw uses (engineR − engineL): a dead left engine
-//     yaws left, toward the dead engine.
+//     single-engine-out yaw uses (engineL − engineR): a dead left engine
+//     yaws left, toward the dead engine (positive yawRate = nose left).
 
 import * as THREE from 'three';
 import {
@@ -137,10 +139,12 @@ const ROTOR_TRANSLIFT = 0.3; // translational lift gain, v/40 clamped 0..1
 const ROTOR_DRAG = 0.05; // extra CD term for the rotor disc
 const ROTOR_THRUST_EFF = 0.15; // forward thrust fraction for a heli
 /** Adverse yaw: yaw rate per unit roll rate, scaled by the induced-drag
- *  share of total drag (BET §4, k_adv ≈ 0.15). Sign: in this codebase
- *  rollRate > 0 = rolling LEFT (bank left), and adverse yaw yaws the
- *  nose AWAY from the turn — rolling left, the nose yaws right
- *  (positive yawRate) — so the term is +sign(rollRate)·k·|rollRate|. */
+ *  share of total drag (BET §4, k_adv ≈ 0.15). Sign: rollRate > 0 =
+ *  rolling RIGHT (Euler YXZ z > 0; the right wing is -X), and adverse
+ *  yaw yaws the nose AWAY from the turn — rolling right, the nose yaws
+ *  LEFT (positive yawRate: +ω.y swings the nose toward +X, the left
+ *  wing) — so the term is +sign(rollRate)·k·|rollRate|. Pass 11: the
+ *  old comment had rollRate > 0 as rolling left; the code was right. */
 const ADV_YAW_K = 0.15;
 /** Weathercock: yaw rate per radian of sideslip β, driving β → 0
  *  (BET §1 — the curve-model stand-in for Cn_β). */
@@ -357,7 +361,23 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
       .add(up.clone().multiplyScalar(Math.sin(vec)));
     thrustVec.addScaledVector(thrustDir, thrustEff);
     if (v > 1) {
-      liftVec.addScaledVector(up, lift);
+      // LIFT DIRECTION (pass 11): perpendicular to the airflow, NOT
+      // the body-up axis. The body-up axis sits sin(AoA) aft of the
+      // perpendicular to the flight path, so applying the lift along
+      // it put a spurious L·sin(AoA) component backward along the
+      // flight path — ~20% of the lift at a 12 deg turn AoA, more
+      // than the thrust — which capped every sustained turn ~25%
+      // below the §0 band and bled speed in any high-AoA manoeuvre.
+      // The magnitude is unchanged (q·S·CL); only the direction is
+      // corrected: the component of body-up perpendicular to vAir.
+      // Rotary keeps body-up (rotor thrust is along the mast).
+      let liftDir = up;
+      if (state.archetype !== 'rotary') {
+        const vHat = vAir.clone().normalize();
+        const perp = up.clone().addScaledVector(vHat, -up.dot(vHat));
+        if (perp.lengthSq() > 0.01) liftDir = perp.normalize();
+      }
+      liftVec.addScaledVector(liftDir, lift);
       dragVec.addScaledVector(vAir.clone().normalize(), -drag);
     }
 
@@ -433,7 +453,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
       yawIn,
       pitchIn,
       rollIn,
-      dmg.wingL - dmg.wingR,
+      dmg.wingR - dmg.wingL,
     );
     if (this.spinModel.spin > 0.01) {
       // v2's lateral drift force, kept as a force on the drag vector.
@@ -444,13 +464,17 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     // Coordinated yaw (BET §1): ω = g·tan φ/V from the ACTUAL bank
     // and true airspeed — the nose follows the lift-tilted velocity
     // vector. φ is the bank from the quaternion (Euler YXZ z; positive
-    // = left bank, so the coordinated yaw is negative — nose left).
+    // = right bank, so the coordinated yaw is negative — nose right).
     // Capped at the sustained-turn envelope (drag = thrust at this
     // speed/altitude), so the jet cannot coordinate a turn it cannot
     // sustain.
     const bank = new THREE.Euler().setFromQuaternion(quat, 'YXZ').z;
     let coordYaw = 0;
     if (v > 5) {
+      // Pass 11: cap the CL at this aircraft's peak — the old
+      // default 1.6 overstated the envelope for the F-15E (1.10)
+      // and the F-22 (1.40), letting the coordinated yaw (and the
+      // AI bank command) demand turns the wing cannot hold.
       const omegaMax = sustainedTurnRate(
         v,
         rho,
@@ -458,13 +482,15 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
         S_lift,
         inducedK,
         m,
+        curve.peak,
       );
       coordYaw = clamp((-G * Math.tan(bank)) / v, -omegaMax, omegaMax);
     }
     // Weathercock (BET §1): Cn_β drives the nose toward β = 0.
-    // SIGN: β > 0 means the velocity is to the RIGHT of the nose
-    // (vBody.x > 0, body +X = right), so the tail pushes the nose
-    // RIGHT (positive yawRate) to align — the term is +WEATHERCOCK·β.
+    // SIGN: β > 0 means the velocity is to the LEFT of the nose
+    // (vBody.x > 0, body +X = the LEFT wing), so the tail pushes the
+    // nose LEFT (positive yawRate) to align — the term is
+    // +WEATHERCOCK·β. Pass 11: the old comment said right/right.
     // A − sign here is positive feedback: it yaws the nose AWAY from
     // the velocity, the sideslip grows, the drag spikes, and the jet
     // bleeds speed and departs in a hard turn (the 60 deg coordinated
@@ -476,7 +502,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     // Adverse yaw (BET §4): while rolling, the nose yaws AWAY from
     // the turn, scaled by the induced-drag share of total drag —
     // unless the pilot holds rudder into the turn. (rollRate > 0 =
-    // rolling left; adverse yaw is nose right = positive yawRate.)
+    // rolling right; adverse yaw is nose left = positive yawRate.)
     const inducedShare =
       cdEff > 0.001
         ? (inducedK * cl * cl) / cdEff
@@ -493,7 +519,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
       (1 - rudderIntoTurn);
     // Single-engine-out yaw: toward the dead engine (v2 failEngineSide).
     const engineSide =
-      fail.engineSide ?? clamp(dmg.engineR - dmg.engineL, -1, 1);
+      fail.engineSide ?? clamp(dmg.engineL - dmg.engineR, -1, 1);
     const yawRate =
       (yawIn * YAW_RATE_DEG * D2R +
         engineSide * ENGINE_OUT_YAW_DEG * D2R) *
@@ -503,7 +529,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
       adverseYaw +
       spinStep.yawRate;
     // Wing damage: asymmetric roll (per-side in this port).
-    const asymRoll = (dmg.wingL - dmg.wingR) * ASYM_ROLL * qAuth;
+    const asymRoll = (dmg.wingR - dmg.wingL) * ASYM_ROLL * qAuth;
 
     // Hover auto-level (Issue 2): in a deep hover (vector >= 70 deg,
     // slow) the lift-fan FCS holds the jet level — a gentle PD on bank
@@ -511,7 +537,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     // stick in hover is ~33 deg/s against a 17 deg/s max correction).
     // Without this a hovered jet drifts off level and the pilot has no
     // stable reference; with it the hover holds attitude hands-off.
-    // Euler YXZ x > 0 = nose down, z > 0 = left bank; the correction
+    // Euler YXZ x > 0 = nose down, z > 0 = right bank; the correction
     // is the opposite sign on both axes. Switches off above 25 m/s,
     // so the transition to forward flight is the pilot's.
     if (hoverBlend > 0.5 && v < 25) {

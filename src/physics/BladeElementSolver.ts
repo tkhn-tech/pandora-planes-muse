@@ -246,6 +246,14 @@ export function buildStations(spec: AircraftSpec): Station[] {
   const stations: Station[] = [];
   const meanChord = S / span;
   const rootChord = meanChord / 0.7; // taper 1.0 → 0.4, mean 0.7
+  // Pass 11: the wing stations sum to wingArea, but the lift
+  // reference is wingAreaEffective when set (MiG-29: the blended
+  // fuselage + LERX generate ~40% of the lift, so the curve solver
+  // lifts on 45 m² while BET's wing stations summed to 38 — BET
+  // under-lifted the MiG-29 by ~8% at level AoA and ~19% at the
+  // peak, and it sank out of a stall test without ever flagging).
+  // Scale the wing-station areas so they sum to the lift area.
+  const wingAreaScale = (spec.wingAreaEffective ?? S) / S;
 
   // Wing: 8 per half, chord tapering root → tip, AC slightly aft of
   // the CG for a swept wing. Ailerons on the outer half (i ≥ 4).
@@ -269,7 +277,7 @@ export function buildStations(spec: AircraftSpec): Station[] {
       stations.push({
         kind: 'wing',
         r: new THREE.Vector3(side * (span / 2) * t, -0.3, -0.03 * L),
-        area: chord * (span / 16),
+        area: chord * (span / 16) * wingAreaScale,
         chord,
         side,
         control: i >= 4 ? 'aileron' : 'none',
@@ -613,7 +621,14 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     const totalMoment = new THREE.Vector3(); // body frame
     const vLocal = new THREE.Vector3();
     const omegaCrossR = new THREE.Vector3();
-    let liftSum = 0; // total lift (along body-up), N
+    let liftSum = 0; // total lift (body-up component), N — the
+    // calibrated magnitude (q·S·CL); see the force application
+    // below for why the DIRECTION is not the body-up axis.
+    // Summed station lift VECTOR, body frame (0, y, z): the
+    // station lifts are perpendicular to their local airflow, so
+    // their sum is the true lift direction — perpendicular to the
+    // airflow, tilted forward of the body-up axis by the AoA.
+    const liftVecBody = new THREE.Vector3();
 
     for (const st of this.stations) {
       if (st.kind === 'engine' || st.kind === 'liftfan' || st.kind === 'rollpost') {
@@ -630,8 +645,9 @@ export class BladeElementSolver implements IAerodynamicsSolver {
         // Fin: side force from the sideslip β, plus rudder.
         // M = r × F with F = (Fx, 0, 0): M_y = z·Fx, M_z = −y·Fx.
         // SIGN (weathercock — issue 6 root cause): β > 0 means the
-        // velocity is to the RIGHT of the nose (vBody.x > 0), so the
-        // tail must push the nose RIGHT (positive M_y) to align.
+        // velocity is to the LEFT of the nose (vBody.x > 0, +X is the
+        // LEFT wing), so the tail must push the nose LEFT (positive
+        // M_y: +ω.y swings the nose toward +X) to align.
         // M_y = r.z·Fx with r.z < 0 (tail), so Fx must be NEGATIVE
         // for β > 0: cSide = −4·β. The old +4·β was positive
         // feedback — it yawed the nose AWAY from the velocity, the
@@ -639,9 +655,11 @@ export class BladeElementSolver implements IAerodynamicsSolver {
         // the drag spiked, the jet bled 400 → 41 kt and tumbled to
         // AoA ~180° in every hard turn. (The curve solver had the
         // same sign error and was fixed there; BET's fin never was.)
-        // The rudder term is unchanged: yawIn > 0 (right rudder) →
-        // rudDeflect < 0 → cSide decreases → Fx negative → nose
-        // right, which matches the curve solver.
+        // The rudder term is unchanged: yawIn > 0 (LEFT rudder — both
+        // solvers map +yawIn to nose left) → rudDeflect < 0 → cSide
+        // decreases → Fx negative → nose LEFT, which matches the
+        // curve solver. Pass 11: the old comment said β > 0 was
+        // velocity-right and the nose goes right; the code was right.
         const betaLocal = Math.atan2(vLocal.x, vLocal.z);
         let cSide = clamp(-4.0 * betaLocal, -1.2, 1.2);
         if (st.control === 'rudder') cSide += CL_DELTA * rudDeflect;
@@ -658,7 +676,11 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       // damaged → less lift → rolling moment, no special cases).
       let dmgScale = 1;
       if (st.kind === 'wing') {
-        dmgScale = 1 - (st.side < 0 ? dmg.wingL : dmg.wingR) * 0.8;
+        // st.side < 0 is the RIGHT wing (-X), so it scales by
+        // wingR; the left wing (+X) by wingL. Pass 11: was swapped
+        // (it read wingL for the right wing) and only worked because
+        // the hit-zone anchors were mirrored the same way.
+        dmgScale = 1 - (st.side < 0 ? dmg.wingR : dmg.wingL) * 0.8;
       } else if (st.kind === 'tail') {
         dmgScale = 1 - dmg.tail * 0.7;
       }
@@ -685,8 +707,12 @@ export class BladeElementSolver implements IAerodynamicsSolver {
         cl = clamp(2.0 * alpha * D2R, -0.8, 0.8) * st.clScale;
       }
       if (st.control === 'aileron') {
-        // Differential aileron: rollIn > 0 (bank left) → left wing
-        // Cl down, right wing Cl up.
+        // Differential aileron: rollIn > 0 (bank RIGHT) → right
+        // wing Cl down, left wing Cl up (the right wing is -X, so
+        // st.side < 0 is the right wing). Pass 11: the old comment
+        // said "rollIn > 0 (bank left)" and had the wings swapped —
+        // that wrong ground truth is why pass 1 concluded the roll
+        // was "already correct" while every input path was inverted.
         cl += CL_DELTA * ailDeflect * (st.side < 0 ? -1 : 1);
       }
       cl *= dmgScale;
@@ -705,6 +731,13 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       totalMoment.y += st.r.z * 0 - st.r.x * (dL * lz);
       totalMoment.z += st.r.x * (dL * ly) - st.r.y * 0;
       liftSum += dL * Math.max(0, ly);
+      // The vector sum keeps the forward (body-z) component the
+      // scalar drops — same ly > 0 guard as liftSum, so a
+      // reversed-flow station contributes to neither.
+      if (ly > 0) {
+        liftVecBody.y += dL * ly;
+        liftVecBody.z += dL * lz;
+      }
     }
 
     // --- Thrust forces + moments ---
@@ -746,8 +779,8 @@ export class BladeElementSolver implements IAerodynamicsSolver {
         const t = isVtolFan
           ? thrustEff * (1 - fanShare)
           : st.side < 0
-            ? engL
-            : engR;
+            ? engR
+            : engL;
         addThrust(st.r, thrustDirBody, t);
       } else if (st.kind === 'liftfan') {
         addThrust(st.r, thrustDirBody, thrustEff * fanShare);
@@ -814,7 +847,28 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     const liftVec = new THREE.Vector3();
     const dragVec = new THREE.Vector3();
     if (v > 1) {
-      liftVec.addScaledVector(up, lift);
+      // LIFT DIRECTION (pass 11): the summed station lift vector,
+      // NOT the body-up axis. The stations' lifts are perpendicular
+      // to their local airflow, so their sum is the true lift
+      // direction — tilted FORWARD of body-up by the AoA. Applying
+      // the lift along body-up put a spurious L·sin(AoA) component
+      // BACKWARD along the flight path (the body-up axis is sin(AoA)
+      // aft of the perpendicular to the airflow): at the sustained-
+      // turn AoA (~12°) that is ~20% of the lift — ~190 kN on the
+      // F-18, more than the thrust — so no jet could hold its §0
+      // sustained turn rate (measured 13-17 deg/s vs the §0 16-21),
+      // every hard turn bled 20-40 kt, and a 150 kt turn bled into
+      // the stall flag. The magnitude is unchanged (liftSum, the
+      // calibrated q·S·CL); only the direction is corrected, so the
+      // whole lift now acts perpendicular to the flight path and the
+      // only backward force is the drag, as the §0 calibration
+      // assumes. Rotary keeps body-up (rotor thrust is along the
+      // mast); a degenerate sum (hover, v ≈ 0) falls back to it.
+      let liftDir = up;
+      if (state.archetype !== 'rotary' && liftVecBody.lengthSq() > 1) {
+        liftDir = liftVecBody.clone().normalize().applyQuaternion(quat);
+      }
+      liftVec.addScaledVector(liftDir, lift);
       dragVec.addScaledVector(vAir.clone().normalize(), -drag);
     }
     // Thrust (world frame): the body-frame thrust direction rotated
@@ -856,7 +910,7 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       yawIn,
       pitchIn,
       rollIn,
-      state.dying ? 0 : dmg.wingL - dmg.wingR,
+      state.dying ? 0 : dmg.wingR - dmg.wingL,
     );
     const inertia = inertias(m, span, length);
     // Only when the spin is actually developed — otherwise this PD
@@ -942,7 +996,7 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // stable reference and drifted off level. Same PD as the curve
     // solver — in a deep hover (vector >= 70 deg, slow) the lift-fan
     // FCS holds the jet level, capped so the pilot can overpower it.
-    // Euler YXZ x > 0 = nose down, z > 0 = left bank; the correction
+    // Euler YXZ x > 0 = nose down, z > 0 = right bank; the correction
     // is the opposite sign on both axes. Switches off above 25 m/s,
     // so the transition to forward flight is the pilot's.
     // PITCH YIELDS TO THE PILOT (probe-vtol 3b): the pitch

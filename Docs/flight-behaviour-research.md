@@ -2,6 +2,39 @@
 
 Source: research agent, 17 Nov 2026. Read-only; mapped to `src/physics/CurveAerodynamicsSolver.ts`, `FlightPhysicsController.ts`, `IAerodynamicsSolver.ts`, `AircraftSpec.ts`, `PCFlightInput.ts`, `AircraftAIController.ts`, `main.ts`. Assumes the parallel takeoff-defect fixes (1.3 m/s² acceleration, pitch-up, spawn crash) are repaired first.
 
+## Pass 11 addendum (20 Nov 2026) — audit + physics fix
+
+An audit of the implementation against this report's numbers found one
+implementation bug that dwarfed every spec error, plus four spec errors
+(full detail in `flight-behaviour-per-model.md`, pass-11 addendum).
+
+**Lift applied along the body-up axis (both solvers) — the bug.** Both
+`BladeElementSolver` and `CurveAerodynamicsSolver` applied lift along the
+body-up axis. The body-up axis sits sin(AoA) aft of the perpendicular to
+the flight path, so the lift carried a spurious L·sin(AoA) backward
+component — ~20% of the lift at a 12° turn AoA, more than the thrust.
+Measured proof (F-18, 400 kt, 82° bank): solver drag 107–123 kN vs
+193 kN thrust, yet the jet decelerated at 4–6 m/s². Consequence: sustained
+turns measured 13–17°/s against this report's §0 values of 16–21°/s, every
+hard turn bled 20–40 kt, and a 150 kt turn bled into the stall flag (the
+live F-22 report). Fixed in pass 11: lift is now perpendicular to the
+airflow (BET: the summed station-lift vector; curve solver: the component
+of body-up perpendicular to vAir). Magnitude unchanged. **Measured after
+the fix** (`scripts/probe-stall-speeds.ts`, all green): sustained turns
+F-18 16.6, F-35A 16.0, F-22 18.9, F-15E 20.9, MiG-29 19.9, Su-34 14.1°/s
+at 400 kt SL vs §0 19.0, 16.4, 20.0, 21.0, 21.2, 16.1°/s — the §0 method
+is validated, with the remaining 1–2.5°/s shortfall being the BET trim
+download the §0 formula does not count. Stall speeds now measure F-18 130,
+F-35A 134, F-22 120, F-15E 144, MiG-29 125, Su-34 139 kt.
+
+**Spec corrections (pass 11):** F-18 Vr 126 → 140 kt (was below its own
+stall speed); F-22 CLmax 1.75 → 1.40, Vs 54 → 60 m/s (clean Vs is
+classified — best estimates 108–130 kt); F-15E CLmax 1.36 → 1.10,
+Vs 62 → 72 m/s (real CLmax ≈ 1.1, no LE flaps); MiG-29 CL peak 1.58 →
+1.35 on the 45 m² effective area, Vs 59 → 64 m/s. Su-34 mass kept at
+30,000 kg (roster combat mass; real normal takeoff weight 39,000 kg).
+`sustainedTurnRate` now takes each model's own CLmax instead of a flat 1.6.
+
 ## 0. Headline calibration — do first
 
 Current code: `CD_INDUCED = 0.06` hardcoded for every aircraft. Too low: jet sustains turns it cannot sustain and barely bleeds speed at max pull.
@@ -46,7 +79,7 @@ Current code vs fix (`CurveAerodynamicsSolver.ts` `solve()`):
 Real numbers: F/A-18E: rotate ~154 kt at MTOW, nose 10–12.5°, flight-path vector 3–5°; legacy Hornet: hold stick just aft of neutral, nose 6–8°, main gear lifts ~173 kt at 35,000 lb. F-22 (USAF AIB, NAS Fallon): rotation 136–143 KCAS, takeoff 163–164 KCAS. F-15E: takeoff 140–180 kt. F-35A: approach ~155 kt at 40,000 lb; rotation ~15–20 kt slower than the F-35C's, i.e. ~150 kt. Climb-out: 5° nose-up accelerating to 350 kt to 10,000 ft; max-performance climb 28–32° nose-up, 44,600 ft/min initial (Super Hornet, afterburner).
 
 Current code vs fix:
-- `FlightPhysicsController.ts` `stepInternal()`: rotation gate is `sp > stallSpeed·0.85 && pitchIn < −0.25` — for the F-18 that is 53 m/s ≈ 102 kt, well below the real ~126 kt at this weight (154 kt scaled by √(20,242/30,000)). Raise the gate to `sp > stallSpeed·0.95` and, more importantly, make liftoff emerge from lift > weight rather than from a flag. Pitch authority: `PITCH_RATE_DEG = 55` is a plausible *maximum*, but at rotation the pilot needs ~10–15°/s, not 55 — the rate should be q-scheduled and stick-shaped (see §4 sensitivity), otherwise rotation is a twitch. Add per-spec `rotateSpeedKt` to `AircraftSpec` (F-18 126, F-22 140, F-15E 160, F-35A 150 at the sim's masses) and show "ROTATE" on the HUD at Vr.
+- `FlightPhysicsController.ts` `stepInternal()`: rotation gate is `sp > stallSpeed·0.85 && pitchIn < −0.25` — for the F-18 that is 53 m/s ≈ 102 kt, well below the real ~126 kt at this weight (154 kt scaled by √(20,242/30,000)). Raise the gate to `sp > stallSpeed·0.95` and, more importantly, make liftoff emerge from lift > weight rather than from a flag. Pitch authority: `PITCH_RATE_DEG = 55` is a plausible *maximum*, but at rotation the pilot needs ~10–15°/s, not 55 — the rate should be q-scheduled and stick-shaped (see §4 sensitivity), otherwise rotation is a twitch. Add per-spec `rotateSpeedKt` to `AircraftSpec` (F-18 140, F-22 140, F-15E 150, F-35A 150 at the sim's masses) and show "ROTATE" on the HUD at Vr. Pass 11: the F-18's old 126 kt Vr was *below* its 128 kt stall speed — a deck liftoff at ~130 kt dropped at −2114 fpm; 140 kt is the corrected value.
 - Climb: no climb-attitude guidance; the HUD could show the 10° climb cue. Minor.
 
 ## 4. Adverse yaw, roll/yaw coupling, rudder, bombing run

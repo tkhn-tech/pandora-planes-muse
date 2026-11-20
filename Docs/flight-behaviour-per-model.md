@@ -19,20 +19,94 @@ altitude it was computed at, so the builder can reproduce it. Where a number
 is published, the source is named; where it is an estimate or disputed, it is
 flagged **[EST]** or **[DISPUTED]**.
 
-## ⚠️ Read first: the sim's masses are inconsistent
+## Pass 11 addendum (20 Nov 2026) — flight-characteristics audit
 
-`AircraftSpec.ts` mixes conventions. F/A-18F (20,242 kg) and MiG-29
-(15,000 kg) use realistic combat masses; F-35A (14,500 kg), F-22
-(19,700 kg), F-15E (14,300 kg) and Su-34 (22,000 kg) use near-*empty*
-masses. The result: the F-22 flies at T/W 1.61 and the F-15E at 1.84, while
-the F/A-18F flies at 0.99 — the roster is unbalanced by construction, and
-no `turn` multiplier can fix it honestly. **Recommendation: adopt combat
-masses for all six** (F-18 20,242 kg, F-35A 18,270 kg, F-22 24,883 kg,
-F-15E 20,400 kg, MiG-29 15,300 kg, Su-34 30,000 kg). If masses change,
-re-derive stall speeds (V_stall = √(2W/(ρ·S·CLmax))) and rotation gates
-from the table in §7 — the values there are given at combat mass. The
-Su-34 thrust error (§6) is the one hard bug in this file: fix it regardless
-of the mass decision.
+The numbers in §1–§7 were the research starting point; pass 11 audited them
+against the implementation and corrected four of them in `AircraftSpec.ts`
+(plus one implementation bug that dwarfed all four). Measured verification
+is in `scripts/probe-stall-speeds.ts` (all checks green, 20 Nov 2026).
+
+**The implementation bug — lift applied along the body-up axis (both
+solvers).** `BladeElementSolver` and `CurveAerodynamicsSolver` both applied
+the lift force along the body-up axis. The body-up axis sits sin(AoA) aft
+of the perpendicular to the flight path, so the lift carried a spurious
+L·sin(AoA) component *backward* along the flight path — ~20% of the lift
+at a 12° turn AoA (~190 kN on the F-18, more than its thrust). Measured
+proof (F-18, 400 kt, 82° bank, AoA 12°): the solver's own drag was
+107–123 kN against 193 kN of thrust, yet the jet decelerated at 4–6 m/s² —
+the missing ~150 kN was the lift's backward component. Consequence: no jet
+could hold its §0 sustained turn rate (measured 13–17°/s vs the §0 16–21°/s),
+every hard turn bled 20–40 kt, and a 150 kt turn bled into the stall flag
+(the live F-22 report). Fix: the lift is now applied perpendicular to the
+airflow — in BET, the summed station-lift vector (the stations already
+compute lift perpendicular to their local airflow); in the curve solver,
+the component of body-up perpendicular to vAir. Magnitude unchanged
+(the calibrated q·S·CL). After the fix the sustained rates measure
+F-18 16.6, F-35A 16.0, F-22 18.9, F-15E 20.9, MiG-29 19.9, Su-34 14.1°/s
+at 400 kt SL, against §0 expectations 19.0, 16.4, 20.0, 21.0, 21.2,
+16.1°/s (all within ±3°/s; the remaining 1–2.5°/s shortfall is the BET
+trim download — the tail must download ~100 kN to trim 7 g, which the
+§0 formula does not count).
+
+**Spec corrections (all in `AircraftSpec.ts`):**
+- F/A-18F: `rotateSpeedKt` 126 → **140**. The old Vr was *below* the
+  128 kt stall speed (CL needed at Vr 1.66 > CLmax 1.6) — the cause of
+  the live F-18 deck drop at −2114 fpm after a ~130 kt liftoff.
+- F-22: CL peak **1.75 → 1.40**, linearEndCL 1.35 → 1.20, floor
+  1.0 → 0.85, `stallSpeed` 54 → **60 m/s (117 kt)**. Clean Vs is
+  classified/unpublished; the best estimates are 108–130 kt (Simple
+  Flying / boltflight), implying CLmax ~1.15–1.35 — the modelled 105 kt /
+  CLmax 1.75 was ~20 kt too low and uncorroborated.
+- F-15E: CL peak **1.36 → 1.10**, linearEndCL 1.30 → 1.05,
+  `stallSpeed` 62 → **72 m/s (141 kt)**. The old CL 1.36 predicted
+  Vs 127 kt, not the spec's own 120 kt; the real CLmax ≈ 1.1 (no
+  leading-edge flaps). Thrust 258 kN is the F100-PW-229 only (the -220
+  is 211 kN total).
+- MiG-29: CL peak **1.58 → 1.35 on the 45 m² effective area**
+  (≡ 1.60 on the 38 m² wing area), linearEndCL 1.35 → 1.15,
+  `stallSpeed` 59 → **64 m/s (124 kt)**. The old 1.58 was quoted on the
+  wing area, so it predicted Vs 124 kt while the spec said 115 kt.
+  BET now also scales the wing-station areas to the effective area
+  (`buildStations`), so BET lifts on 45 m² like the curve solver —
+  before, BET under-lifted the MiG-29 by ~8% at level AoA and ~19% at
+  the peak, and it sank out of a stall test without ever flagging.
+- Su-34: mass **kept at 30,000 kg** — the roster convention is combat
+  mass (like the F-22's 24,883 kg vs its 38,000 kg MTOW). Real normal
+  takeoff weight is 39,000 kg (MTOW 45,100 kg; aerospaceweb.org), at
+  which the same CLmax gives Vs ~157 kt.
+- `sustainedTurnRate` no longer defaults CLmax to 1.6 for every
+  aircraft: the curve solver's coordinated-yaw cap and the AI bank
+  command now pass each model's own `clCurve.peak` (and the AI uses
+  the lift area for the MiG-29), so the F-15E (1.10) and F-22 (1.40)
+  are no longer credited with an envelope they cannot hold.
+
+**Measured verification (probe-stall-speeds, BET, live paths, 20 Nov 2026):**
+stall speeds F-18 130, F-35A 134, F-22 120, F-15E 144, MiG-29 125,
+Su-34 139 kt (bands Vs ±8 kt); level flight at 150 kt: no stall flag on
+any jet (the F-22 report is closed — it was the lift-direction bug plus
+the too-low modelled Vs, not the stall trigger); takeoff liftoffs
+F-18 168, F-35A 180, F-22 160, F-15E 181, MiG-29 161, Su-34 162 kt in
+331–481 m; F-22 at 29% throttle does NOT lift off below Vr (runs off
+the end at 119–125 kt). F-35A sustained rate ~16–17°/s SL (the task's
+~19°/s E-M claim is the top of a 16–19°/s band, not a single value).
+
+**Could not be sourced authoritatively:** clean stall speed for any
+aircraft except the F/A-18E/F 129 kt power-off (Wikipedia, citing
+NATOPS/SAC); landing-config stall speeds; CLmax values (only F-15 ~1.1,
+F-16 ~1.6, Su-27 1.85 @ 24°, MiG-29 ~1.5); rotation speeds (pilot
+accounts / Eurocontrol V2/Vat only); F-35A MTOW conflict (29,900 kg
+RAAF vs 70,000 lb class / 31,750 kg USAF).
+
+## ⚠️ Read first: the sim's masses — fixed to combat weights
+
+`AircraftSpec.ts` formerly mixed conventions (F-35A, F-22, F-15E, Su-34
+near empty). That is fixed: all six now use combat masses (F-18 20,242 kg,
+F-35A 18,270 kg, F-22 24,883 kg, F-15E 20,400 kg, MiG-29 15,300 kg,
+Su-34 30,000 kg). The Su-34's 30,000 kg is the roster combat mass; the
+real normal takeoff weight is 39,000 kg (MTOW 45,100 kg) — at 39 t the
+same CLmax gives Vs ~157 kt (see §6). If masses change, re-derive stall
+speeds (V_stall = √(2W/(ρ·S·CLmax))) and rotation gates from the table
+in §7 — the values there are given at combat mass.
 
 ---
 
@@ -45,10 +119,13 @@ of the mass decision.
   (**196 kN total, sim ✓**). T/W 0.99 at combat mass.
 - **Stall / AoA:** wing section stalls ~15°; LEX vortex lift keeps the
   aircraft flying to a 35° lift limit, controllable to 50°; NATOPS AoA limit
-  25° (A–D). Stall speed ~66 m/s at combat mass (sim 62, close — the sim
-  effectively uses CLmax ≈ 1.8).
-- **Rotation / takeoff:** rotate 126 kt at 20,242 kg (154 kt at MTOW);
+  25° (A–D). Stall speed ~66 m/s at combat mass (sim 66 ✓, CLmax 1.6);
+  power-off stall 129 kt published (Wikipedia, citing NATOPS/SAC).
+- **Rotation / takeoff:** rotate **140 kt** at 20,242 kg (154 kt at MTOW);
   main gear lifts ~173 kt at 35,000 lb. Climb-out 5° nose-up to 350 kt.
+  Pass 11: the old 126 kt Vr was *below* the 128 kt stall speed — a deck
+  liftoff at ~130 kt dropped at −2114 fpm, because it lifted off below a
+  flyable speed.
 - **Turn rates (GAO NSIAD-96-98, fighter-escort config):** STR **19.2°/s SL**,
   **12.3°/s at 15,000 ft**; ITR **24.7°/s**; best rate speed ~430 KCAS;
   bleed at max pull **~54 kt/s** at SL.
@@ -59,8 +136,11 @@ of the mass decision.
   CL = 1.6 − 0.05·(α−35), floor 0.8. CD_sep = 0.35·max(0,(α−20)/15)².
 - **BET layout:** 39 stations — wing 16, tailplane 8, fin 4, LEX 8,
   fuselage 1, engines 2 (main report §5).
-- **Sim status:** correct as-is. `turn: 1.0` is the reference the other
-  multipliers are measured against.
+- **Sim status:** correct as-is except the Vr fix above (126 → 140 kt,
+  pass 11). `turn: 1.0` is the reference the other
+  multipliers are measured against. Measured (pass 11, probe-stall-speeds):
+  stall 130 kt, sustained turn 16.6°/s at 400 kt SL (§0: 19.0), liftoff
+  168 kt in 451 m.
 
 ## 2. F-35A VTOL (player) — a fictional hybrid: read the caveat
 
@@ -148,10 +228,9 @@ numbers are F-35A; hover numbers are F-35B.
 
 ## 3. F-22 Raptor (player)
 
-- **Mass:** empty **19,700 kg (sim mass = empty)**; **combat ~24,883 kg**
+- **Mass:** empty **19,700 kg**; **combat ~24,883 kg (sim mass ✓)**
   (defense-issues comparison; ~29 t "typical operating" per the xiaobrook
   simulator's published-figures table); MTOW 38,000 kg.
-  **Recommend 24,883 kg.**
 - **Geometry:** S = 78.0 m², span 13.56 m, **AR = 2.36**, LE sweep **42°**,
   diamond wing + prominent chines + LERX, twin canted fins, e ≈ 0.85
   (blended body + diamond planform), **k = 0.159**.
@@ -169,8 +248,11 @@ numbers are F-35A; hover numbers are F-35B.
   control**; Herbst manoeuvre (J-turn), Pugachev's Cobra and Kulbit
   demonstrated. **Max usable AoA 60°+** — the highest in the game, and
   the only one where high AoA is a weapon rather than an emergency.
-  Stall speed at combat mass (CLmax 1.75): **~54 m/s** (sim 65 is too
-  high — it was set for the light mass with a low CLmax).
+  Stall speed at combat mass (CLmax 1.40): **~60 m/s (117 kt)**.
+  Pass 11: the old CLmax 1.75 / Vs 54 m/s (105 kt) was uncorroborated —
+  clean Vs is classified/unpublished, and the best estimates are
+  108–130 kt (Simple Flying; boltflight), implying CLmax ~1.15–1.35.
+  The modelled 105 kt was ~20 kt too low.
 - **Rotation / takeoff:** rotation **136–143 KCAS**, takeoff **163–164
   KCAS** (USAF AIB, NAS Fallon). Approach 141–155 kt (sources disagree;
   use ~145 kt). Takeoff run ~480 m.
@@ -189,8 +271,10 @@ numbers are F-35A; hover numbers are F-35B.
   or with a lower thrust-lapse exponent — so the honest band is 11–13°/s,
   still only a small advantage over the F-15's 12.1°/s, as the
   "2–3°/s advantage" framing expects).
-  ITR: **~28–31°/s** (CLmax 2.0 with TVC at ~300 kt SL, 8.6 g — inside
-  the 9.5 g limit). One airshow-measured data point supports the SL
+  ITR: **~23°/s wing-only** (CLmax 1.40 at ~300 kt SL, 6.5 g);
+  **~28°/s with TVC assist [EST]** (the nozzles add lift/moment past
+  the wing's peak — the old "~28–31°/s (CLmax 2.0 with TVC)" assumed
+  a wing CLmax of 2.0, which no source supports). One airshow-measured data point supports the SL
   sustained figure: a full 360° in ~17.2 s = **20.9°/s average**.
   Best rate speed ~400–440 KCAS. Minimum turn radius quoted ~229 m (750 ft)
   at very low speed — a corner-speed curiosity, not a sustained figure.
@@ -208,13 +292,14 @@ numbers are F-35A; hover numbers are F-35B.
   airspeed-independent at low speed — unlike every other jet here, the
   F-22 keeps pitch authority at ~0 kt). Yaw at high AoA is TVC-assisted;
   the jet is famously departure-resistant.
-- **CL curve (differs from the Hornet):** linear to 15° (CL 1.35);
-  15–35°: CL = 1.35 + 0.020·(α−15), peak **1.75 at 35°**; 35–60°:
-  CL = 1.75 − 0.015·(α−35) (**1.38 at 60°**), floor 1.0. The high
+- **CL curve (differs from the Hornet):** linear to 15° (CL 1.20);
+  15–35°: CL = 1.20 + 0.010·(α−15), peak **1.40 at 35°**; 35–60°:
+  CL = 1.40 − 0.015·(α−35) (**1.03 at 60°**), floor 0.85. The high
   post-35° floor is the diamond wing + chines + LERX vortex system, and
   it is what lets the jet fly at 60° AoA. CD_sep = 0.30·max(0,(α−20)/15)².
   TVC lift is NOT in this curve — it is a thrust force at the nozzle
-  station (see BET layout).
+  station (see BET layout). Pass 11: peak was 1.75 (uncorroborated) —
+  see the stall note above.
 - **BET layout: 43 stations** — wing 16, tailplane 8 (all-moving
   stabilators), **twin canted fins 8 (4 each)**, **LERX/chine 8** (the
   F-22's chines are a major vortex source — do not omit them), fuselage 1,
@@ -223,32 +308,37 @@ numbers are F-35A; hover numbers are F-35B.
   contribute a direct pitch moment even at zero airspeed — this is what
   makes post-stall manoeuvres possible in the model, and it falls out of
   the geometry with no special cases.
-- **Sim fixes:** mass 19,700 → **24,883 kg**; `turn: 1.15` → **1.05**
+- **Sim fixes:** mass 19,700 → **24,883 kg** (done); `turn: 1.15` → **1.05**
   (sustained rate ≈ Hornet's; the 1.15 belongs to instantaneous only —
   if the solver separates STR/ITR, give the F-22 an ITR bonus instead);
-  `rollDeg: 180` → **200 [EST]**; `stallSpeed: 65` → **54–58 m/s**;
+  `rollDeg: 180` → **200 [EST]**; `stallSpeed: 65` → **60 m/s** (pass 11:
+  the old 54 m/s was ~20 kt too low, CLmax 1.75 uncorroborated);
   `rotateSpeedKt` (new field): **140**. Add a `tvcDeg: 20` field for the
-  nozzle model.
+  nozzle model. Measured (pass 11): stall 120 kt, sustained turn
+  18.9°/s at 400 kt SL (§0: 20.0), liftoff 160 kt in 331 m; no stall
+  flag in level flight at 150 kt.
 
 ## 4. F-15E Strike Eagle (player)
 
-- **Mass:** empty 14,379 kg **(sim mass 14,300 = empty)**; **combat
-  ~20,400 kg clean** (heavier with CFTs/stores, up to 36,700 kg MTOW).
-  **Recommend 20,400 kg.**
+- **Mass:** empty 14,379 kg; **combat ~20,400 kg clean (sim mass ✓)**
+  (heavier with CFTs/stores, up to 36,700 kg MTOW).
 - **Geometry:** S = 56.5 m², span 13.05 m, **AR = 3.01**, LE sweep **45°**,
   e ≈ 0.8, **k = 0.132**. No LEX — the F-15's wing root has only small
   fairings, and the wide flat fuselage is itself a lifting body. Airfoil
   NACA 64A006.6 root / 64A203 tip. Twin fins, all-moving stabilators.
 - **Thrust:** 2× F100-PW-229, dry **79 kN each (158 total)**, AB **129 kN
   each (258 total, sim ✓)**. T/W: **1.84 at sim mass (absurd),
-  1.29 at combat mass clean**. Rate of climb 50,000 ft/min.
+  1.29 at combat mass clean**. Rate of climb 50,000 ft/min. Note the
+  258 kN is the -229 only — the older F100-PW-220 is 211 kN total
+  (pass 11).
 - **Stall / AoA:** **max usable AoA ~30°** — and the F-15 is the least
   forgiving jet here past it: no LEX vortex lift, so the stall break is
   sharp and the jet departs in yaw/roll above ~30° (the Eagle will spin
   if mishandled at high AoA, unlike the departure-resistant Hornet).
-  Stall speed at combat mass (CLmax 1.36): **~65 m/s** (sim 62 ✓).
-  The 1984 flight manual quotes level-flight stall "over 100 knots" at
-  light weight.
+  Stall speed at combat mass (CLmax 1.10): **~72 m/s (141 kt)**.
+  Pass 11: the old CLmax 1.36 predicted Vs 127 kt, not the spec's own
+  120 kt — and the real CLmax ≈ 1.1 (no leading-edge flaps). The 1984
+  flight manual quotes level-flight stall "over 100 knots" at light weight.
 - **Rotation / takeoff:** takeoff **140–180 kt** (Lakenheath footage:
   roar-to-liftoff under 13 s). Rotation **~150 kt** at combat weight;
   the main report's 160 kt was calibrated to the light sim mass — do not
@@ -273,20 +363,26 @@ numbers are F-35A; hover numbers are F-35B.
   good (twin fins + large rudders); the jet is honest and predictable,
   with no FCS tricks — what the pilot commands is what happens.
 - **CL curve (differs sharply from the Hornet):** linear to 14°
-  (CL 1.30); 14–25°: CL = 1.30 + 0.005·(α−14), peak **1.36 at 25°**;
-  above 25°: CL = 1.36 − 0.06·(α−25), floor 0.7. The steep post-stall
+  (CL 1.05); 14–25°: CL = 1.05 + 0.005·(α−14), peak **1.10 at 25°**;
+  above 25°: CL = 1.10 − 0.06·(α−25), floor 0.7. The steep post-stall
   drop is the point: no vortex lift to save the wing, so the stall break
   must feel like a break. CD_sep = 0.40·max(0,(α−20)/15)² — the
-  sharpest drag rise in the roster.
+  sharpest drag rise in the roster. Pass 11: peak was 1.36 (internally
+  inconsistent — it predicted Vs 127 kt against the spec's 120 kt).
 - **BET layout: 36 stations** — wing 16, tailplane 8 (all-moving
   stabilators — large, the F-15's primary pitch control), **twin fins 8
   (4 each)**, **fuselage 2** (the flat fuselage is a lifting body: give
   the fuselage stations real area and lift, unlike the Hornet's
   drag-only fuselage station), engines 2. No LEX stations.
-- **Sim fixes:** mass 14,300 → **20,400 kg**; `turn: 0.95` → **1.0**
+- **Sim fixes:** mass 14,300 → **20,400 kg** (done); `turn: 0.95` → **1.0**
   (clean STR ≈ Hornet's; the 0.95 belongs to the strike-loaded config);
-  `rollDeg: 140` → **180 [EST]**; `stallSpeed: 62` keep; `rotateSpeedKt`
-  (new field): **150**.
+  `rollDeg: 140` → **180 [EST]**; `stallSpeed: 62` → **72 m/s**
+  (pass 11: CLmax 1.36 → 1.10, Vs 127 kt was internally inconsistent);
+  `rotateSpeedKt` (new field): **150**. Measured (pass 11): stall
+  144 kt, sustained turn 20.9°/s at 400 kt SL (§0: 21.0), liftoff
+  181 kt in 396 m. The CLmax correction does not change the 400 kt
+  sustained rate (thrust-limited there, not CL-limited) — it changes
+  Vs and the low-speed turn.
 
 ## 5. MiG-29 Fulcrum (enemy)
 
@@ -308,7 +404,11 @@ numbers are F-35A; hover numbers are F-35B.
   spin and recovers as soon as controls are released. The Pugachev Cobra
   (~110° AoA) is a *dynamic* manoeuvre, not sustained flight — do not
   model it as a flyable regime. Stall speed at combat mass (effective
-  S 45 m², CLmax 1.58): **~59 m/s** (sim 60 ✓).
+  S 45 m², CLmax 1.35): **~64 m/s (124 kt)**. Pass 11: the old CLmax
+  1.58 was quoted on the 38 m² wing area (≡ 1.35 on the 45 m² effective
+  area), so it predicted Vs 124 kt while the spec said 115 kt. Real
+  clean Vs ~125–135 kt; landing speed 124 kt, Vat/V2 140 kt
+  (Eurocontrol).
 - **Rotation / takeoff:** takeoff speed **260 km/h (140 kt)**; rotation
   **~130 kt**; takeoff run only **250–260 m** at normal weight (short
   field + FOD doors in the intakes); landing speed 235 km/h (127 kt),
@@ -340,11 +440,12 @@ numbers are F-35A; hover numbers are F-35B.
   ~38–41°/s. At high AoA the roll response can drop to near zero or
   slightly negative (adverse yaw) — the pilot points the nose with the
   rudder at low speed, which the manual explicitly notes.
-- **CL curve:** linear to 15° (CL 1.35); 15–30°: CL = 1.35 + 0.015·(α−15),
-  peak **1.58 at 30°**; 30–45°: CL = 1.58 − 0.020·(α−30) (1.28 at 45°),
-  floor 0.9. CD_sep = 0.30·max(0,(α−20)/15)². If the builder keeps
-  S = 38 m² in the spec, raise CLmax to ~1.8 to reproduce the published
-  turn rates; if it uses effective S = 45 m², the curve above is correct.
+- **CL curve:** linear to 15° (CL 1.15); 15–30°: CL = 1.15 + 0.013·(α−15),
+  peak **1.35 at 30°**; 30–45°: CL = 1.35 − 0.020·(α−30) (1.05 at 45°),
+  floor 0.9. CD_sep = 0.30·max(0,(α−20)/15)². The curve is quoted on
+  the 45 m² effective area; on the 38 m² wing area the peak is 1.60.
+  Pass 11: the old peak 1.58 was the wing-area figure used on the
+  effective area — see the stall note above.
 - **BET layout: 43 stations** — wing 16, **LERX 8 (4 per side, 73.5°
   sweep — the largest vortex source in the game after the Hornet's)**,
   tailplane 8 (all-moving), **twin canted fins 8 (4 each)**, fuselage 1
@@ -355,14 +456,20 @@ numbers are F-35A; hover numbers are F-35B.
 - **Sim fixes:** mass 15,000 keep; `turn: 1.0` → **1.1** (STR 21 vs
   Hornet 19); `rollDeg: 155` keep (max) **but add the airspeed roll cap**
   (105°/s at Mach 0.4, <60°/s high-speed/low, 40°/s supersonic, 20°/s
-  near stall); `stallSpeed: 60` keep; `rotateSpeedKt` (new field): **130**.
-  Consider `wingAreaEffective: 45` for lift vs `wingArea: 38` for drag.
+  near stall); `stallSpeed: 60` → **64 m/s** (pass 11: CL peak 1.58 →
+  1.35 on the effective area); `rotateSpeedKt` (new field): **130**.
+  Consider `wingAreaEffective: 45` for lift vs `wingArea: 38` for drag
+  (done — and BET now scales the wing stations to it, pass 11).
+  Measured (pass 11): stall 125 kt, sustained turn 19.9°/s at 400 kt
+  SL (§0: 21.2), liftoff 161 kt in 375 m.
 
 ## 6. Su-34 Fullback (enemy)
 
-- **Mass:** empty 22,500 kg **(sim mass 22,000 ≈ empty)**; gross 39,000 kg;
-  MTOW 45,100 kg; **typical combat ~30,000 kg. Recommend 30,000 kg.**
+- **Mass:** empty 22,500 kg; gross 39,000 kg;
+  MTOW 45,100 kg; **typical combat ~30,000 kg (sim mass ✓)**.
   The heaviest fighter in the game by a wide margin, and it must feel it.
+  Pass 11: the roster uses the 30,000 kg combat mass; at the real normal
+  takeoff weight of 39,000 kg the same CLmax gives Vs ~157 kt.
 - **Geometry:** S = 62.04 m², span 14.7 m, **AR = 3.49**, LE sweep **42°**
   (Su-27 family), e ≈ 0.8, **k = 0.114**. **Canards** (front horizontal
   tail) + conventional all-moving tailplane + twin fins — a **three-surface
@@ -379,7 +486,7 @@ numbers are F-35A; hover numbers are F-35B.
   it is currently fought against a crippled opponent.
 - **Stall / AoA:** **max usable AoA ~30° [EST]** (Su-27 family limit;
   no public Su-34 E-M diagram exists). Stall speed at 30,000 kg
-  (CLmax 1.53): **~71 m/s** (sim 65 is correct only at the empty mass).
+  (CLmax 1.53): **~71 m/s (sim 71 ✓)**.
   Landing speed 250 km/h (135 kt).
 - **Rotation / takeoff:** takeoff distance 850–1,260 m; rotation
   **~140 kt [EST]**, takeoff **~150 kt [EST]** at typical combat weight.
@@ -413,11 +520,14 @@ numbers are F-35A; hover numbers are F-35B.
   pitch trim is shared between canard and tailplane, so a canard
   failure must degrade pitch authority and change the trim point —
   this falls out of the station model if both surfaces are modelled.
-- **Sim fixes (do these):** `thrustMax: 166,000` → **264,000 N**
-  (critical); mass 22,000 → **30,000 kg**; `turn: 0.85` keep
+- **Sim fixes (done):** `thrustMax: 166,000` → **264,000 N**
+  (critical — was 63% of real thrust);
+  mass 22,000 → **30,000 kg**; `turn: 0.85` keep
   (STR 15 vs Hornet 19 ≈ 0.8); `rollDeg: 120` keep; `maxG: 7` keep;
   `stallSpeed: 65` → **71 m/s** at combat mass; `rotateSpeedKt`
-  (new field): **140 [EST]**.
+  (new field): **140 [EST]**. Measured (pass 11): stall 139 kt,
+  sustained turn 14.1°/s at 400 kt SL (§0: 16.1), liftoff 162 kt
+  in 471 m.
 
 ---
 
@@ -430,11 +540,11 @@ after implementing.
 
 | Model | Combat mass (kg) | k = 1/(π·e·AR) | CLmax (peak AoA) | Stall (m/s) | Rotate (kt) | STR SL | STR 15–20k ft | ITR | Bleed at max pull (kt/s) | rollDeg (sim → rec.) | turn mult. (sim → rec.) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| F/A-18F | 20,242 | 0.100 | 1.60 @ 35° | 66 | 126 | 19.2°/s | 12.3°/s | 24.7°/s | ~54 | 150 → 150 | 1.00 → 1.00 |
+| F/A-18F | 20,242 | 0.100 | 1.60 @ 35° | 66 | 140 | 19.2°/s | 12.3°/s | 24.7°/s | ~54 | 150 → 150 | 1.00 → 1.00 |
 | F-35A VTOL | 18,270 | 0.149 | 1.50 @ 30° | 68 | 150 | ~16°/s | ~11°/s | ~21°/s | ~26 | 160 → 160 | 1.05 → 0.90 |
-| F-22 | 24,883 | 0.159 | 1.75 @ 35° | 54 | 140 | ~19–20°/s | ~11–13°/s | ~28–31°/s | ~60–70 | 180 → 200 | 1.15 → 1.05 |
-| F-15E | 20,400 | 0.132 | 1.36 @ 25° | 65 | 150 | ~19–20°/s | ~11°/s | ~24°/s | ~8–10 | 140 → 180 | 0.95 → 1.00 |
-| MiG-29 | 15,300 | 0.110 | 1.58 @ 30° | 59 | 130 | ~21°/s | ~13°/s [EST] | ~26–28°/s | ~15–22 | 155 → 155 | 1.00 → 1.10 |
+| F-22 | 24,883 | 0.159 | 1.40 @ 35° | 60 | 140 | ~19–20°/s | ~11–13°/s | ~23°/s (+TVC ~28 [EST]) | ~60–70 | 180 → 200 | 1.15 → 1.05 |
+| F-15E | 20,400 | 0.132 | 1.10 @ 25° | 72 | 150 | ~19–20°/s | ~11°/s | ~24°/s | ~8–10 | 140 → 180 | 0.95 → 1.00 |
+| MiG-29 | 15,300 | 0.110 | 1.35 @ 30° (45 m² eff) | 64 | 130 | ~21°/s | ~13°/s [EST] | ~26–28°/s | ~15–22 | 155 → 155 | 1.00 → 1.10 |
 | Su-34 | 30,000 | 0.114 | 1.53 @ 30° | 71 | 140 [EST] | ~14–16°/s [EST] | ~9–10°/s [EST] | ~19–20°/s [EST] | ~13–16 | 120 → 120 | 0.85 → 0.85 |
 
 Thrust (dry / AB, total) for the same table: F-18 124 / 196 kN; F-35A
@@ -449,26 +559,34 @@ LEX/chine/canard/fin counts and the F-35A's lift-fan station.)
 ## 8. Spec changes the builder should make (checklist)
 
 1. **Su-34 `thrustMax`: 166,000 → 264,000 N** (hard bug — the jet is
-   currently at 63% of real thrust).
+   currently at 63% of real thrust). **Done.**
 2. **Masses to combat weights:** F-35A 14,500 → 18,270 kg; F-22 19,700 →
    24,883 kg; F-15E 14,300 → 20,400 kg; Su-34 22,000 → 30,000 kg.
    F-18 and MiG-29 masses are already combat weights — leave them.
+   **Done.**
 3. **New `AircraftSpec` fields** (main report §0/§3): `inducedK` and `e`
    per model (table §7); `rotateSpeedKt` per model (table §7);
    `tvcDeg: 20` for the F-22; `wingAreaEffective` for the MiG-29
    (45 m² lift vs 38 m² drag) or equivalently CLmax 1.8 on 38 m².
+   **Done** (the MiG-29 uses `wingAreaEffective: 45` with CL peak 1.35 —
+   the "CLmax 1.8 on 38 m²" alternative is withdrawn, pass 11: 1.58 on
+   38 m² ≡ 1.35 on 45 m²).
 4. **Turn multipliers:** F-35A 1.05 → 0.90; F-22 1.15 → 1.05;
    F-15E 0.95 → 1.00; MiG-29 1.00 → 1.10; F-18 1.00 and Su-34 0.85 stay.
+   **Done** (F-35A 0.9, F-22 1.05, F-15E 1.0, MiG-29 1.1 in the spec).
 5. **Roll rates:** F-22 180 → 200°/s [EST]; F-15E 140 → 180°/s [EST];
    others stay. **MiG-29: add an airspeed roll cap** (105°/s at Mach 0.4,
    <60°/s high-speed/low, 40°/s supersonic, 20°/s near stall) — the
-   current q-scaling gets the top end backwards.
-6. **Stall speeds at combat mass:** F-35A 60 → 68; F-22 65 → 54–58;
-   Su-34 65 → 71; F-18 62 → 66 (optional, close); F-15E 62 and MiG-29 60
-   stay.
+   current q-scaling gets the top end backwards. **Done**
+   (`rollCapSchedule` in the spec).
+6. **Stall speeds at combat mass (pass 11 corrections):** F-35A 60 → 68
+   (done); F-22 65 → **60** (was 54 in the first draft — CLmax 1.75
+   uncorroborated, Vs ~117 kt); F-15E 62 → **72** (CLmax 1.36 → 1.10);
+   MiG-29 60 → **64** (CL peak 1.58 → 1.35 on the effective area);
+   Su-34 65 → **71** (done); F-18 62 → 66 (done).
 7. **Per-model CL curves** (§1–§6) replace the single shared curve in
    `CurveAerodynamicsSolver.ts` — the F-15E's sharp stall and the F-22's
-   60° floor cannot come from one curve.
+   60° floor cannot come from one curve. **Done.**
 8. **F-35A hover:** two thrust stations (fan + nozzle), not one vectored
    nozzle — pitch by differential fan/nozzle thrust, roll by roll-post
    stations. Hover at 94% throttle at combat mass is correct; do not
@@ -476,6 +594,15 @@ LEX/chine/canard/fin counts and the F-35A's lift-fan station.)
 9. **F-35A `carrier: true`** is fictional (real A-model: no tailhook;
    B-model: STOVL, 7 g; C-model: carrier). Keep it — it is the user's
    designation — but do not cite it as a real capability.
+10. **Pass 11 (20 Nov 2026):** F-18 Vr 126 → **140 kt** (was below its
+    own stall speed); lift direction fixed in both solvers (lift
+    perpendicular to the airflow, not along body-up — the phantom
+    L·sin(AoA) backward force capped every sustained turn ~25% low);
+    BET wing stations scaled to the MiG-29's effective area;
+    `sustainedTurnRate` takes each model's own CLmax (was a flat 1.6);
+    verification probe `scripts/probe-stall-speeds.ts` — all checks
+    green (stall speeds, 150 kt level flight, takeoff rolls, sustained
+    turns).
 
 ## 9. Downloads needed
 

@@ -8,12 +8,28 @@
 //   have a flat "landingOff" belly fairing — the gear-UP config), so
 //   the gear is procedural (strut + wheel x3, built by
 //   AircraftRigBindings at the physics gear-post stations).
+//   Re-verified 2026-11-20 on the RAW GLBs with no rig involved:
+//   fa18 4 named meshes, f22 3, f35a 2, f15e 3, none below the belly
+//   and none unnamed — there is no included gear. (A pass-11 brief
+//   claimed 9 unnamed included-gear meshes per jet; those were the
+//   procedural legs' own children, measured after the rig built
+//   them. The gear stays procedural.)
 // - The visual models were mounted too low: normalizeAircraft centred
 //   them on the bbox centre, but the tall tail pushes that centre up,
 //   so the F-18/F-15E bellies sat 0.35–0.41 m UNDERGROUND on their
 //   gear and the physics gear feet (-2.2 m) were hidden inside the
 //   fuselage. The model is now shifted so its belly lands on the
 //   physics belly (-0.8 m) and the gear feet sit 1.4 m below it.
+//
+// Pass 11: the strut tops used to stop at bellyY + 0.25 (-0.55 m),
+// but the airframe surface at the posts is HIGHER than the belly
+// plane (F-15E mains -0.08 m / nose +0.17 m, F-18 mains +1.62 m),
+// so the struts visibly floated below the jet — Nicholas's F-15E
+// "gears disconnected from the jet" report. Each strut top is now
+// raycast to the lowest airframe surface above its station (+0.10 m
+// overlap), per jet per station; this probe asserts that contact,
+// that the three procedural legs are the ONLY gear (no duplicates),
+// and that the wheels sit at the physics feet (-2.2 m).
 //
 // Per jet, through the LIVE spawn/takeoff/landing path (variable dt,
 // live wind): gear down + visible on the runway, stowed after climbing
@@ -275,13 +291,102 @@ async function main(): Promise<void> {
       ac.modelStatus === 'ok',
       `modelStatus=${ac.modelStatus} error=${ac.modelError ?? 'none'} tris=${ac.modelTris}`,
     );
+    const rig = ac.rig!;
+
+    // --- Static geometry, model frame (before resetAt moves the
+    // aircraft): the gear is procedural, so assert the three legs
+    // are the ONLY gear, their wheels sit at the physics feet, and
+    // their strut tops reach the airframe surface at each station.
+    {
+      const model = ac.model!;
+      model.updateMatrixWorld(true);
+      const allMeshes: THREE.Mesh[] = [];
+      model.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) allMeshes.push(o as THREE.Mesh);
+      });
+      const legGroups: THREE.Object3D[] = [];
+      model.traverse((o) => {
+        if (o.name.startsWith('gear_leg_')) legGroups.push(o);
+      });
+      check(
+        `${key}: exactly three procedural gear legs`,
+        legGroups.length === 3,
+        `found ${legGroups.length}: ${legGroups.map((g) => g.name).join(', ')}`,
+      );
+      const underLeg = (m: THREE.Object3D): boolean => {
+        let p: THREE.Object3D | null = m.parent;
+        while (p) {
+          if (p.name.startsWith('gear_leg_')) return true;
+          p = p.parent;
+        }
+        return false;
+      };
+      const stray = allMeshes.filter((m) => {
+        const bb = new THREE.Box3().setFromObject(m);
+        return bb.min.y < -1.0 && !underLeg(m);
+      });
+      check(
+        `${key}: no gear meshes outside the three legs (no duplicates)`,
+        stray.length === 0,
+        stray.length > 0
+          ? `stray below -1.0 m: ${stray.map((m) => `'${m.name}'`).join(', ')}`
+          : `${allMeshes.filter((m) => underLeg(m)).length} leg child meshes, all under gear_leg_*`,
+      );
+      const ray2 = new THREE.Raycaster();
+      // Physics gear posts: nose (0, +0.35L), mains (x = ±1.6, -0.15L).
+      const stations: Array<['gear_front' | 'gear_L' | 'gear_R', number, number]> = [
+        ['gear_front', 0, 0.35 * spec.length],
+        ['gear_L', -1.6, -0.15 * spec.length],
+        ['gear_R', 1.6, -0.15 * spec.length],
+      ];
+      for (const [slot, sx, sz] of stations) {
+        const leg = rig.bound[slot];
+        if (!leg) {
+          check(`${key}: ${slot} leg bound`, false);
+          continue;
+        }
+        const kids: THREE.Mesh[] = [];
+        leg.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh) kids.push(o as THREE.Mesh);
+        });
+        let strutTop = -Infinity;
+        let wheelFoot = Infinity;
+        for (const k of kids) {
+          const bb = new THREE.Box3().setFromObject(k);
+          strutTop = Math.max(strutTop, bb.max.y);
+          wheelFoot = Math.min(wheelFoot, bb.min.y);
+        }
+        const others = allMeshes.filter((m) => !underLeg(m));
+        ray2.set(new THREE.Vector3(sx, -10, sz), new THREE.Vector3(0, 1, 0));
+        ray2.far = 30;
+        const hits = ray2.intersectObjects(others, false);
+        const belly = hits.length > 0 ? hits[0]!.point.y : NaN;
+        check(
+          `${key}: ${slot} strut top touches the belly (no floating gear)`,
+          !Number.isNaN(belly) && strutTop >= belly - 0.02 && strutTop <= belly + 0.3,
+          `strutTop=${strutTop.toFixed(2)} belly=${Number.isNaN(belly) ? 'NO HIT' : belly.toFixed(2)} gap=${Number.isNaN(belly) ? '?' : (belly - strutTop).toFixed(2)}`,
+        );
+        check(
+          `${key}: ${slot} wheel foot at the physics gear foot (-2.2 m)`,
+          Math.abs(wheelFoot - -2.2) < 0.05,
+          `wheelFoot=${wheelFoot.toFixed(2)} (${kids.length} meshes in leg)`,
+        );
+      }
+      if (key === 'fa18') {
+        const helmet = model.getObjectByName('helmet002');
+        check(
+          'fa18: pilot helmet hidden (helmet002, not helmet.002)',
+          !!helmet && !helmet.visible,
+          helmet ? `visible=${helmet.visible}` : 'helmet002 not found',
+        );
+      }
+    }
 
     // --- Spawn on Alpha: gear down, visible, belly on the physics belly.
     ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
     ac.brake = true;
     ac.thrTarget = 0;
     stepFor(ac, 2);
-    const rig = ac.rig!;
     check(
       `${key}: model belly aligns with the physics belly (-0.8 m, not underground)`,
       Math.abs(rig.bellyY - -0.8) < 0.15,

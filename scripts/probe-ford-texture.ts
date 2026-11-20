@@ -92,9 +92,11 @@ if (typeof (globalThis as unknown as { document?: unknown }).document === 'undef
 }
 
 import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { HELICARRIER_GLB } from '../src/assets/models/helicarrier';
+import { HelicarrierController } from '../src/entities/HelicarrierController';
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = ''): void {
@@ -241,6 +243,82 @@ async function main(): Promise<void> {
     'live load: deck meshes use FordDeck with a bound map texture',
     deckMeshCount === 2 && deckMapOk,
     `deck meshes=${deckMeshCount} map bound=${deckMapOk}`,
+  );
+
+  // --- Controller build (pass 11, live v4.5 FAIL): the GLB's deck
+  // plates are wound face-DOWN with a single-sided material, so the
+  // texture was bound but invisible from above — the player saw the
+  // light-grey hull top. The controller must flip the material to
+  // DoubleSide and rotate the map 90° so the strip runs ALONG the
+  // deck (the deck UVs run u along the length, v across the width,
+  // while the strip runs vertically in the texture). Verified
+  // geometrically: after the map's uvTransform, the transformed v'
+  // must run along the deck length (aft vs forward halves differ)
+  // and u' across the width (port vs starboard halves differ).
+  await RAPIER.init();
+  const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  const cScene = new THREE.Scene();
+  const carrier = new HelicarrierController(cScene, world, {
+    modelGlbUri: HELICARRIER_GLB,
+    deckTopSourceY: 29.78,
+    heightAt: () => 0,
+  });
+  await carrier.build();
+  let ctlDeckCount = 0;
+  let ctlSideOk = false;
+  let ctlRotOk = false;
+  // Per deck mesh: transformed-UV halves (model-space x/z vs uv').
+  const halves: Array<{ dvFwd: number; duPort: number }> = [];
+  carrier.group.traverse((o) => {
+    if (!(o as THREE.Mesh).isMesh) return;
+    const mesh = o as THREE.Mesh;
+    if (!mesh.name.startsWith('deck_top')) return;
+    ctlDeckCount++;
+    const mat = mesh.material as THREE.MeshStandardMaterial;
+    if (mat.side === THREE.DoubleSide) ctlSideOk = true;
+    if (mat.map) {
+      mat.map.updateMatrix();
+      if (Math.abs(mat.map.rotation - Math.PI / 2) < 1e-6) ctlRotOk = true;
+      const g = mesh.geometry;
+      const pos = g.attributes.position as THREE.BufferAttribute;
+      const uv = g.attributes.uv as THREE.BufferAttribute | undefined;
+      if (uv) {
+        const m = mat.map.matrix;
+        const v2 = new THREE.Vector2();
+        let zMin = Infinity, zMax = -Infinity, xMin = Infinity, xMax = -Infinity;
+        for (let i = 0; i < pos.count; i++) {
+          zMin = Math.min(zMin, pos.getZ(i)); zMax = Math.max(zMax, pos.getZ(i));
+          xMin = Math.min(xMin, pos.getX(i)); xMax = Math.max(xMax, pos.getX(i));
+        }
+        const zMid = (zMin + zMax) / 2, xMid = (xMin + xMax) / 2;
+        let vAft = 0, vFwd = 0, nAft = 0, nFwd = 0;
+        let uPort = 0, uStbd = 0, nPort = 0, nStbd = 0;
+        for (let i = 0; i < uv.count; i++) {
+          v2.set(uv.getX(i), uv.getY(i)).applyMatrix3(m);
+          if (pos.getZ(i) < zMid) { vAft += v2.y; nAft++; } else { vFwd += v2.y; nFwd++; }
+          if (pos.getX(i) < xMid) { uPort += v2.x; nPort++; } else { uStbd += v2.x; nStbd++; }
+        }
+        halves.push({
+          dvFwd: Math.abs(vFwd / Math.max(nFwd, 1) - vAft / Math.max(nAft, 1)),
+          duPort: Math.abs(uStbd / Math.max(nStbd, 1) - uPort / Math.max(nPort, 1)),
+        });
+      }
+    }
+  });
+  check(
+    'controller build: both deck meshes present with DoubleSide FordDeck',
+    ctlDeckCount === 2 && ctlSideOk,
+    `deck meshes=${ctlDeckCount} doubleSided=${ctlSideOk}`,
+  );
+  check(
+    'controller build: deck map rotated 90° (strip along the deck)',
+    ctlRotOk,
+    `rotation=${Math.PI / 2}`,
+  );
+  check(
+    'controller build: transformed v\' runs along the deck length, u\' across the width (strip along the deck, not across it)',
+    halves.length === 2 && halves.every((h) => h.dvFwd > 0.3 && h.duPort > 0.3),
+    halves.map((h) => `dV'(fwd-aft)=${h.dvFwd.toFixed(2)} dU'(port-stbd)=${h.duPort.toFixed(2)}`).join('; '),
   );
 
   console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURES`);

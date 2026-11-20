@@ -257,6 +257,14 @@ export class HelicarrierController {
   readonly pos: THREE.Vector3 = CARRIER_START_POS.clone();
   /** Horizontal velocity, recomputed each update (v2 carrier.vel). */
   readonly vel = new THREE.Vector3();
+  /** Smoothed vertical velocity (pass 11): the terrain-following
+   *  climb rate is ramped at 5 m/s^2, so this persists across
+   *  updates. NOT vel.y — update() resets vel.y to 0 every step
+   *  when it recomputes the horizontal velocity, so reading vel.y
+   *  as the previous vertical velocity pins the ramp to ~0 and the
+   *  carrier can never climb (it flew into the terrain and died
+   *  in probe-carrier-loop-dt). */
+  private vySmooth = 0;
   yaw = 0;
   yawRate = 0;
   readonly speed = CARRIER_SPEED;
@@ -355,6 +363,33 @@ export class HelicarrierController {
         const norm = normalizeModel(obj, 333, 0); // bow +Z already
         this.group.add(norm.group);
         this.modelReady = true;
+        // Pass 11 (Ford deck markings — live v4.5 FAIL): the GLB's
+        // deck_top plates are wound face-DOWN (every triangle normal
+        // (0,-1,0)) with a single-sided FordDeck material, so from
+        // above — the only angle a player ever sees the deck — the
+        // plates were backface-culled and the player saw straight
+        // through them to the flat light-grey hull top (#a1a29d):
+        // the "plain light-grey slab". The texture was bound (the
+        // probe proved that) but never visible. Make the deck
+        // double-sided. The baked Ford strip also runs vertically in
+        // the texture while the deck UVs run u along the deck length
+        // and v across the width, so the strip lay ACROSS the deck;
+        // rotate the map 90° so the strip runs ALONG the deck,
+        // angling to port going forward, as on the real Ford.
+        // (u', v') = (v, 1-u) at rotation +PI/2: the strip (image
+        // x 0.375-0.70) lands at deck-width fraction 0.375-0.70,
+        // centred, and the image top lands at the forward end.
+        obj.traverse((o) => {
+          const mesh = o as THREE.Mesh;
+          if (!mesh.isMesh || !/deck_top/i.test(mesh.name)) return;
+          const mat = mesh.material as THREE.MeshStandardMaterial | null;
+          if (!mat) return;
+          mat.side = THREE.DoubleSide;
+          if (mat.map) {
+            mat.map.center.set(0.5, 0.5);
+            mat.map.rotation = Math.PI / 2;
+          }
+        });
         // Deck top in group coords from the measured source value
         // (29.78 for the SHIELD model) and this load's actual bbox
         // centre — (29.78 - 35.06) * 1.0 = -5.28 m.
@@ -713,6 +748,7 @@ export class HelicarrierController {
       );
     this.list = 0;
     this.yawRate = 0;
+    this.vySmooth = 0;
     this.dying = false;
     this.dyingT = 0;
     this.impactDone = false;
@@ -838,17 +874,26 @@ export class HelicarrierController {
     // death check (ground + 10) is far below.
     const ahead = this.groundAhead(2500);
     const targetY = Math.max(CARRIER_ALT, ahead + 150);
-    const dyAlt = clamp(targetY - this.pos.y, -10 * dt, 15 * dt);
-    this.pos.y += dyAlt;
-    // Record the climb rate in vel.y (issue 8 regression fix): the
-    // deck body is kinematic, and syncDeckBody sets its linvel from
+    // Vertical ACCELERATION limit (pass 11): the climb rate used
+    // to jump by 25 m/s in one substep at a climb -> descent
+    // reversal (vel.y +15 -> -10 in a single step), and a jet
+    // riding the deck — whose velocity lags the deck's by one
+    // substep — sank 0.75 m into the deck at the reversal
+    // (probe-deck-ride-long, t=87.1 s). Ramp the vertical velocity
+    // at 5 m/s^2 so the deck never reverses faster than a riding
+    // jet can follow (a 25 m/s reversal now takes 5 s). The
+    // 62 s look-ahead leaves ample time to clear a range.
+    const targetVy = clamp((targetY - this.pos.y) / dt, -10, 15);
+    const maxDv = 5 * dt;
+    const vy = clamp(targetVy, this.vySmooth - maxDv, this.vySmooth + maxDv);
+    this.vySmooth = vy;
+    // vel.y IS the climb rate (issue 8 regression fix): the deck
+    // body is kinematic, and syncDeckBody sets its linvel from
     // vel — with vel.y = 0 the deck teleported up through a jet
-    // standing on it (the contact solver never pushed the jet up, so
-    // it was left 29 m below the deck, fell, and crashed "hard
-    // landing"). With vel.y = the climb rate, Rapier pushes the jet
-    // up with the deck, and velocityAt / the VTOL and trap relative-
-    // velocity checks see the matching vertical speed.
-    this.vel.y = dt > 0 ? dyAlt / dt : 0;
+    // standing on it. With vel.y = the climb rate, Rapier pushes
+    // the jet up with the deck.
+    this.vel.y = vy;
+    this.pos.y += vy * dt;
     // Lift from pods: each lost pod -25% lift, +7 deg list.
     // (The dying check lives at the top of update() — a dying carrier
     // never reaches here.)

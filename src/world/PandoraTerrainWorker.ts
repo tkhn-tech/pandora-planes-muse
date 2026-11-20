@@ -463,6 +463,88 @@ export function generateHeights(req: TerrainChunkRequest): Float32Array {
 }
 
 // ---------------------------------------------------------------------------
+// Infinite chunk generation (pass 11 — TerrainStreamer).
+//
+// generateHeights() above anchors its chunk grid to the OLD map: chunk
+// (cx, cz) spans [cx*size - 6000, (cx+1)*size - 6000]. That grid cannot
+// address terrain past the 12 km edge. The streamer instead addresses
+// chunks DIRECTLY in original-frame coordinates: chunk (cx, cz) spans
+// [cx*size, (cx+1)*size] in x and the same in z, with no -6000 offset,
+// so every (cx, cz) in Z^2 is a valid chunk and the map has no edge.
+//
+// The two grids agree where they overlap: with size 3000, chunk
+// (cx, cz) of this scheme is chunk (cx+2, cz+2) of the old scheme, and
+// both sample heightAt() — a pure function of (x, z) — at the same
+// 60 m nodes, so a streamer chunk and the generator's 201x201 grid
+// give IDENTICAL heights at every shared node (verified by
+// probe-infinite-flight). Adjacent streamer chunks share their edge
+// samples by the same convention (resolution samples inclusive of both
+// edges), so neighbouring chunks meet with no crack and no step.
+// Deterministic: same (chunkX, chunkZ, size, resolution) always yields
+// the same Float32Array, so a retired chunk regenerates identically
+// when re-entered.
+// ---------------------------------------------------------------------------
+
+/** Heights for one infinite-grid chunk. Sample (ix, iz) sits at
+ *  x = chunkX*size + ix*step, z = chunkZ*size + iz*step,
+ *  step = size/(resolution-1), row-major, x fastest — the same layout
+ *  generateHeights() produces, so THREE.PlaneGeometry vertex order
+ *  after rotateX(-PI/2) and the Rapier transposed-heightfield layout
+ *  both apply unchanged. */
+export function generateChunkHeights(
+  chunkX: number,
+  chunkZ: number,
+  size: number,
+  resolution: number,
+): Float32Array {
+  const heights = new Float32Array(resolution * resolution);
+  const originX = chunkX * size;
+  const originZ = chunkZ * size;
+  const step = size / (resolution - 1);
+  let i = 0;
+  for (let iz = 0; iz < resolution; iz++) {
+    const z = originZ + iz * step;
+    for (let ix = 0; ix < resolution; ix++) {
+      const x = originX + ix * step;
+      heights[i++] = heightAt(x, z);
+    }
+  }
+  return heights;
+}
+
+/** Exact Rapier-heightfield surface height for one infinite-grid chunk
+ *  — the same piecewise-linear triangle surface heightfieldHeightAt()
+ *  computes, with the same h10–h01 diagonal, but for a chunk whose
+ *  samples start at (originX, originZ) with the given step instead of
+ *  the old map's (-6000, -6000) / 60 m grid. Points outside the chunk
+ *  clamp to its edge (same convention as heightfieldHeightAt); callers
+ *  must select the chunk that contains (x, z). */
+export function chunkHeightfieldHeightAt(
+  heights: Float32Array,
+  res: number,
+  originX: number,
+  originZ: number,
+  step: number,
+  x: number,
+  z: number,
+): number {
+  const gx = (x - originX) / step;
+  const gz = (z - originZ) / step;
+  const ix = Math.max(0, Math.min(res - 2, Math.floor(gx)));
+  const iz = Math.max(0, Math.min(res - 2, Math.floor(gz)));
+  const fx = Math.max(0, Math.min(1, gx - ix));
+  const fz = Math.max(0, Math.min(1, gz - iz));
+  const h00 = heights[iz * res + ix]!;
+  const h10 = heights[iz * res + ix + 1]!;
+  const h01 = heights[(iz + 1) * res + ix]!;
+  const h11 = heights[(iz + 1) * res + ix + 1]!;
+  // Rapier's heightfield diagonal: (i+1,j)–(i,j+1), i.e. h10–h01 —
+  // identical to heightfieldHeightAt above.
+  if (fx + fz <= 1) return h00 + (h10 - h00) * fx + (h01 - h00) * fz;
+  return h11 + (h01 - h11) * (1 - fx) + (h10 - h11) * (1 - fz);
+}
+
+// ---------------------------------------------------------------------------
 // Web Worker entry point. Guarded so importing this module on the main
 // thread (for the pure math above) is side-effect free: in a real worker
 // `window` is undefined and `self` is the DedicatedWorkerGlobalScope; in a

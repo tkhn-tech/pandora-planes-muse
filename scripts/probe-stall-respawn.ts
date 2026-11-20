@@ -595,6 +595,16 @@ async function main(): Promise<void> {
     for (let i = 0; i < 60 * 7; i++) substep(ac);
     // Enemy missile detonates at the jet's centre (proximity fuse).
     weapons.applyProximityDamage(ac, ac.pos.clone(), 40, 15, false);
+    // The fall is timed from the HIT, not from the reset: ac.time
+    // counts from resetAt, so the 7 s settle above is inside it.
+    // (Pass 11: the old check compared impactT < 25 s against a
+    // clock that included the settle, so a correct 22 s fall from
+    // ~1100 m read as 29 s and failed — the jet climbs ~140 m
+    // during the settle on its ~2-3 deg trim AoA at 220 m/s, a
+    // pre-existing trim issue documented in BladeElementSolver,
+    // not a glide: the fall itself is 22 s, not the 40-60 s glide
+    // this check exists to catch.)
+    const hitT = ac.time;
     const fxAtHit = ac.getDamageFx();
     console.log(
       `  missile hit: dying=${ac.dying} reason=${ac.dyingReason} hp=${ac.hp.toFixed(1)} ` +
@@ -627,8 +637,8 @@ async function main(): Promise<void> {
     }
     check(
       'Dying jet falls to the ground and impacts (not a 40-60 s glide)',
-      !ac.alive && ac.crashedFromDying && impactT > 0 && impactT < 25,
-      `impactT=${impactT.toFixed(1)} s crashedFromDying=${ac.crashedFromDying} maxFall=${maxFallSpeed.toFixed(1)} m/s minVsi=${minVsi.toFixed(1)}`,
+      !ac.alive && ac.crashedFromDying && impactT > hitT && impactT - hitT < 25,
+      `fallT=${(impactT - hitT).toFixed(1)} s (impactT=${impactT.toFixed(1)} s from reset) crashedFromDying=${ac.crashedFromDying} maxFall=${maxFallSpeed.toFixed(1)} m/s minVsi=${minVsi.toFixed(1)}`,
     );
     ac.dispose();
   }

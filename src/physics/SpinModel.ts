@@ -43,8 +43,9 @@ export class SpinModel {
    * @param yawIn rudder input −1..1 (positive = right rudder)
    * @param pitchIn stick pitch −1..1 (negative = pull up)
    * @param rollIn stick roll −1..1
-   * @param asymWing (wingL − wingR) damage, −1..1 — asymmetric damage
-   *   can start a spin without rudder input
+   * @param asymWing (wingR − wingL) damage, −1..1 — asymmetric damage
+   *   can start a spin without rudder input (a dead left wing gives
+   *   a negative value and spins the nose left, toward the dead wing).
    * @returns the spin yaw rate (rad/s) and roll rate (rad/s) to add to
    *   the solver's rates, plus the lateral drift acceleration (m/s²)
    *   for the force sum. All zero when not spinning.

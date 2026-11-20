@@ -19,7 +19,8 @@
 // Research targets (Docs/flight-behaviour-per-model.md §7/§8):
 //   sustained turn SL: F-18 19.2, F-22 ~19-20, F-15E ~19-20,
 //   F-35A ~16, MiG-29 ~21, Su-34 ~14-16 deg/s.
-//   Rotation speeds (kt): F-18 126, F-35A 150, F-22 140, F-15E 150,
+//   Rotation speeds (kt): F-18 140 (pass 11 — was 126, below its own
+//   stall speed), F-35A 150, F-22 140, F-15E 150,
 //   MiG-29 130, Su-34 140.
 //
 // Usage: node_modules/.bin/esbuild scripts/probe-bet.ts
@@ -102,7 +103,7 @@ const TURN_BAND: Record<string, [number, number]> = {
   su34: [10, 19],
 };
 const ROTATE_KT: Record<string, number> = {
-  fa18: 126,
+  fa18: 140,
   f35a: 150,
   f22: 140,
   f15e: 150,
