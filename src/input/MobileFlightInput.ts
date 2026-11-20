@@ -84,8 +84,13 @@ export class MobileFlightInput implements IFlightInputProvider {
       const dg = this.gamma - this.gamma0;
       // VTOL hover benefits from a gentler tilt response.
       const scale = this.kind === 'vtol' ? 32 : 25;
-      if (Math.abs(db) > 3) pitch = clamp(-db / scale, -1, 1);
-      if (Math.abs(dg) > 3) roll = clamp(-dg / scale, -1, 1);
+      // Pass 11: both signs were inverted. Beta: top tilts BACK
+      // toward you (db < 0) = nose up = pitchIn < 0, so pitch =
+      // +db/scale. Gamma: device tilts RIGHT (dg > 0) = roll right
+      // = rollIn > 0 (the physics maps rollIn > 0 to a right
+      // bank), so roll = +dg/scale.
+      if (Math.abs(db) > 3) pitch = clamp(db / scale, -1, 1);
+      if (Math.abs(dg) > 3) roll = clamp(dg / scale, -1, 1);
     }
     return { pitch, roll, yaw: 0, throttle: null };
   }

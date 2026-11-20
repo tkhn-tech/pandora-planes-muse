@@ -19,6 +19,7 @@ import type {
   DamageZone,
 } from '../physics/FlightPhysicsController';
 import { CrashVFXManager } from './CrashVFXManager';
+import type { FloatingOrigin } from '../world/FloatingOrigin';
 
 export const GUN_RANGE = 1200;
 export const GUN_HIT_RADIUS = 9;
@@ -44,10 +45,17 @@ export const BOMB_POD_DAMAGE = 40;
 export const MISSILE_DAMAGE_RADIUS = 15;
 
 /** Zone anchor points on an airframe, in body coordinates (+Z = nose,
- *  +X = right, +Y = up). Used to map a hit point to the nearest zone
- *  (gun hits) and to apply proximity damage with falloff (missile /
- *  bomb). The fuel tank sits in the centre fuselage, slightly forward;
- *  the engines are aft; the tail and fin are at the rear. */
+ *  +X = LEFT wing, +Y = up — the right wing is -X, so wingL sits at
+ *  +span/4 and wingR at -span/4). Used to map a hit point to the
+ *  nearest zone (gun hits) and to apply proximity damage with falloff
+ *  (missile / bomb). The fuel tank sits in the centre fuselage,
+ *  slightly forward; the engines are aft; the tail and fin are at
+ *  the rear. Pass 11: the old comment said +X = right and the
+ *  anchors were mirrored — a hit on the physical left wing damaged
+ *  wingR, so the wrong wing detached and the wrong side's lift and
+ *  thrust were cut. The solvers' (wingL - wingR) formulas were
+ *  written against the same mirrored model, so behaviour cancelled
+ *  out — all of them are flipped together here. */
 function zoneAnchors(
   target: Aircraft,
 ): { zone: DamageZone; local: THREE.Vector3 }[] {
@@ -56,8 +64,8 @@ function zoneAnchors(
   const span = S.span;
   const anchors: { zone: DamageZone; local: THREE.Vector3 }[] = [
     { zone: 'fuselage', local: new THREE.Vector3(0, 0, 0) },
-    { zone: 'wingL', local: new THREE.Vector3(-span / 4, 0, 0) },
-    { zone: 'wingR', local: new THREE.Vector3(span / 4, 0, 0) },
+    { zone: 'wingL', local: new THREE.Vector3(span / 4, 0, 0) },
+    { zone: 'wingR', local: new THREE.Vector3(-span / 4, 0, 0) },
     { zone: 'tail', local: new THREE.Vector3(0, 0, -L / 2) },
     { zone: 'fin', local: new THREE.Vector3(0, 1.5, -L / 2) },
     { zone: 'fuel', local: new THREE.Vector3(0, 0, L / 6) },
@@ -66,8 +74,8 @@ function zoneAnchors(
   if (S.key === 'f35a') {
     anchors.push({ zone: 'engine', local: new THREE.Vector3(0, 0, -L / 4) });
   } else {
-    anchors.push({ zone: 'engineL', local: new THREE.Vector3(-1.2, 0, -L / 4) });
-    anchors.push({ zone: 'engineR', local: new THREE.Vector3(1.2, 0, -L / 4) });
+    anchors.push({ zone: 'engineL', local: new THREE.Vector3(1.2, 0, -L / 4) });
+    anchors.push({ zone: 'engineR', local: new THREE.Vector3(-1.2, 0, -L / 4) });
   }
   return anchors;
 }
@@ -76,7 +84,9 @@ function zoneAnchors(
  *  (damage-model §2 — the hit resolver stops picking a random zone).
  *  The point is converted to the target's body frame and the nearest
  *  zone anchor wins. */
-function zoneForHitPoint(target: Aircraft, hitPoint: THREE.Vector3): DamageZone {
+/** Exported for probes: a hit on the physical left wing (+X) must
+ *  resolve to wingL, the physical right wing (-X) to wingR. */
+export function zoneForHitPoint(target: Aircraft, hitPoint: THREE.Vector3): DamageZone {
   const local = hitPoint
     .clone()
     .sub(target.pos)
@@ -105,6 +115,10 @@ export interface WeaponHooks {
   carrierPodPositions?: () => THREE.Vector3[];
   groundHeight?: (x: number, z: number) => number;
   deckHeight?: (x: number, z: number) => number;
+  /** Floating origin: in-flight missiles/bombs shift with the world
+   *  at an origin shift (pass 11, infinite terrain step 5). Without
+   *  it they jump ~2 km relative to their (registered) target. */
+  origin?: FloatingOrigin | null;
 }
 
 interface Missile {
@@ -140,6 +154,7 @@ export class WeaponSystem {
   private readonly scene: THREE.Scene;
   private readonly world: RAPIER.World;
   private readonly hooks: WeaponHooks;
+  private readonly origin: FloatingOrigin | null;
   private readonly vfx: CrashVFXManager;
   private readonly tracers: THREE.Line[] = [];
   private readonly missiles: Missile[] = [];
@@ -157,6 +172,7 @@ export class WeaponSystem {
     this.scene = scene;
     this.world = world;
     this.hooks = hooks;
+    this.origin = hooks.origin ?? null;
     this.vfx = new CrashVFXManager(scene, {
       groundHeight: hooks.groundHeight,
     });
@@ -525,6 +541,11 @@ export class WeaponSystem {
       RAPIER.ColliderDesc.ball(0.6).setSensor(true),
       body,
     );
+    // Pass 11: shift with the world at an origin shift (body AND mesh
+    // — the mesh is re-synced from the body each frame, so both must
+    // move together or they desync by the shift).
+    this.origin?.registerBody(body);
+    this.origin?.registerObject(mesh);
     this.missiles.push({ mesh, body, target, shooter, life: MISSILE_LIFE });
     this.hooks.sfx?.('msl');
   }
@@ -641,6 +662,9 @@ export class WeaponSystem {
       RAPIER.ColliderDesc.ball(0.8).setSensor(true),
       body,
     );
+    // Pass 11: shift with the world at an origin shift (see missile).
+    this.origin?.registerBody(body);
+    this.origin?.registerObject(group);
     this.bombs.push({ mesh: group, body, shooter, life: 20 });
     this.hooks.sfx?.('msl');
   }
@@ -793,6 +817,8 @@ export class WeaponSystem {
 
   private removeMissile(i: number): void {
     const m = this.missiles[i];
+    this.origin?.unregisterObject(m.mesh);
+    this.origin?.unregisterBody(m.body);
     this.scene.remove(m.mesh);
     this.world.removeRigidBody(m.body);
     this.missiles.splice(i, 1);
@@ -800,6 +826,8 @@ export class WeaponSystem {
 
   private removeBomb(i: number): void {
     const b = this.bombs[i];
+    this.origin?.unregisterObject(b.mesh);
+    this.origin?.unregisterBody(b.body);
     this.scene.remove(b.mesh);
     this.world.removeRigidBody(b.body);
     this.bombs.splice(i, 1);

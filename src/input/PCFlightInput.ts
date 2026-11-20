@@ -216,7 +216,7 @@ export class PCFlightInput implements IFlightInputProvider {
       rx = this.gpRoll;
     } else if (this.yoke.active && this.camMode !== 2) {
       px = clamp(this.yoke.dy / 60, -1, 1);
-      rx = clamp(-this.yoke.dx / 60, -1, 1);
+      rx = clamp(this.yoke.dx / 60, -1, 1); // pass 11: was -dx (inverted roll)
     }
     // Keyboard stick: arrow keys (+ A/D roll) give a -1..1 target; the
     // stick slews toward it at STICK_SLEW/s, then inversion + the
@@ -224,11 +224,23 @@ export class PCFlightInput implements IFlightInputProvider {
     // the mouse yoke and gamepad above are analogue and unshaped.
     const kbPitchTarget =
       (held('ArrowDown') ? 1 : 0) - (held('ArrowUp') ? 1 : 0);
+    // Pass 11 (item 7): the roll was INVERTED on every player input
+    // path. The physics maps rollIn > 0 to a RIGHT bank (positive
+    // rotation about the nose axis +Z tips the right wingtip, -X,
+    // down), but every input produced rollIn = -1 for "right":
+    // ArrowRight/D gave -1, the mouse yoke negated dx, the gamepad
+    // negated axis 0, the touch merge negated joy.x. Pass 1 had
+    // concluded "already correct" because probe-roll's own ground
+    // truth was inverted (it asserted rollIn = -1 banks right).
+    // All paths now produce rollIn = +1 for "steer right". The AI
+    // already assumes rollIn > 0 = more right bank and is unchanged;
+    // the auto-level operates on rates, not rollIn sign, and is
+    // unchanged. Pitch is NOT inverted (ArrowUp = nose up).
     const kbRollTarget =
-      (held('ArrowLeft') ? 1 : 0) -
-      (held('ArrowRight') ? 1 : 0) +
-      (held('KeyA') ? 1 : 0) -
-      (held('KeyD') ? 1 : 0);
+      (held('ArrowRight') ? 1 : 0) -
+      (held('ArrowLeft') ? 1 : 0) +
+      (held('KeyD') ? 1 : 0) -
+      (held('KeyA') ? 1 : 0);
     const slew = (cur: number, target: number, rate: number): number => {
       const step = rate * dt;
       if (cur < target) return Math.min(target, cur + step);
@@ -244,9 +256,13 @@ export class PCFlightInput implements IFlightInputProvider {
     px += shape(this.kbPitch, this.shaping.pitchSens, this.shaping.invertPitch);
     rx += shape(this.kbRoll, this.shaping.rollSens, this.shaping.invertRoll);
 
-    // Rudder: Q = left, E = right (yawIn > 0 = nose right, solver yaw).
+    // Rudder: Q = left, E = right. BOTH solvers map yawIn > 0 to nose
+    // LEFT (BET fin moment; curve solver +yawRate term — positive
+    // yawRate rotates the nose toward +X, the left wing), so left
+    // rudder feeds +1 and right rudder -1. Pass 11: this had E -> +1,
+    // so E yawed the nose left — the same inversion family as roll.
     const yaw =
-      (held('KeyE') ? 1 : 0) - (held('KeyQ') ? 1 : 0);
+      (held('KeyQ') ? 1 : 0) - (held('KeyE') ? 1 : 0);
 
     // Throttle: incremental while held; null = no opinion this frame.
     let throttle: number | null = null;
@@ -418,7 +434,7 @@ export class PCFlightInput implements IFlightInputProvider {
     const ax1 = dz(gp.axes[1] ?? 0);
     if (ax0 !== 0 || ax1 !== 0) {
       this.gpActive = true;
-      this.gpRoll = -ax0;
+      this.gpRoll = ax0; // pass 11: was -ax0 (inverted roll; stick right = +x = roll right)
       this.gpPitch = ax1;
     }
     const b = (i: number): boolean => !!(gp!.buttons[i]?.pressed);

@@ -271,6 +271,10 @@ export interface AircraftFailures {
  *  (template carrierDeckY / carrierRelative / carrier.vel / yawRate). */
 export interface DeckProvider {
   alive: boolean;
+  /** World Y of the deck surface (the carrier's deck top), when
+   *  the provider is a carrier. Optional: providers that cannot
+   *  supply it omit it, and callers fall back to deckHeightAt. */
+  deckTopY?: number;
   /** Deck height at world (x, z), or -Infinity when not over the deck. */
   deckHeightAt(x: number, z: number): number;
   /** Deck velocity, m/s (world frame) — the LINEAR velocity of the
@@ -801,8 +805,24 @@ export class Aircraft {
     // a tumble (AoA -129 deg); the F-15E did the same at 21 m/s and
     // read as a 40 m/s lift-off. A 3 m skid keeps face contacts
     // dominant so a single edge contact cannot dominate the manifold.
-    const vMain = 2 * (0.7 * 0.8 * 3.0); // two main skids
-    const vNose = 0.6 * 0.8 * 3.0; // one nose skid
+    // Main gear: two skids at z = -0.15*length. Pass 11 (deck wall):
+    // the skid feet sit 0.15 m ABOVE the surface at rest height
+    // (bottom -2.05, rest height -2.2), NOT touching it. The old feet
+    // at -2.2 m sat exactly on the deck surface, so a rolling jet's
+    // nose skid — whose front face reaches the deck-rect seam
+    // (local z +2.0, where the deck narrows from hx 35.8 to 24.0) —
+    // caught the bow rect's vertical back face (its top edge is
+    // exactly at the deck surface) and Rapier bounced the jet ~2 m
+    // back and ~0.5 m up on every approach: the "wall" Nicholas hit
+    // on every deck takeoff. A skid bottom 0.15 m clear of the
+    // surface can never overlap that face (the jet rides within
+    // millimetres of rest height — probe-deck-ride-long min gap
+    // -0.00 m), while the controller's positional onSurface gate
+    // (0.5 m on a deck) still owns ground contact, so the ride,
+    // touchdown detection and hard-landing check are unchanged.
+    // The 3 m skid length is kept (face contacts stay dominant).
+    const vMain = 2 * (0.7 * 0.7 * 3.0); // two main skids
+    const vNose = 0.6 * 0.7 * 3.0; // one nose skid
     const density = s.mass / (vFuse + vMain + vNose);
     this.body = this.world.createRigidBody(
       RAPIER.RigidBodyDesc.dynamic()
@@ -838,11 +858,11 @@ export class Aircraft {
     };
     // Fuselage: belly -0.8 m, top +2.0 m (hy 1.4, centre +0.6).
     mk(hx, 1.4, hzFuse, 0, 0.6, 0);
-    // Main gear: two skids at z = -0.15*length, feet at -2.2 m.
-    mk(0.35, 0.4, 1.5, -1.6, -1.8, -s.length * 0.15);
-    mk(0.35, 0.4, 1.5, 1.6, -1.8, -s.length * 0.15);
-    // Nose gear: z = +0.35*length, feet at -2.2 m.
-    mk(0.3, 0.4, 1.5, 0, -1.8, s.length * 0.35);
+    // Main gear: two skids at z = -0.15*length, feet 0.15 m clear.
+    mk(0.35, 0.35, 1.5, -1.6, -1.7, -s.length * 0.15);
+    mk(0.35, 0.35, 1.5, 1.6, -1.7, -s.length * 0.15);
+    // Nose gear: z = +0.35*length, feet 0.15 m clear.
+    mk(0.3, 0.35, 1.5, 0, -1.7, s.length * 0.35);
   }
 
   /** Handles of every collider on this aircraft's body, for the
@@ -1039,7 +1059,7 @@ export class Aircraft {
             if ((o as THREE.Mesh).isMesh) (o as THREE.Mesh).castShadow = false;
           });
           if (this.modelKey === 'fa18') {
-            const pilot = scene3.getObjectByName('helmet.002');
+            const pilot = scene3.getObjectByName('helmet002');
             if (pilot) pilot.visible = false;
           }
           const targetLen =
@@ -1425,7 +1445,25 @@ export class Aircraft {
     const spPre = isDeck
       ? Math.hypot(newVel.x - deckVel.x, newVel.z - deckVel.z)
       : 0;
-    if (isDeck && this.pos.y <= floorY + gearH + surfTol) {
+    // Pass 11 (item 3): the pre-coupling and the onSurface gate
+    // below were ONE-SIDED — they fired whenever the jet was BELOW
+    // floorY + gearH + tol, with no lower bound. A jet that
+    // undershot a carrier landing and flew UNDER the deck (12 m
+    // below deckTop) was declared "on the deck": the coupling set
+    // newVel.y = deckVel.y + (floorY + gearH - pos.y) * 8 (a
+    // +113 m/s upward command), the deck cuboid's bottom face
+    // blocked the rise, and the jet wedged under the deck forever
+    // (onDeck, sp 0, alive, 12 m below the surface). The gate now
+    // requires the jet to be within 3.0 m BELOW rest height as well
+    // as within the entry/exit tolerance above it. 3.0 m, not 1.0:
+    // a 1.0 m bound made a normal dip (a fast deck descent) cut
+    // the coupling, and the jet then free-fell 0.75 m INTO the
+    // deck (probe-deck-ride-long regression) — once below the
+    // bound the gate could never re-engage, a one-way cliff. A
+    // jet 12 m under the deck is still excluded; a jet dipping
+    // 3 m is a hard touchdown, and the coupling pulls it back.
+    const surfLo = floorY + gearH - 3.0;
+    if (isDeck && this.pos.y <= floorY + gearH + surfTol && this.pos.y >= surfLo) {
       const rotating =
         spPre > S.stallSpeed * 0.85 && this.pitchIn < -0.25;
       if (!rotating) {
@@ -1438,7 +1476,8 @@ export class Aircraft {
       spdH0 < 5 &&
       relVy <= 0.5 &&
       relVy >= -0.5 &&
-      this.pos.y <= floorY + gearH + 2.0;
+      this.pos.y <= floorY + gearH + 2.0 &&
+      this.pos.y >= surfLo;
     // Whether the jet was on a surface last step — a continuing
     // contact is riding, not a new touchdown (see the vs computation
     // in the onSurface branch). Captured before the branch updates
@@ -1474,7 +1513,9 @@ export class Aircraft {
     const onSurfaceVel =
       relVy <= 0.5 || (isDeck && spPre < S.stallSpeed * 0.5);
     if (
-      (this.pos.y <= floorY + gearH + exitTol && onSurfaceVel) ||
+      (this.pos.y <= floorY + gearH + exitTol &&
+        this.pos.y >= surfLo &&
+        onSurfaceVel) ||
       restingTilted
     ) {
       // Touching a surface. Rapier resolves the penetration — this
@@ -2100,14 +2141,35 @@ export class Aircraft {
    *  - down in VTOL hover (F-35A lands vertically on it);
    *  - stowing shortly after liftoff (AGL > 30 m and climbing, or
    *    AGL > 100 m);
-   *  - deploying on approach (AGL < 120 m, < 130 kt, descending).
+   *  - deploying on approach (AGL < 120 m, < 200 kt, descending).
    *  A manual command (setGearManual) overrides it for 8 s; a gear
    *  jam (failGearJam) holds it down. Runs before updateRig so the
-   *  rig animates the new state in the same step. */
+   *  rig animates the new state in the same step.
+   *  Pass 11 (item 3): AGL is the height above the NEAREST surface
+   *  (terrain or deck top), not just the terrain. A carrier
+   *  approach flies 300 m above the terrain but 30 m above the
+   *  deck — the old terrain-only AGL read 300+ m, so the gear
+   *  stowed on final and the deck gate (gearH 0.8 with the gear
+   *  up) never fired at the 2.2 m rest height: the jet flew along
+   *  at deckTop+2.3 m, onDeck false, and never touched down. The
+   *  deploy speed is 200 kt, not 130: a carrier approach at
+   *  46 m/s deck-relative is 86 m/s / 167 kt airspeed (the carrier
+   *  itself does 78 kt), so the old 130 kt limit never deployed
+   *  the gear on a carrier final either. */
   private autoGear(): void {
     if (!this.alive || this.dying || this.failGearJam) return;
     if (this.simTime < this.gearManualUntil) return;
-    const agl = this.pos.y - this.floorY;
+    const deckTop = this.deck?.deckTopY ?? Infinity;
+    const deckAgl = this.pos.y - deckTop;
+    // The deck counts only when it is BELOW the jet (deckAgl > 0):
+    // a jet taking off from a 50 m runway under a 345 m deck has a
+    // deck AGL of -95 m, and taking the min of that would read a
+    // negative AGL — the gear would never stow after takeoff and
+    // would deploy at 150 m on a runway approach.
+    const agl = Math.min(
+      this.pos.y - this.floorY,
+      deckAgl > 0 ? deckAgl : Infinity,
+    );
     if (this.onSurface) {
       this.gear = true;
       return;
@@ -2120,7 +2182,7 @@ export class Aircraft {
       this.gear = false;
       return;
     }
-    if (!this.gear && agl < 120 && this.ias < 130 * 0.514444 && this.vel.y < 0) {
+    if (!this.gear && agl < 120 && this.ias < 200 * 0.514444 && this.vel.y < 0) {
       this.gear = true;
     }
   }
@@ -2289,28 +2351,69 @@ export class Aircraft {
 
   /** Detach the worse-damaged wing as a tumbling segment (v2 detachWing:
    *  hide the matching mesh, spawn debris, toast on the player side).
-   *  The mesh goes to onDetachSegment; with no wing node the event
-   *  still fires with segment=null (CrashVFXManager box fallback). */
+   *  Pass 11 (stall-impact VFX): the real GLBs bind NO wing/tail
+   *  node (the rig only finds the procedural gear legs), so
+   *  detachSegment returned null for every player jet, main.ts
+   *  skipped the debris, and nothing was ever removed from the
+   *  model — the wreck looked factory-intact, missiles on the rails.
+   *  The donor model cannot be split from here (the airframe is a
+   *  single mesh, and respawn() would not restore a removed mesh),
+   *  so when the rig has no wing node a procedural torn wing panel
+   *  (charred spec tint, half-span long) is handed to
+   *  onDetachSegment instead: a wing-sized piece visibly tears off
+   *  and tumbles to rest beside the wreck. A crash detach (alive
+   *  already false) scatters at a quarter of the impact velocity so
+   *  the piece lands near the wreck instead of flying off at 85 m/s;
+   *  a mid-flight detach keeps the full velocity. */
   detachWing(): void {
     if (this.wingDetached) return;
     this.wingDetached = true;
     const side =
       this.damageZones.wingL >= this.damageZones.wingR ? 'wing_L' : 'wing_R';
-    const segment = this.rig
+    let segment = this.rig
       ? this.rig.detachSegment(side as 'wing_L' | 'wing_R')
       : null;
-    this.events.onDetachSegment?.(this, segment, this.pos.clone(), this.vel.clone());
+    if (!segment) {
+      const span = this.spec.span ?? this.spec.length * 0.8;
+      const wing = new THREE.Mesh(
+        new THREE.BoxGeometry(span * 0.45, 0.3, this.spec.length * 0.22),
+        new THREE.MeshLambertMaterial({
+          color: new THREE.Color(this.spec.tint).multiplyScalar(0.45),
+        }),
+      );
+      wing.name = 'torn_wing';
+      segment = wing;
+    }
+    const vel = this.vel.clone();
+    if (!this.alive) vel.multiplyScalar(0.25);
+    this.events.onDetachSegment?.(this, segment, this.pos.clone(), vel);
   }
 
   /** Detach the tail as a tumbling segment (damage-model §6 step 4 —
    *  the rig already binds `tail_section` per its slot list). Called
    *  when the tail zone is destroyed (spar/fire rules), not only from
-   *  a damage threshold. */
+   *  a damage threshold. Pass 11: same fallback as detachWing — no
+   *  player GLB binds a tail node, so a procedural torn tail section
+   *  is handed to onDetachSegment when the rig returns null, and a
+   *  crash detach scatters at a quarter of the impact velocity. */
   detachTail(): void {
     if (this.tailDetached) return;
     this.tailDetached = true;
-    const segment = this.rig ? this.rig.detachSegment('tail_section') : null;
-    this.events.onDetachSegment?.(this, segment, this.pos.clone(), this.vel.clone());
+    let segment = this.rig ? this.rig.detachSegment('tail_section') : null;
+    if (!segment) {
+      const span = this.spec.span ?? this.spec.length * 0.8;
+      const tail = new THREE.Mesh(
+        new THREE.BoxGeometry(span * 0.35, 0.3, this.spec.length * 0.15),
+        new THREE.MeshLambertMaterial({
+          color: new THREE.Color(this.spec.tint).multiplyScalar(0.45),
+        }),
+      );
+      tail.name = 'torn_tail';
+      segment = tail;
+    }
+    const vel = this.vel.clone();
+    if (!this.alive) vel.multiplyScalar(0.25);
+    this.events.onDetachSegment?.(this, segment, this.pos.clone(), vel);
   }
 
   /** Start the dying fall (damage-model §6 step 1). The jet is shot
@@ -2387,12 +2490,16 @@ export class Aircraft {
     if (!this.alive) return;
     this.crashedFromDying = true;
     this.alive = false;
-    if (
-      (this.damageZones.wingL > WING_DETACH_FATAL ||
-        this.damageZones.wingR > WING_DETACH_FATAL) &&
-      !this.wingDetached
-    ) {
+    // Pass 11: the impact tears the airframe apart whether or not
+    // the wing was already damaged past the fatal threshold — the
+    // old damage-gated detach left a dying jet's wreck intact when
+    // it hit the ground with healthy wings (the same flaw pass 8
+    // fixed in crash()). Detach a wing and the tail unconditionally.
+    if (!this.wingDetached) {
       this.detachWing();
+    }
+    if (!this.tailDetached) {
+      this.detachTail();
     }
     this.group.position.copy(this.pos);
     this.group.quaternion.copy(this.quat);

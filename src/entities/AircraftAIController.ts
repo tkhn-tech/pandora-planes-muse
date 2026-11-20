@@ -295,9 +295,15 @@ export class AircraftAIController {
     // and g = 9.81), clamped to +-75 deg, then rollIn from the bank
     // error. This replaces v2's rollIn = -local.x * 2.2, which banked
     // directly from the heading error and over-banked in tight turns.
-    // Sign: heading increases to the RIGHT (atan2(fwd.x, fwd.z)), so a
-    // positive heading error (goal to the right) needs a RIGHT bank
-    // (negative phi, rollIn < 0 = bank right).
+    // Sign: heading DECREASES on a right turn (atan2(fwd.x, fwd.z) —
+    // a right turn swings the nose toward -X, the right wing), so a
+    // goal to the right gives a NEGATIVE heading error and a negative
+    // omegaDes — and phiDes = -atan(...) is then POSITIVE, a RIGHT
+    // bank (Euler YXZ z > 0, rollIn > 0). The minus sign in phiDes
+    // is what makes a negative (right-turn) rate bank right. Pass 11:
+    // the old comment claimed heading increases right and negative
+    // phi is a right bank — both backwards; the code was right and
+    // the comment was the trap.
     const fwd = ac.fwd();
     const curHdg = Math.atan2(fwd.x, fwd.z);
     const desHdg = Math.atan2(toGoal.x, toGoal.z);
@@ -317,7 +323,11 @@ export class AircraftAIController {
     // logic raises thrTarget when ias < want), and the 0.6 factor
     // below keeps the command inside the envelope.
     const omegaMax = Math.max(
-      sustainedTurnRate(ac.ias, rho, S.thrustMax * Math.max(this.thrTarget, 0.7), S.wingArea, S.inducedK, S.mass),
+      // Pass 11: cap the CL at this aircraft's peak (the old
+      // default 1.6 overstated the envelope for the F-15E and
+      // F-22), and use the LIFT area (MiG-29: 45 m², not the 38 m²
+      // wing area) so the cap agrees with the curve solver's.
+      sustainedTurnRate(ac.ias, rho, S.thrustMax * Math.max(this.thrTarget, 0.7), S.wingAreaEffective ?? S.wingArea, S.inducedK, S.mass, S.clCurve.peak),
       0.05,
     );
     // RTB turns are gentler when nearly aligned (0.35x the sustained
@@ -431,9 +441,11 @@ export class AircraftAIController {
     let pitchIn = clamp((ac.vsi - vsDes) * 0.06, -pitchLim, pitchLim);
 
     // Rudder: centre the ball (sideslip beta) + adverse-yaw feedforward
-    // when rolling. beta > 0 (velocity right of the nose) needs
-    // nose-right rudder (yawIn > 0); rolling left (rollIn > 0) yaws the
-    // nose right, so feed rudder left. v2 left yawIn at 0 always — the
+    // when rolling. beta > 0 (velocity LEFT of the nose, +X) needs
+    // nose-LEFT rudder (yawIn > 0 — both solvers map +yawIn to nose
+    // left); rolling RIGHT (rollIn > 0) drags the nose LEFT via
+    // adverse yaw (away from the turn), so feed rudder RIGHT
+    // (yawIn < 0). v2 left yawIn at 0 always — the
     // AI never used the rudder. Rudder only in normal flight (AoA
     // within +-12 deg) and GENTLE (gain 0.02, cap +-0.25): a 10 deg
     // sideslip fed yawIn 0.50 at 315 kt, and the strong yaw departed
@@ -478,18 +490,27 @@ export class AircraftAIController {
     // turn / speed).
     const bankNow = Math.abs(new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z);
     const aboveWant = ac.ias > want;
-    // RTB final-phase floor (pass 4, BET promotion): on the glide
-    // slope the jet needs power to stay on it — with the floor at 0
-    // the AI cut to idle because it was 5 m/s fast, and under BET
-    // the jet sank at -13 m/s (AoA 11-12 deg, high drag) and hit the
-    // terrain short of the runway. The curve solver glides at idle;
-    // BET does not. So in the RTB final phase the floor is 0.35
-    // even when above want (the airbrake still bleeds the excess
-    // speed); the 0 floor stays for the approach, where the jet must
-    // slow from cruise to pattern speed.
+    // Pass 11 (lift fix): the pass-4 RTB-final floor (0.35 even when
+    // above want) is re-tuned to 0.10, not removed. It existed because
+    // under the buggy BET the jet sank at -13 m/s at idle on the slope
+    // (the phantom L·sin(AoA) drag); with the lift now perpendicular
+    // to the airflow the jet glides at idle like the curve solver, so
+    // the floor's rationale changed — but the idle glide is STILL
+    // steeper than the 3.5 deg slope (gear down, -7 to -13 m/s at
+    // idle), so with the floor at 0 the jet sinks below the slope and
+    // hits terrain ~1 km short of the runway (probe). Conversely the
+    // 0.35 floor overpowered the drag: 0.35 throttle (~57 kN on the
+    // MiG-29) beat the airbrake (~33 kN at 100 m/s) and the jet
+    // accelerated down the slope to 203 kt and died on touchdown.
+    // 0.10 (~16 kN) is the slope-holding thrust at ~72 m/s (drag
+    // ~25 kN minus the 9 kN gravity component down the slope) — it
+    // holds the glide without beating the drag, so the jet settles
+    // near the 72 m/s final speed instead of running away. The floor
+    // is 0.10 in RTB final when above want; 0 elsewhere above want;
+    // 0.35/0.85 only when at or below want.
     const rtbFinalFloor = this.state === 'rtb' && this.rtbPhase === 'final';
     const minThr = aboveWant
-      ? (rtbFinalFloor ? 0.35 : 0)
+      ? (rtbFinalFloor ? 0.1 : 0)
       : bankNow > (15 * Math.PI) / 180 && ac.ias < want
         ? 0.85
         : 0.35;

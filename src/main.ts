@@ -49,6 +49,16 @@ import { Aircraft } from './physics/FlightPhysicsController';
 import type { DeckProvider } from './physics/FlightPhysicsController';
 import { AircraftAIController } from './entities/AircraftAIController';
 import { SPECS } from './aircraft/AircraftSpec';
+import {
+  buildCockpit,
+  cockpitEyeFor,
+  fixCanopyMaterials,
+} from './aircraft/CockpitBuilder';
+import {
+  applyCameraFloor,
+  orbitCameraPosition,
+} from './camera/OrbitCamera';
+import { TerrainStreamer } from './world/TerrainStreamer';
 import { FloatingOrigin } from './world/FloatingOrigin';
 import { HELICARRIER_GLB } from './assets/models/helicarrier';
 import { PandoraWorldGenerator } from './world/PandoraWorldGenerator';
@@ -66,7 +76,7 @@ import { MobileFlightInput } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.5 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.6 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -296,6 +306,17 @@ worldGen.registerWithFloatingOrigin(floatingOrigin);
   // heightfield, so they must be recognised as terrain for contact.
   for (const h of worldGen.runwayColliderHandles) colliderOwners.set(h, 'terrain');
 }
+// Pass 11 (infinite terrain): chunked terrain streaming beyond the
+// central 12 km map. The streamer owns everything outside the central
+// 4x4 chunk block (which worldGen keeps — its mesh, heightfield and
+// runway boxes are untouched, and chunk boundaries sit exactly on the
+// old map edge, so there is no overlap and no gap). The map has no
+// edge to hit and no visible snap: chunks stream in ahead of the
+// player (radius 2 = 25 chunks / 15x15 km) and retire behind.
+const terrainStreamer = new TerrainStreamer(scene, rapierWorld, floatingOrigin, {
+  onColliderAdded: (h) => colliderOwners.set(h, 'terrain'),
+  onColliderRemoved: (h) => colliderOwners.delete(h),
+});
 const runwayPlacer = new RunwayPlacer(scene);
 {
   const placed = runwayPlacer.place(worldGen.runways);
@@ -420,6 +441,17 @@ const deckProvider: DeckProvider = {
   get alive() {
     return carriers.some((c) => c.active && c.alive);
   },
+  // Pass 11: the deck-top Y, so the auto-gear can measure AGL
+  // above the deck (a carrier approach is 300 m above the terrain
+  // but 30 m above the deck). The highest live carrier's deck.
+  get deckTopY() {
+    let best = -Infinity;
+    for (const c of carriers) {
+      if (!c.active || !c.alive) continue;
+      best = Math.max(best, c.deckTopY);
+    }
+    return best;
+  },
   deckHeightAt: (x, z) => {
     let best = -Infinity;
     for (const c of carriers) {
@@ -459,7 +491,7 @@ const deckProvider: DeckProvider = {
  *  resting on the collider while the analytic height put it 90+ m in
  *  the air, so the controller never saw it land.) */
 const heightfieldGroundHeight = (x: number, z: number): number =>
-  worldGen.heightfieldHeightAt(x, z);
+  terrainStreamer.heightAt(x, z);
 
 // ---- combat / VFX ----
 let shakeT = 0;
@@ -486,6 +518,10 @@ const weapons = new WeaponSystem(scene, rapierWorld, {
   },
   carrierPodPositions: () => carrierPodPositionsAll(),
   groundHeight: heightfieldGroundHeight,
+  // Pass 11 (infinite terrain, step 5): in-flight missiles/bombs
+  // must shift with the world at an origin shift, or they jump ~2 km
+  // relative to their target (which is registered) and fly wrong.
+  origin: floatingOrigin,
   deckHeight: (x, z) => {
     let best = -Infinity;
     for (const c of carriers) {
@@ -586,6 +622,10 @@ let respawnTimer: ReturnType<typeof setTimeout> | null = null;
  *  an immediate respawn. */
 let spectating = false;
 let prevPlayerDying = false;
+/** Pass 11 (wreck free orbit): the camera mode the player had before
+ *  spectate engaged, restored by skipSpectate (and by the respawned
+ *  safety net) so the player returns to their chase/cockpit view. */
+let preSpectateCamMode = 0;
 /** Damage-visual timer: spawn a smoke/fire plume every 0.5 s per
  *  damaged aircraft (the plume lives 6 s, so this keeps a continuous
  *  trail without flooding the VFX pool). */
@@ -961,6 +1001,10 @@ function skipSpectate(): void {
     respawnTimer = null;
   }
   spectating = false;
+  // Pass 11 (wreck free orbit): back to the view the player had
+  // before the wreck (chase or cockpit).
+  camMode = preSpectateCamMode;
+  pcInput.setCameraMode(camMode);
   setSpectateBanner(false);
   showRespawnPicker(false);
 }
@@ -1156,6 +1200,12 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   startSpawnTrace();
   camMode = 0;
   pcInput.setCameraMode(0);
+  // Pass 11 (chase framing): every life starts at the default
+  // framing — a zoomed-out (120 m, jet a speck) or zoomed-in (14 m,
+  // jet fills the frame) state from the previous life must not
+  // persist into the new one.
+  camDist = 30;
+  camOrbit = { yaw: 0, pitch: 0.32 };
   clearTransientUI();
 }
 
@@ -1285,6 +1335,10 @@ async function startRound(next: SandboxConfig): Promise<void> {
   try {
     await player.attachModel();
     modelStatus[cfg.aircraftKey] = { state: 'ok' };
+    // Pass 11 (cockpit parity): glass canopies + the procedural
+    // cockpit kit, built to the F-18's standard for every player jet.
+    fixCanopyMaterials(player.group);
+    buildCockpit(player.group, player.spec.modelKey);
   } catch (e) {
     modelStatus[cfg.aircraftKey] = {
       state: 'FAILED',
@@ -1374,6 +1428,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
     try {
       await e.attachModel();
       modelStatus[key] = { state: 'ok' };
+      fixCanopyMaterials(e.group);
     } catch (err) {
       modelStatus[key] = {
         state: 'FAILED',
@@ -1444,6 +1499,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
       try {
         await t.attachModel();
         modelStatus[key] = { state: 'ok' };
+        fixCanopyMaterials(t.group);
       } catch (err) {
         modelStatus[key] = {
           state: 'FAILED',
@@ -1613,7 +1669,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.5 · Vite + Rapier).
+// Footer version string (v4.6 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1663,20 +1719,32 @@ function updateCamera(dt: number): void {
   const up = p.up();
   // Spectate (damage-model §5): while the player's wreck is falling
   // (dying) or in the 2 s after impact, the camera stays with the
-  // wreck — chase math at a longer distance (40-45 m) so the fire and
-  // the tumble read clearly. C may cycle to free-orbit around the
-  // wreck (handled by cycleCam, which still works — camMode 2 orbits
-  // p.pos, i.e. the wreck).
-  // The chase offset uses the wreck's VELOCITY direction (live
-  // finding 3), NOT its tumbling body axes: the old code built the
-  // offset from fwd/up (the wreck's quaternion), so as the wreck
-  // tumbled the camera swung chaotically and the wreck left the
-  // frame. The velocity direction is stable (the wreck falls along
-  // it), and the camera looks AT the wreck's position, not 40 m
-  // ahead along a tumbling axis. When the wreck is nearly still
-  // (on the ground after impact) the velocity is ~0, so fall back
-  // to the body fwd.
+  // wreck. Pass 11 (wreck free orbit): the wreck view IS the free
+  // orbit — drag orbits (camOrbit), wheel/pinch zoom (camDist), the
+  // camera stays focused on the wreck. The old code returned the
+  // fixed 42 m chase here before ever checking camMode, so camMode 2
+  // never applied while spectating despite the comment claiming it
+  // did; the chase below is now only the non-orbit fallback (e.g. if
+  // the player C-cycles away from orbit mid-spectate). The chase
+  // offset uses the wreck's VELOCITY direction (live finding 3), NOT
+  // its tumbling body axes: the old code built the offset from
+  // fwd/up (the wreck's quaternion), so as the wreck tumbled the
+  // camera swung chaotically and the wreck left the frame. The
+  // velocity direction is stable (the wreck falls along it), and the
+  // camera looks AT the wreck's position, not 40 m ahead along a
+  // tumbling axis. When the wreck is nearly still (on the ground
+  // after impact) the velocity is ~0, so fall back to the body fwd.
   if (spectating) {
+    if (camMode === 2) {
+      const orbitPos = applyCameraFloor(
+        orbitCameraPosition(p.pos, camOrbit, camDist),
+        p.pos,
+        heightfieldGroundHeight,
+      );
+      camera.position.copy(orbitPos);
+      camera.lookAt(p.pos.clone());
+      return;
+    }
     const dist = 42;
     const velDir = p.vel.length() > 5
       ? p.vel.clone().normalize()
@@ -1725,12 +1793,21 @@ function updateCamera(dt: number): void {
       camera.position.x += (Math.random() - 0.5) * shakeT * 4;
       camera.position.y += (Math.random() - 0.5) * shakeT * 4;
     }
-    camera.lookAt(p.pos.clone().addScaledVector(fwd, 40));
+    // Pass 11 (chase framing): look AT the jet, not 40 m ahead of it
+    // — the old look-ahead put the jet at the bottom edge of the
+    // frame, so at short camDist it filled the frame and at long
+    // camDist it was a speck at the edge. Centred, the framing is
+    // consistent at every zoom.
+    camera.lookAt(p.pos.clone());
   } else if (camMode === 1) {
+    // Cockpit: per-jet eye from the GLB canopy bboxes (CockpitBuilder)
+    // — the old fixed (fwd x5, up x2.2) floated 0.66 m above the
+    // F-22's canopy and the F-35A has no canopy at all.
+    const eye = cockpitEyeFor(p.spec.modelKey);
     camera.position
       .copy(p.pos)
-      .addScaledVector(fwd, 5)
-      .addScaledVector(up, 2.2);
+      .addScaledVector(fwd, eye.z)
+      .addScaledVector(up, eye.y);
     camera.quaternion.copy(p.quat);
   } else {
     const cx =
@@ -1855,13 +1932,13 @@ function playerInput(dt: number): void {
     rx = pcRoll;
   } else {
     // Touch stick, sim-style: pull BACK (drag down, joy.y > 0) = nose
-    // up (px < 0); stick right = bank right (rx < 0). This matches
-    // the help text ("pull the stick back") and the keyboard (ArrowUp
-    // = nose up). The old mapping had stick up = nose up, which is
-    // why the live tester pulled down and the jet did not rotate —
-    // the pull they expected was the opposite of what the stick did.
+    // up (px < 0); stick right (joy.x > 0) = bank right (rx > 0 —
+    // the physics maps rollIn > 0 to a right bank). Pass 11: this
+    // was rx = -joy.x, which rolled the jet LEFT when the stick
+    // went right. This matches the help text ("pull the stick
+    // back") and the keyboard (ArrowUp = nose up).
     px = -joy.y;
-    rx = -joy.x;
+    rx = joy.x;
   }
   px += tilt.pitch ?? 0;
   rx += tilt.roll ?? 0;
@@ -2031,6 +2108,15 @@ function handleDeaths(): void {
         // A dying crash already spectates from the dying detection.
         if (!a.crashedFromDying && !spectating) {
           spectating = true;
+          // Pass 11 (wreck free orbit): the wreck view starts as the
+          // free-orbit camera (drag orbits, wheel/pinch zooms), framed
+          // at the default 30 m / 0.32 pitch. The mode the player had
+          // is restored by skipSpectate.
+          preSpectateCamMode = camMode;
+          camMode = 2;
+          pcInput.setCameraMode(2);
+          camOrbit = { yaw: 0, pitch: 0.32 };
+          camDist = 30;
           setSpectateBanner(true, a.lastCrashReason ?? undefined);
         }
         // A dying crash (shot down, fell, impacted) shows the picker
@@ -2152,7 +2238,22 @@ function animate(): void {
   // player.pos is fresh (synced in the previous frame's last step),
   // so the shift is computed from the true position and every read
   // after the substeps sees the shifted position.
-  worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
+  // Pass 11 (infinite terrain): capture the shift, stream terrain
+  // around the player, and move the CAMERA with the shift. The camera
+  // was never registered with the FloatingOrigin, so at every shift
+  // the chase lerp left it ~2 km behind the jet for ~0.6 s — the
+  // "glitch back" Nicholas felt every ~2 km of flight. The jet and
+  // the terrain shift invisibly (original-frame jump 0.000 m over 21
+  // shifts / 40 km); moving the camera with the world makes the shift
+  // invisible for the chase view too (cockpit / free-orbit position
+  // absolutely, so they never glitched). The streamer update runs
+  // right after the shift check, once per frame.
+  const shift = worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
+  if (shift) {
+    camera.position.x -= shift.x;
+    camera.position.z -= shift.z;
+  }
+  terrainStreamer.update(player?.pos ?? new THREE.Vector3());
   applyFailure(elapsed);
   updateSky(rawDt);
   const turb = cfg.weather.turbulence;
@@ -2199,6 +2300,13 @@ function animate(): void {
   if (player) {
     if (player.dying && !prevPlayerDying) {
       spectating = true;
+      // Pass 11 (wreck free orbit): see handleDeaths — the wreck view
+      // starts as the free-orbit camera, framed at the default.
+      preSpectateCamMode = camMode;
+      camMode = 2;
+      pcInput.setCameraMode(2);
+      camOrbit = { yaw: 0, pitch: 0.32 };
+      camDist = 30;
       const killer =
         player.lastHitBy?.isPlayer === false ? 'an enemy' : undefined;
       setSpectateBanner(true, player.dyingReason ?? undefined, killer);
@@ -2207,6 +2315,8 @@ function animate(): void {
     // If the player respawned (alive again), spectate is over.
     if (player.alive && !player.dying && spectating && !respawnTimer) {
       spectating = false;
+      camMode = preSpectateCamMode;
+      pcInput.setCameraMode(camMode);
       setSpectateBanner(false);
     }
   }

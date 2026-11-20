@@ -13,7 +13,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
-import { WeaponSystem } from '../src/combat/WeaponSystem';
+import { WeaponSystem, zoneForHitPoint } from '../src/combat/WeaponSystem';
 import {
   generateHeights,
   heightfieldHeightAt,
@@ -349,6 +349,44 @@ async function main(): Promise<void> {
       `Going-down (${key}): lethal damage -> dying + fire -> fall -> impact`,
       entered && fell && crashed && ac.crashedFromDying,
       `dying=${ac.dying} fire=${ac.fireKind} fell=${fell} crashed=${crashed} crashedFromDying=${ac.crashedFromDying} finalY=${ac.pos.y.toFixed(1)}`,
+    );
+    ac.dispose();
+  }
+
+  // ---- 5. Hit-point -> zone mapping respects the body frame ----
+  // The physical LEFT wing is +X (right wing -X), so a hit at local
+  // +span/4 must resolve to wingL and -span/4 to wingR; same for the
+  // engines (+1.2 -> engineL, -1.2 -> engineR). Pass 11: the anchors
+  // were mirrored (+X called right), so a left-wing hit damaged
+  // wingR and detached the wrong wing's mesh.
+  {
+    const ac = makeJet('fa18', false);
+    ac.resetAt(0, 600, 0, 0); // heading 0: body frame = world frame
+    const S = SPECS['fa18']!;
+    const hit = (lx: number, ly: number, lz: number): string =>
+      zoneForHitPoint(
+        ac,
+        new THREE.Vector3(ac.pos.x + lx, ac.pos.y + ly, ac.pos.z + lz),
+      );
+    check(
+      'Hit on physical LEFT wing (+X) resolves to wingL',
+      hit(S.span / 4, 0, 0) === 'wingL',
+      `zone=${hit(S.span / 4, 0, 0)}`,
+    );
+    check(
+      'Hit on physical RIGHT wing (-X) resolves to wingR',
+      hit(-S.span / 4, 0, 0) === 'wingR',
+      `zone=${hit(-S.span / 4, 0, 0)}`,
+    );
+    check(
+      'Hit on physical LEFT engine (+X) resolves to engineL',
+      hit(1.2, 0, -S.length / 4) === 'engineL',
+      `zone=${hit(1.2, 0, -S.length / 4)}`,
+    );
+    check(
+      'Hit on physical RIGHT engine (-X) resolves to engineR',
+      hit(-1.2, 0, -S.length / 4) === 'engineR',
+      `zone=${hit(-1.2, 0, -S.length / 4)}`,
     );
     ac.dispose();
   }

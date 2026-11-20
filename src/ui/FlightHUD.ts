@@ -81,17 +81,21 @@ export class FlightHUD {
     set('hudHdg', String(Math.round(hdg)).padStart(3, '0') + '°');
     set('hudAoA', Math.round(ac.aoa) + '°');
     // Bank indicator (Issue 1): the ACTUAL bank from the physics
-    // quaternion (Euler YXZ z; positive = left bank). Steer right must
-    // read "N° ▶" (right bank) and steer left "◀ N°" — if this ever
-    // disagrees with the stick, the input chain is inverted, not the
-    // physics. Level within 2° reads 0°.
+    // quaternion (Euler YXZ z; positive = RIGHT bank — the right wing
+    // is -X, so a positive rotation about the nose axis drops it).
+    // Steer right must read "N° ▶" (right bank) and steer left
+    // "◀ N°" — if this ever disagrees with the stick, the input
+    // chain is inverted, not the physics. Level within 2° reads 0°.
+    // Pass 11: this had the arrows backwards (positive read as a
+    // left bank), which is why the HUD agreed with the inverted
+    // inputs while Nicholas reported the roll backwards.
     const bankDeg = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z * R2D;
     set(
       'hudBank',
       bankDeg > 2
-        ? `◀ ${Math.round(bankDeg)}°`
+        ? `${Math.round(bankDeg)}° ▶`
         : bankDeg < -2
-          ? `${Math.round(-bankDeg)}° ▶`
+          ? `◀ ${Math.round(-bankDeg)}°`
           : '0°',
     );
     set('hudG', ac.gload.toFixed(1));
@@ -403,6 +407,9 @@ export class FlightHUD {
     if (!d) return;
     d.classList.remove('hidden');
     d.textContent = lines.join('\n');
+    // Pass 11: the panel scrolls (max-height in index.html) — keep
+    // the newest spawn-trace / warning lines in view.
+    d.scrollTop = d.scrollHeight;
   }
 
   /** Camera-mode toast (C key / camBtn): Chase / Cockpit / Free orbit. */

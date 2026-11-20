@@ -172,7 +172,11 @@ export const SPECS: Record<string, AircraftSpec> = {
     stallSpeed: 66,
     inducedK: 0.1,
     e: 0.8,
-    rotateSpeedKt: 126,
+    // Pass 11: Vr 140 kt — the old 126 kt was BELOW the 128 kt
+    // stall speed (CL needed at Vr 1.66 > CLmax 1.6), which is why
+    // a deck liftoff at ~130 kt dropped at -2114 fpm: it lifted
+    // off below a flyable speed.
+    rotateSpeedKt: 140,
     clCurve: {
       linearEndAoA: 15,
       linearEndCL: 1.35,
@@ -243,7 +247,11 @@ export const SPECS: Record<string, AircraftSpec> = {
     span: 13.56,
     length: 19.0,
     thrustMax: 312000,
-    stallSpeed: 54,
+    // Pass 11: clean Vs ~117 kt at combat weight (best estimates
+    // 108-130 kt; the exact figure is classified), so CLmax 1.40
+    // (was 1.75, uncorroborated) and stallSpeed 60 m/s (was 54,
+    // 105 kt — ~20 kt too low). Vr 140 kt unchanged.
+    stallSpeed: 60,
     inducedK: 0.159,
     e: 0.85,
     rotateSpeedKt: 140,
@@ -251,10 +259,10 @@ export const SPECS: Record<string, AircraftSpec> = {
     elevSchedA: 60, // big tail + TVC: less scheduling needed (issue 6)
     clCurve: {
       linearEndAoA: 15,
-      linearEndCL: 1.35,
-      peak: 1.75,
+      linearEndCL: 1.2,
+      peak: 1.4,
       peakAoA: 35,
-      floor: 1.0,
+      floor: 0.85,
       postSlope: 0.015,
       cdSep: 0.3,
     },
@@ -282,14 +290,18 @@ export const SPECS: Record<string, AircraftSpec> = {
     span: 13.05,
     length: 19.41,
     thrustMax: 258000,
-    stallSpeed: 62,
+    // Pass 11: real CLmax ≈ 1.1 (no leading-edge flaps), so
+    // Vs ~141 kt — the old CL 1.36 predicted Vs 127 kt, not the
+    // spec's own 120 kt. Thrust 258 kN is the F100-PW-229
+    // (the -220 is 211 kN total). Vr 150 kt unchanged.
+    stallSpeed: 72,
     inducedK: 0.132,
     e: 0.8,
     rotateSpeedKt: 150,
     clCurve: {
       linearEndAoA: 14,
-      linearEndCL: 1.3,
-      peak: 1.36,
+      linearEndCL: 1.05,
+      peak: 1.1,
       peakAoA: 25,
       floor: 0.7,
       postSlope: 0.06,
@@ -320,15 +332,19 @@ export const SPECS: Record<string, AircraftSpec> = {
     span: 11.36,
     length: 17.32,
     thrustMax: 163000,
-    stallSpeed: 59,
+    // Pass 11: CL peak 1.35 on the 45 m² EFFECTIVE (lifting-body)
+    // area — the old 1.58 was quoted on the 38 m² wing area, so it
+    // predicted Vs 124 kt while the spec said 115 kt. 1.35 on
+    // 45 m² ≡ 1.60 on 38 m², Vs ~124 kt. Vr 130 kt unchanged.
+    stallSpeed: 64,
     inducedK: 0.11,
     e: 0.85,
     rotateSpeedKt: 130,
     elevSchedA: 110, // small tail: more scheduling needed (issue 6)
     clCurve: {
       linearEndAoA: 15,
-      linearEndCL: 1.35,
-      peak: 1.58,
+      linearEndCL: 1.15,
+      peak: 1.35,
       peakAoA: 30,
       floor: 0.9,
       postSlope: 0.02,
@@ -362,6 +378,11 @@ export const SPECS: Record<string, AircraftSpec> = {
     name: 'Su-34 Fullback',
     short: 'Su-34',
     archetype: 'fixed-wing',
+    // Pass 11: mass 30,000 kg is the roster's COMBAT mass
+    // (like the F-22's 24,883 kg vs its 38,000 kg MTOW) — the real
+    // normal takeoff weight is 39,000 kg (MTOW 45,100 kg), at
+    // which the same CLmax gives Vs ~157 kt. Kept at 30 t by
+    // convention; the docs carry the 39 t figure.
     mass: 30000,
     fuelMass: 12100,
     wingArea: 62.0,
