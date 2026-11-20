@@ -4,16 +4,19 @@
 // and DEPLOY on approach/landing — and down in VTOL hover (F-35A).
 //
 // Two defects the gear work fixes (measured, not assumed):
-// - No player GLB has gear meshes (GLB inspection: F-22/F-15E only
-//   have a flat "landingOff" belly fairing — the gear-UP config), so
-//   the gear is procedural (strut + wheel x3, built by
+// - The F/A-18F's GLB carries its OWN gear (nose twin wheels + 2
+//   main wheels, baked into the "ground" airframe mesh — pass 11's
+//   "no included gear" claim was WRONG, measured on the normalized
+//   model where the wheel bottoms had already been aligned to
+//   -0.8 m). It is separated into gear_front / gear_L / gear_R by
+//   separateIncludedGear() and animated with the existing gearDeploy
+//   factor; the F-18 shows ONLY its own gear, no procedural extras.
+//   The F-22/F-15E only have a flat "landingOff" belly fairing (the
+//   gear-UP configuration) and the F-35A's lowest point is its belly,
+//   so they keep procedural gear (strut + wheel x3, built by
 //   AircraftRigBindings at the physics gear-post stations).
-//   Re-verified 2026-11-20 on the RAW GLBs with no rig involved:
-//   fa18 4 named meshes, f22 3, f35a 2, f15e 3, none below the belly
-//   and none unnamed — there is no included gear. (A pass-11 brief
-//   claimed 9 unnamed included-gear meshes per jet; those were the
-//   procedural legs' own children, measured after the rig built
-//   them. The gear stays procedural.)
+//   Re-verified 2026-11-20 on the RAW GLBs with MeshoptDecoder:
+//   fa18 has the included gear above; f22/f35a/f15e have none.
 // - The visual models were mounted too low: normalizeAircraft centred
 //   them on the bbox centre, but the tall tail pushes that centre up,
 //   so the F-18/F-15E bellies sat 0.35–0.41 m UNDERGROUND on their
@@ -294,9 +297,11 @@ async function main(): Promise<void> {
     const rig = ac.rig!;
 
     // --- Static geometry, model frame (before resetAt moves the
-    // aircraft): the gear is procedural, so assert the three legs
-    // are the ONLY gear, their wheels sit at the physics feet, and
-    // their strut tops reach the airframe surface at each station.
+    // aircraft): the gear is the GLB's own on the F-18 (separated
+    // gear_front / gear_L / gear_R, no procedural legs) and
+    // procedural on the other jets — assert the three legs are the
+    // ONLY gear, their wheels sit at the physics feet, and their
+    // strut tops reach the airframe surface at each station.
     {
       const model = ac.model!;
       model.updateMatrixWorld(true);
@@ -308,37 +313,79 @@ async function main(): Promise<void> {
       model.traverse((o) => {
         if (o.name.startsWith('gear_leg_')) legGroups.push(o);
       });
-      check(
-        `${key}: exactly three procedural gear legs`,
-        legGroups.length === 3,
-        `found ${legGroups.length}: ${legGroups.map((g) => g.name).join(', ')}`,
-      );
-      const underLeg = (m: THREE.Object3D): boolean => {
+      const glbGear = (['gear_front', 'gear_L', 'gear_R'] as const)
+        .map((s) => model.getObjectByName(s))
+        .filter((o): o is THREE.Object3D => !!o);
+      if (spec.includedGear) {
+        check(
+          `${key}: NO procedural gear legs (the GLB's own gear is used)`,
+          legGroups.length === 0,
+          `found ${legGroups.length}: ${legGroups.map((g) => g.name).join(', ')}`,
+        );
+        check(
+          `${key}: exactly three separated GLB gear groups`,
+          glbGear.length === 3,
+          `found ${glbGear.length}: ${glbGear.map((g) => g.name).join(', ')}`,
+        );
+      } else {
+        check(
+          `${key}: exactly three procedural gear legs`,
+          legGroups.length === 3,
+          `found ${legGroups.length}: ${legGroups.map((g) => g.name).join(', ')}`,
+        );
+      }
+      const underGear = (m: THREE.Object3D): boolean => {
         let p: THREE.Object3D | null = m.parent;
         while (p) {
-          if (p.name.startsWith('gear_leg_')) return true;
+          if (
+            p.name.startsWith('gear_leg_') ||
+            p.name === 'gear_front' ||
+            p.name === 'gear_L' ||
+            p.name === 'gear_R'
+          )
+            return true;
           p = p.parent;
         }
-        return false;
+        return m.name === 'gear_front' || m.name === 'gear_L' || m.name === 'gear_R';
       };
+      // A stray gear mesh is one below -1.0 m that is not one of the
+      // three legs. The airframe ('ground') and the stores
+      // ('Weapon_pack') legitimately extend below the belly — the
+      // F-18's airframe carries a centreline ventral feature at
+      // -1.63 m and stores at -1.45 m — so they are not gear and
+      // are excluded by name.
       const stray = allMeshes.filter((m) => {
         const bb = new THREE.Box3().setFromObject(m);
-        return bb.min.y < -1.0 && !underLeg(m);
+        return (
+          bb.min.y < -1.0 &&
+          !underGear(m) &&
+          m.name !== 'ground' &&
+          m.name !== 'Weapon_pack'
+        );
       });
       check(
         `${key}: no gear meshes outside the three legs (no duplicates)`,
         stray.length === 0,
         stray.length > 0
           ? `stray below -1.0 m: ${stray.map((m) => `'${m.name}'`).join(', ')}`
-          : `${allMeshes.filter((m) => underLeg(m)).length} leg child meshes, all under gear_leg_*`,
+          : `${allMeshes.filter((m) => underGear(m)).length} gear meshes, all under the three legs`,
       );
       const ray2 = new THREE.Raycaster();
-      // Physics gear posts: nose (0, +0.35L), mains (x = ±1.6, -0.15L).
-      const stations: Array<['gear_front' | 'gear_L' | 'gear_R', number, number]> = [
-        ['gear_front', 0, 0.35 * spec.length],
-        ['gear_L', -1.6, -0.15 * spec.length],
-        ['gear_R', 1.6, -0.15 * spec.length],
-      ];
+      // Gear stations: the GLB's own stations for the F-18 (its gear
+      // sits at the model's stations, not the physics posts — nose
+      // z +3.57, mains z -2.26), the physics posts for the procedural
+      // jets (nose (0, +0.35L), mains (x = ±1.6, -0.15L)).
+      const stations: Array<['gear_front' | 'gear_L' | 'gear_R', number, number]> = spec.includedGear
+        ? spec.includedGear.map((st) => [
+            st.slot,
+            (st.x0 + st.x1) / 2,
+            (st.z0 + st.z1) / 2,
+          ])
+        : [
+            ['gear_front', 0, 0.35 * spec.length],
+            ['gear_L', -1.6, -0.15 * spec.length],
+            ['gear_R', 1.6, -0.15 * spec.length],
+          ];
       for (const [slot, sx, sz] of stations) {
         const leg = rig.bound[slot];
         if (!leg) {
@@ -356,14 +403,21 @@ async function main(): Promise<void> {
           strutTop = Math.max(strutTop, bb.max.y);
           wheelFoot = Math.min(wheelFoot, bb.min.y);
         }
-        const others = allMeshes.filter((m) => !underLeg(m));
+        const others = allMeshes.filter((m) => !underGear(m));
         ray2.set(new THREE.Vector3(sx, -10, sz), new THREE.Vector3(0, 1, 0));
         ray2.far = 30;
         const hits = ray2.intersectObjects(others, false);
         const belly = hits.length > 0 ? hits[0]!.point.y : NaN;
+        // The included gear is cut 0.05 m short of the airframe (the
+        // cap margin) plus a triangle-straddle, so its strut top can
+        // sit up to ~0.08 m below the surface — still attached, not
+        // floating (the F-15E's old 0.72 m gap is what this catches).
+        // Procedural legs overlap the airframe by 0.10 m, so they
+        // sit above the surface instead.
+        const gapTol = spec.includedGear ? 0.1 : 0.02;
         check(
           `${key}: ${slot} strut top touches the belly (no floating gear)`,
-          !Number.isNaN(belly) && strutTop >= belly - 0.02 && strutTop <= belly + 0.3,
+          !Number.isNaN(belly) && strutTop >= belly - gapTol && strutTop <= belly + 0.3,
           `strutTop=${strutTop.toFixed(2)} belly=${Number.isNaN(belly) ? 'NO HIT' : belly.toFixed(2)} gap=${Number.isNaN(belly) ? '?' : (belly - strutTop).toFixed(2)}`,
         );
         check(
@@ -393,7 +447,7 @@ async function main(): Promise<void> {
       `bellyY=${rig.bellyY.toFixed(2)} (was -2.61 fa18 / -2.55 f15e / -2.03 f22 / -1.72 f35a)`,
     );
     check(
-      `${key}: three gear legs bound (procedural strut + wheel)`,
+      `${key}: three gear legs bound (${spec.includedGear ? 'GLB own gear' : 'procedural strut + wheel'})`,
       !!rig.bound.gear_front && !!rig.bound.gear_L && !!rig.bound.gear_R,
       `bound: ${rig.bound.gear_front ? 'front' : '-'} ${rig.bound.gear_L ? 'L' : '-'} ${rig.bound.gear_R ? 'R' : '-'}`,
     );
@@ -432,6 +486,53 @@ async function main(): Promise<void> {
       ac.alive && !ac.gear && rig.gearDeploy < 0.05 && !gearVisible(ac),
       `gear=${ac.gear} deploy=${rig.gearDeploy.toFixed(2)} visible=${gearVisible(ac)} agl=${agl(ac).toFixed(1)} ias=${ac.ias.toFixed(0)} m/s`,
     );
+
+    // --- High-speed stow hold (v4.6 live failure, 2026-11-20): the
+    // F-18's gear was DOWN in flight at 499–773 kt / 5,861–29,777 ft
+    // while the other three jets stowed correctly — F-18-specific,
+    // and the harness had missed it twice (it only checked the stow
+    // right after takeoff, at ~113 m/s). The cause was the F-18's
+    // INCLUDED gear baked into the airframe mesh: it never stowed
+    // because it was never animated, while the procedural legs the
+    // probe checked did stow. Now the included gear IS the animated
+    // gear, so hold it at high speed. The jet is teleported to level
+    // flight at 250 m/s (~486 kt) at 2,000 m — the same teleport the
+    // approach check uses, because flying there by pitch control
+    // porpoises (the jet trades speed for altitude and never gets
+    // fast) — then the live physics, variable dt and wind run for
+    // 10 s and the gear must STILL be stowed.
+    {
+      const hdgRad = (alpha.hdg * Math.PI) / 180;
+      const fwdX = Math.sin(hdgRad);
+      const fwdZ = Math.cos(hdgRad);
+      const tx = alpha.x;
+      const ty = alpha.elev + 2000;
+      const tz = alpha.z;
+      const spd = 250;
+      const half = hdgRad / 2;
+      ac.body.setTranslation({ x: tx, y: ty, z: tz }, true);
+      ac.body.setRotation({ x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) }, true);
+      ac.body.setLinvel({ x: fwdX * spd, y: 0, z: fwdZ * spd }, true);
+      ac.pos.set(tx, ty, tz);
+      ac.vel.set(fwdX * spd, 0, fwdZ * spd);
+      ac.quat.set(0, Math.sin(half), 0, Math.cos(half));
+      ac.pitchIn = 0;
+      ac.rollIn = 0;
+      ac.yawIn = 0;
+      ac.thrTarget = 1;
+      stepFor(ac, 10);
+      const fastIas = ac.ias;
+      const fastAltFt = ac.pos.y * 3.28084;
+      check(
+        `${key}: gear STAYS stowed at high speed (no F-18 re-deploy in flight)`,
+        ac.alive && ac.ias > 200 && !ac.gear && rig.gearDeploy < 0.05 && !gearVisible(ac),
+        `ias=${fastIas.toFixed(0)} m/s (${(fastIas * 1.944).toFixed(0)} kt) alt=${fastAltFt.toFixed(0)} ft gear=${ac.gear} deploy=${rig.gearDeploy.toFixed(2)} visible=${gearVisible(ac)} agl=${agl(ac).toFixed(1)}`,
+      );
+      // Climb away / slow down before the approach teleport.
+      ac.thrTarget = 0.5;
+      ac.pitchIn = -0.3;
+      stepFor(ac, 3);
+    }
 
     // --- Approach: teleport to a controlled approach state and
     // descend through the deploy band. Flying a full scripted

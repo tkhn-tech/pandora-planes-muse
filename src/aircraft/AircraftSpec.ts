@@ -79,6 +79,20 @@ export interface RotaryParams {
   autorotationLift: number;
 }
 
+/** Included-gear station volume (aircraft frame, after normalize):
+ *  triangles whose centroid is inside [x0, x1] x [z0, z1] and below
+ *  capY belong to that gear. capY is the fuselage / wing underside
+ *  at the station minus a 0.05 m safety margin, so no airframe
+ *  triangle is ever cut into the gear. */
+export interface IncludedGearStation {
+  slot: 'gear_front' | 'gear_L' | 'gear_R';
+  x0: number;
+  x1: number;
+  z0: number;
+  z1: number;
+  capY: number;
+}
+
 export interface AircraftSpec {
   /** Record key ('fa18', 'f35a', ...). */
   key: string;
@@ -152,6 +166,21 @@ export interface AircraftSpec {
   gunRpm?: number;
   /** Can carry bombs. */
   bombs?: boolean;
+  /** Belly alignment for normalizeAircraft: align the fuselage
+   *  belly at rawY (raw GLB frame, metres) to targetY in the
+   *  aircraft frame, instead of the bbox min to -0.8 m. Set only
+   *  when the GLB's bbox min is NOT the belly — the F-18's bbox min
+   *  is its included gear wheels, 1.36 m below the belly, so the
+   *  default alignment put the belly at +0.56 m and the wheels at
+   *  -0.8 m, 1.4 m short of the physics gear feet (-2.2 m). */
+  bellyAlign?: { rawY: number; targetY: number };
+  /** Included landing gear, separated from the airframe at load time
+   *  (F-18 only — the other player GLBs were verified 2026-11-20 to
+   *  have no gear: F-22/F-15E carry only a flat "landingOff" belly
+   *  fairing, the F-35A's lowest point is its belly, so they keep
+   *  procedural gear). When present, the rig binds these instead of
+   *  building procedural legs. */
+  includedGear?: IncludedGearStation[];
   /** Rotary parameters (heli only). */
   rotary?: RotaryParams;
 }
@@ -192,6 +221,27 @@ export const SPECS: Record<string, AircraftSpec> = {
     maxVectorDeg: 0,
     tint: 0x8a97a3,
     modelKey: 'fa18',
+    // Included landing gear (Nicholas's repeated request, 2026-11-20
+    // — the pass-11 "no included gear in any GLB" claim was WRONG:
+    // it measured the NORMALIZED model, where normalizeAircraft had
+    // already aligned the gear wheel bottoms to -0.8 m, so of course
+    // nothing was below -0.8. Measured on the RAW GLB with
+    // MeshoptDecoder (diag-glb, 2026-11-20): the "ground" airframe
+    // mesh carries its own gear — nose twin wheels at (x +-0.29,
+    // z +3.57), mains at (x +-1.55, z -2.26), wheel bottoms at raw
+    // y -0.01 (mains) / 0.00 (nose), 1.36 m below the fuselage belly
+    // (raw y 1.35, centre strip |x|<0.5, z -1..1). bellyAlign puts
+    // the belly at -0.84 m so the wheel bottoms land exactly on the
+    // physics gear feet (-2.2 m); the stations below are the gear
+    // volumes in the aircraft frame after that shift (nose fuselage
+    // underside -0.95 m, mains wing underside -1.20 m, each minus a
+    // 0.05 m safety margin — measured by raycast, diag-fa18-caps).
+    bellyAlign: { rawY: 1.35, targetY: -0.84 },
+    includedGear: [
+      { slot: 'gear_front', x0: -0.8, x1: 0.8, z0: 2.8, z1: 4.4, capY: -1.0 },
+      { slot: 'gear_L', x0: -2.2, x1: -0.9, z0: -3.1, z1: -1.6, capY: -1.25 },
+      { slot: 'gear_R', x0: 0.9, x1: 2.2, z0: -3.1, z1: -1.6, capY: -1.25 },
+    ],
     turn: 1.0,
     rollDeg: 150,
     pitch: 1.0,
