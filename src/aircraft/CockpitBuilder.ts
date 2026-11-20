@@ -26,10 +26,13 @@
 // 3. NO INTERIOR: only the F-18's GLB has any cockpit interior (a
 //    pilot helmet, 0.02 m behind the eye). The others are bare shells.
 //    buildCockpit() adds the same procedural kit to every player jet
-//    — instrument panel (+ screens), HUD combiner + reticle, coaming,
+//    — instrument panel (+ screens), HUD combiner glass, coaming,
 //    seat + helmet — positioned from the eye, so all four read to the
 //    F-18's standard. The F-35A's panel is a single wide display (its
-//    real layout); the others get two screens + gauge dots. The kit
+//    real layout); the others get two screens. Pass 12: every screen
+//    carries lit symbology and a row of three round dials (rims,
+//    ticks, needles) sits below the screens — the panels were blank
+//    grey/black with no dials in the v4.6.1 live check. The kit
 //    sits inside the fuselage (panel top = eye.y - 0.55, below the
 //    canopy base on every jet), so it is occluded from outside by the
 //    airframe and only reads from the cockpit (and faintly through the
@@ -80,7 +83,15 @@ export function cockpitEyeFor(modelKey: string): CockpitEye {
  * with no panel or HUD, because the camera looked backward at the
  * seat behind the eye instead of forward at the panel. Flip it 180°
  * about Y so the camera looks along the aircraft's forward (+Z body).
+ * Pass 12: then pitch the view down so the instrument panel (with
+ * its dials) is visible at the bottom of the frame — the panel sits
+ * ~42° below the forward axis and the 62° FOV cockpit camera (±31°)
+ * cannot see it level. 15° down puts the panel ~27° below the look
+ * direction — inside the frame — while the horizon stays in the
+ * upper half.
  */
+export const COCKPIT_PITCH_DOWN_DEG = 15;
+
 export function cockpitCameraQuaternion(
   aircraftQuat: THREE.Quaternion,
 ): THREE.Quaternion {
@@ -90,6 +101,12 @@ export function cockpitCameraQuaternion(
       new THREE.Quaternion().setFromAxisAngle(
         new THREE.Vector3(0, 1, 0),
         Math.PI,
+      ),
+    )
+    .multiply(
+      new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0),
+        -THREE.MathUtils.degToRad(COCKPIT_PITCH_DOWN_DEG),
       ),
     );
 }
@@ -111,8 +128,19 @@ const MAT = {
   }),
   screen: new THREE.MeshBasicMaterial({ color: 0x14324a }),
   screenWide: new THREE.MeshBasicMaterial({ color: 0x1a4a3a }),
-  gaugeAmber: new THREE.MeshBasicMaterial({ color: 0xffd166 }),
-  gaugeGreen: new THREE.MeshBasicMaterial({ color: 0x7ee787 }),
+  // Dial + screen-symbology materials (pass 12, worker D): unlit
+  // MeshBasicMaterial, so the instruments read in the dark cockpit
+  // (the panel is inside the fuselage, away from the sun — standard
+  // materials go black there, which is why the live panels read as
+  // blank grey/black with no dials).
+  dialFace: new THREE.MeshBasicMaterial({ color: 0x0d1a24 }),
+  dialRim: new THREE.MeshBasicMaterial({ color: 0xd8e2ea }),
+  dialTick: new THREE.MeshBasicMaterial({ color: 0xcfe3ef }),
+  dialNeedle: new THREE.MeshBasicMaterial({ color: 0xff5a4a }),
+  dialNeedleWhite: new THREE.MeshBasicMaterial({ color: 0xffffff }),
+  screenLine: new THREE.MeshBasicMaterial({ color: 0x7ee787 }),
+  screenLineCyan: new THREE.MeshBasicMaterial({ color: 0x6ab8ff }),
+  screenLineAmber: new THREE.MeshBasicMaterial({ color: 0xffd166 }),
   hudGlass: new THREE.MeshBasicMaterial({
     color: 0x9fd8ff,
     transparent: true,
@@ -120,7 +148,6 @@ const MAT = {
     side: THREE.DoubleSide,
     depthWrite: false,
   }),
-  hudLine: new THREE.MeshBasicMaterial({ color: 0x7ee787 }),
   frame: new THREE.MeshStandardMaterial({
     color: 0x23262b,
     roughness: 0.9,
@@ -154,6 +181,68 @@ function box(
   m.position.set(x, y, z);
   if (rx) m.rotation.x = rx;
   return m;
+}
+
+/**
+ * One round standby dial (pass 12, worker D): dark face, white rim,
+ * 8 tick marks, a needle on a pivot (rotated to `needleDeg`, 0 = 12
+ * o'clock) and a centre hub. The whole dial tilts with the panel
+ * (rx 0.25). Parts are named `cockpit_dial_*` for probes; the needle
+ * pivot is `cockpit_dial_needle_pivot`, the needle itself
+ * `cockpit_dial_needle`.
+ */
+function dial(
+  name: string,
+  r: number,
+  needleDeg: number,
+  needleMat: THREE.Material,
+  x: number,
+  y: number,
+  z: number,
+): THREE.Group {
+  const g = new THREE.Group();
+  g.name = name;
+  g.position.set(x, y, z);
+  g.rotation.x = 0.25;
+  const face = new THREE.Mesh(new THREE.CircleGeometry(r, 24), MAT.dialFace);
+  face.name = 'cockpit_dial_face';
+  g.add(face);
+  const rim = new THREE.Mesh(
+    new THREE.TorusGeometry(r, r * 0.1, 8, 32),
+    MAT.dialRim,
+  );
+  rim.name = 'cockpit_dial_rim';
+  g.add(rim);
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    const tick = new THREE.Mesh(
+      new THREE.BoxGeometry(0.006, r * 0.22, 0.004),
+      MAT.dialTick,
+    );
+    tick.name = 'cockpit_dial_tick';
+    tick.position.set(Math.sin(a) * r * 0.86, Math.cos(a) * r * 0.86, 0.002);
+    tick.rotation.z = -a;
+    g.add(tick);
+  }
+  const pivot = new THREE.Group();
+  pivot.name = 'cockpit_dial_needle_pivot';
+  pivot.rotation.z = (-needleDeg * Math.PI) / 180;
+  const needle = new THREE.Mesh(
+    new THREE.BoxGeometry(0.008, r * 0.8, 0.004),
+    needleMat,
+  );
+  needle.name = 'cockpit_dial_needle';
+  needle.position.set(0, r * 0.4, 0.004);
+  pivot.add(needle);
+  g.add(pivot);
+  const hub = new THREE.Mesh(
+    new THREE.CircleGeometry(r * 0.12, 12),
+    MAT.dialNeedleWhite,
+  );
+  hub.name = 'cockpit_dial_hub';
+  hub.position.z = 0.006;
+  g.add(hub);
+  return g;
 }
 
 /**
@@ -203,16 +292,31 @@ export function buildCockpit(
     box('cockpit_panel', panelW, 0.45, 0.08, MAT.panel, 0, panelY, panelZ, 0.25),
   );
   // Screens on the panel face: F-35A one wide display, the others two
-  // screens + gauge dots.
+  // screens. Pass 12 (worker D): the screens were blank dark
+  // rectangles and the only "gauges" were two flat dots — the
+  // v4.6.1 live check read the panels as "blank grey/black with no
+  // dials". Each screen now carries lit symbology (a horizon bar +
+  // data blocks, unlit so they read in the dark cockpit), and a row
+  // of three round dials with rims, ticks and needles sits below
+  // the screens, on the panel face.
   const faceZ = panelZ + 0.055;
   const scrY = panelY + 0.05;
+  const glyph = (cx: number, w: number): void => {
+    kit.add(
+      box('cockpit_screen_line', w * 0.8, 0.012, 0.004, MAT.screenLine, cx, scrY, faceZ + 0.012, 0.25),
+    );
+    kit.add(
+      box('cockpit_screen_line', 0.05, 0.035, 0.004, MAT.screenLineCyan, cx - w * 0.22, scrY + 0.06, faceZ + 0.012, 0.25),
+    );
+    kit.add(
+      box('cockpit_screen_line', 0.05, 0.02, 0.004, MAT.screenLineAmber, cx + w * 0.22, scrY - 0.07, faceZ + 0.012, 0.25),
+    );
+  };
   if (modelKey === 'f35a') {
     kit.add(
       box('cockpit_screen', panelW * 0.82, 0.26, 0.02, MAT.screenWide, 0, scrY, faceZ, 0.25),
     );
-    kit.add(
-      box('cockpit_gauge', 0.3, 0.03, 0.02, MAT.gaugeGreen, 0, scrY - 0.12, faceZ, 0.25),
-    );
+    glyph(0, panelW * 0.82);
   } else {
     const sw = panelW * 0.36;
     kit.add(
@@ -221,41 +325,43 @@ export function buildCockpit(
     kit.add(
       box('cockpit_screen_R', sw, 0.26, 0.02, MAT.screen, panelW * 0.24, scrY, faceZ, 0.25),
     );
-    for (const [gx, gm] of [
-      [-0.32, MAT.gaugeAmber],
-      [0.32, MAT.gaugeGreen],
-    ] as const) {
-      const dot = new THREE.Mesh(
-        new THREE.CircleGeometry(0.035, 12),
-        gm,
-      );
-      dot.name = 'cockpit_gauge';
-      dot.position.set(gx, scrY - 0.13, faceZ + 0.005);
-      dot.rotation.x = 0.25;
-      kit.add(dot);
-    }
+    glyph(-panelW * 0.24, sw);
+    glyph(panelW * 0.24, sw);
   }
+  // Dial row (airspeed / attitude / altitude standbys): white rims,
+  // ticks and coloured needles, so they read as instruments. The
+  // row sits on the panel face below the screens (dial top =
+  // scrY - 0.14 + 0.062, still below the panel top at eye.y - 0.55).
+  const dialY = scrY - 0.14;
+  const dialR = 0.062;
+  const dialAngles = [-40, 15, 65];
+  const dialMats = [MAT.dialNeedle, MAT.dialNeedleWhite, MAT.dialNeedle];
+  [-0.3, 0, 0.3].forEach((dx, i) => {
+    kit.add(
+      dial(
+        `cockpit_dial_${i}`,
+        dialR,
+        dialAngles[i]!,
+        dialMats[i]!,
+        dx,
+        dialY,
+        faceZ + 0.012,
+      ),
+    );
+  });
 
-  // HUD combiner glass + reticle (ring + crosshair), just ahead of the
-  // eye at eye level.
+  // HUD combiner glass only, just ahead of the eye at eye level.
+  // The green reticle (ring + crosshair bars) was REMOVED 2026-11-20
+  // at Nicholas's direction ("Remove this from ALL JETS", F-22
+  // screenshot 20 Nov ~14:28 SGT, purple circle): the reticle read
+  // as a green crosshair circle on the canopy in the external/chase
+  // view. The glass stays — it is a separate transparent plane, not
+  // part of what he circled.
   const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.38), MAT.hudGlass);
   hud.name = 'cockpit_hud_glass';
   hud.position.set(0, eye.y + 0.02, eye.hudZ);
   hud.rotation.x = 0.1;
   kit.add(hud);
-  const ring = new THREE.Mesh(
-    new THREE.TorusGeometry(0.11, 0.006, 8, 32),
-    MAT.hudLine,
-  );
-  ring.name = 'cockpit_hud_reticle';
-  ring.position.set(0, eye.y + 0.02, eye.hudZ + 0.01);
-  kit.add(ring);
-  kit.add(
-    box('cockpit_hud_bar_h', 0.3, 0.012, 0.01, MAT.hudLine, 0, eye.y + 0.02, eye.hudZ + 0.01),
-  );
-  kit.add(
-    box('cockpit_hud_bar_v', 0.012, 0.22, 0.01, MAT.hudLine, 0, eye.y + 0.02, eye.hudZ + 0.01),
-  );
 
   // Canopy frame: the coaming (the padded rim below the panel) only.
   // The side rails + top bow are GONE (2026-11-20): they were the
@@ -282,18 +388,19 @@ export function buildCockpit(
   // the fuselage top as a black box on the spine, and — with the
   // pre-fix camera looking AFT — it filled the cockpit view. The seat
   // back now tops out BELOW the eye (eye.y - 0.12), the headrest and
-  // helmet sit at eye level (the pilot's head), and all three sit
-  // further back, so the eye is in front of the panel + HUD with
-  // nothing tall behind it crowding the view.
+  // helmet sit 0.30 below eye level (tops 1.55 / 1.60, below the
+  // 1.64 fuselage top — the canopy-less F-35A has nothing to hide
+  // them), and all three sit further back, so the eye is in front
+  // of the panel + HUD with nothing tall behind it crowding the view.
   kit.add(
     box('cockpit_seat', 0.62, 0.6, 0.14, MAT.seat, 0, eye.y - 0.42, eye.z - 0.78, -0.2),
   );
   kit.add(
-    box('cockpit_headrest', 0.3, 0.16, 0.1, MAT.seat, 0, eye.y + 0.02, eye.z - 0.84, -0.2),
+    box('cockpit_headrest', 0.3, 0.16, 0.1, MAT.seat, 0, eye.y - 0.28, eye.z - 0.84, -0.2),
   );
   const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), MAT.helmet);
   helmet.name = 'cockpit_helmet';
-  helmet.position.set(0, eye.y + 0.02, eye.z - 0.64);
+  helmet.position.set(0, eye.y - 0.28, eye.z - 0.64);
   kit.add(helmet);
 
   group.add(kit);

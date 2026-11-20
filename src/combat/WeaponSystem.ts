@@ -538,7 +538,27 @@ export class WeaponSystem {
         .setGravityScale(0),
     );
     this.world.createCollider(
-      RAPIER.ColliderDesc.ball(0.6).setSensor(true),
+      RAPIER.ColliderDesc.ball(0.6)
+        .setSensor(true)
+        // Pass 12 (Worker E): collision groups 0 — this sensor must
+        // NEVER generate a contact event. It is a sensor, so it has
+        // no contact forces, but Rapier still emits a collision
+        // event when the OTHER collider has ActiveEvents (the
+        // aircraft's fuselage/gear colliders do), and main.ts's
+        // drain notifies the aircraft on ANY contact. The
+        // 'hard landing' crash rule (bank > 26 deg or impactVs > 9)
+        // then kills a banked jet at altitude when a missile body
+        // brushes its fuselage — measured in probe-ai-live: e3 died
+        // at t=22.9 s at y=448 m (terrain 39 m) and e2 at t=105.3 s
+        // at y=1924 m (terrain 274 m), both banked 52-63 deg, both
+        // with the other collider unregistered (a missile/bomb
+        // body), and the player died the same way at t=112.7 s at
+        // y=1216 m while CLIMBING. The missile needs no Rapier
+        // collision at all — its guidance is analytic PN and its
+        // ground impact is the analytic height check in update() —
+        // so groups 0 (membership 0, mask 0: interacts with
+        // nothing) is the complete fix, with no main.ts change.
+        .setCollisionGroups(0),
       body,
     );
     // Pass 11: shift with the world at an origin shift (body AND mesh
@@ -659,7 +679,13 @@ export class WeaponSystem {
         .setAngvel({ x: 2, y: 0, z: 0 }),
     );
     this.world.createCollider(
-      RAPIER.ColliderDesc.ball(0.8).setSensor(true),
+      RAPIER.ColliderDesc.ball(0.8)
+        .setSensor(true)
+        // Pass 12 (Worker E): collision groups 0, same as the
+        // missile above — a bomb sensor brushing a banked jet
+        // would kill it as a 'hard landing' at altitude. The bomb's
+        // ground impact is the analytic height check in update().
+        .setCollisionGroups(0),
       body,
     );
     // Pass 11: shift with the world at an origin shift (see missile).

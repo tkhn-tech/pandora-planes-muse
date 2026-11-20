@@ -14,8 +14,11 @@
 //   gives each jet its own eye from the measured canopy bboxes.
 // - Only the F-18's GLB has any cockpit interior (a pilot helmet).
 //   buildCockpit() adds the same procedural kit to every player jet
-//   (panel + screens, HUD glass + reticle, coaming, seat + helmet),
-//   positioned from the eye.
+//   (panel + screens, HUD glass, coaming, seat + helmet),
+//   positioned from the eye. The HUD reticle (ring + crosshair) was
+//   REMOVED 2026-11-20 at Nicholas's direction ("Remove this from
+//   ALL JETS") — it read as a green crosshair circle on the canopy
+//   in the external/chase view.
 // - The canopy frame rails + top bow were REMOVED 2026-11-20: a
 //   straight rail cannot hug the curved canopy and read as a black
 //   box on the fuselage spine (Nicholas's red circle) — the GLB
@@ -137,10 +140,21 @@ const CANOPY_BBOX: Record<string, { y: [number, number]; z: [number, number] }> 
 const KIT_PARTS = [
   'cockpit_panel',
   'cockpit_hud_glass',
-  'cockpit_hud_reticle',
   'cockpit_coaming',
   'cockpit_seat',
   'cockpit_helmet',
+];
+
+// Reticle names that must NOT exist anywhere in the aircraft group
+// (2026-11-20, Nicholas: "Remove this from ALL JETS" — the green
+// crosshair circle on the canopy in the external/chase view). The
+// kit is built into ac.group, which is the rendered model in BOTH
+// views — cockpit (camera inside it) and external/chase (camera
+// outside it) — so a traverse-absence check covers both.
+const RETICLE_NAMES = [
+  'cockpit_hud_reticle',
+  'cockpit_hud_bar_h',
+  'cockpit_hud_bar_v',
 ];
 
 async function main(): Promise<void> {
@@ -211,6 +225,21 @@ async function main(): Promise<void> {
       `${key} procedural cockpit kit present (panel/HUD/frame/seat/helmet)`,
       missing.length === 0,
       missing.length ? `missing: ${missing.join(', ')}` : `${KIT_PARTS.length} parts`,
+    );
+
+    // --- No HUD reticle anywhere in the aircraft group (2026-11-20,
+    // Nicholas: "Remove this from ALL JETS"). The reticle (ring +
+    // crosshair bars) read as a green crosshair circle on the canopy
+    // in the external/chase view. The kit is the rendered model in
+    // both views, so absence here covers cockpit AND external.
+    const reticleFound: string[] = [];
+    ac.group.traverse((o) => {
+      if (RETICLE_NAMES.includes(o.name)) reticleFound.push(o.name);
+    });
+    check(
+      `${key} NO HUD reticle present (cockpit + external view)`,
+      reticleFound.length === 0,
+      reticleFound.length ? `found: ${reticleFound.join(', ')}` : 'no reticle objects',
     );
 
     // --- Eye placement (world = body at heading 0, pos (0,600,0)).
@@ -314,9 +343,13 @@ async function main(): Promise<void> {
       const look = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ);
       const fwdBody = new THREE.Vector3(0, 0, 1).applyQuaternion(ac.quat);
       const align = look.dot(fwdBody);
+      // Pass 12: the cockpit camera is pitched down 15° so the panel
+      // (with its dials) is visible at the bottom of the frame — the
+      // panel sits ~42° below the forward axis and the 62° FOV camera
+      // (±31°) cannot see it level. look·fwd = cos(15°) ≈ 0.966.
       check(
-        `${key} cockpit camera looks FORWARD (not aft at the seat)`,
-        align > 0.99,
+        `${key} cockpit camera looks FORWARD and slightly DOWN (not aft at the seat)`,
+        align > 0.95 && align < 0.99,
         `look·fwd=${align.toFixed(3)}`,
       );
       let seatOk = true;
@@ -348,6 +381,32 @@ async function main(): Promise<void> {
         sbb.max.y < eyeWorld.y + 0.05,
         `seatTop=${(sbb.max.y - ac.pos.y).toFixed(2)} eye.y=${eye.y.toFixed(2)}`,
       );
+      // Pass 12: the dials must be inside the cockpit camera's frame
+      // (62° FOV, ±31° from the look direction). The camera is pitched
+      // down 15° so the panel (~42° below forward) lands ~27° below
+      // the look direction — visible at the bottom of the frame.
+      {
+        let frameOk = true;
+        let frameDetail = '';
+        for (const n of ['cockpit_dial_0', 'cockpit_dial_1', 'cockpit_dial_2']) {
+          const part = ac.group.getObjectByName(n);
+          if (!part) { frameOk = false; frameDetail = `${n} missing`; break; }
+          part.getWorldPosition(tmp);
+          const d = tmp.clone().sub(eyeWorld);
+          const ang = (Math.acos(Math.max(-1, Math.min(1, d.clone().normalize().dot(look.clone().normalize())))) * 180) / Math.PI;
+          if (d.dot(look) <= 0 || ang > 31) {
+            frameOk = false;
+            frameDetail = `${n} ang=${ang.toFixed(1)}° (limit 31°)`;
+            break;
+          }
+          frameDetail += `${n} ${ang.toFixed(1)}°; `;
+        }
+        check(
+          `${key} dials inside the cockpit camera frame`,
+          frameOk,
+          frameDetail,
+        );
+      }
     }
 
     // --- No black box on the spine: the canopy frame rails were the

@@ -871,10 +871,10 @@ export class Aircraft {
     // Fuselage: belly -0.8 m, top +2.0 m (hy 1.4, centre +0.6).
     mk(hx, 1.4, hzFuse, 0, 0.6, 0);
     // Main gear: two skids at z = -0.15*length, feet 0.15 m clear.
-    mk(0.35, 0.35, 1.5, -1.6, -1.7, -s.length * 0.15);
-    mk(0.35, 0.35, 1.5, 1.6, -1.7, -s.length * 0.15);
+    mk(0.35, 0.35, 1.5, -(s.gearPosts?.mainX ?? 1.6), -1.7, s.gearPosts?.mainZ ?? -s.length * 0.15);
+    mk(0.35, 0.35, 1.5, s.gearPosts?.mainX ?? 1.6, -1.7, s.gearPosts?.mainZ ?? -s.length * 0.15);
     // Nose gear: z = +0.35*length, feet 0.15 m clear.
-    mk(0.3, 0.35, 1.5, 0, -1.7, s.length * 0.35);
+    mk(0.3, 0.35, 1.5, 0, -1.7, s.gearPosts?.noseZ ?? s.length * 0.35);
   }
 
   /** Handles of every collider on this aircraft's body, for the
@@ -1109,6 +1109,7 @@ export class Aircraft {
     this.modelStatus = template.failed ? 'failed' : 'ok';
     this.modelError = template.error;
     this.modelTris = template.tris;
+    if (this.model) this.group.remove(this.model);
     this.model = template.group.clone(true);
     this.model.traverse((o) => {
       if ((o as THREE.Mesh).isMesh && (o as THREE.Mesh).material) {
@@ -1119,7 +1120,7 @@ export class Aircraft {
     });
     this.group.add(this.model);
     this.modelReady = true;
-    if (!this.rig) this.rig = new AircraftRigBindings(this.model, this.spec);
+    this.rig = new AircraftRigBindings(this.model, this.spec);
   }
 
   /** One fixed step — canonical form. Call after the integrator's
@@ -1400,6 +1401,65 @@ export class Aircraft {
     if (isDeck && this.deck && this.deck.alive) {
       deckYawRate = this.deck.yawRateAt(this.pos.x, this.pos.z);
     }
+    // Whether the jet was on a surface last step — a continuing
+    // contact is riding, not a new touchdown (see the vs computation
+    // in the onSurface branch). Captured before the branch updates
+    // the flag. Defined here (not at the onSurface branch below) so
+    // the contact judge above can use it: a takeoff bounce (the
+    // gear contact breaks and re-forms within a step while the jet
+    // is rolling and pulling to rotate) IS a new Rapier contact
+    // pair, but it is NOT a landing — the jet never left the
+    // surface. Without this guard the F-35A died "hard landing" on
+    // its deck takeoff at 163 kt, vsi 0, bank 0 (probe-deck-spawn):
+    // a bounce re-contact with impactVs > 9 while rolling. A real
+    // crash or landing is always airborne the previous step, so the
+    // guard does not weaken the judge for those.
+    const prevOnSurface = this.onSurface;
+    // Pass 12: a hard impact must crash on the CONTACT, not on the
+    // onSurface position gate below. Rapier's solver ejects the jet
+    // over several substeps (measured vy flips: -137 -> +40, -297 ->
+    // +49, -16 -> +32, -11 -> +24), so by the time the branch below
+    // reads the state the jet is above the 0.15 m gate and climbing
+    // and the vs check never runs — the v4.6.1 live finding (intact
+    // wrecks, no VFX). contact.impactVy is the PRE-resolution
+    // vertical speed from the collision event (drainCollisionEvents
+    // -> notifyContact, fired at first touch), so judge it here.
+    // Measured first-contact impactVy in every bounce case exceeds
+    // HARD_LANDING_VS: fa18 C -12.8, f22 C -9.6, D1 -138/-137,
+    // D2 -294/-255 m/s. Same thresholds as the branch (vs > 9 or
+    // bank > 0.45 rad), deck-relative like the branch, so a normal
+    // landing (vs 2-5, trap ~4.8) and a descending deck cannot
+    // false-trigger. The bank is read from the current quat, as
+    // in the branch — Rapier resolution does not change it. The
+    // Started-only drain makes contact non-null only on a new
+    // touchdown, but a takeoff BOUNCE is also a new Rapier contact
+    // pair (the gear contact breaks and re-forms while rolling) —
+    // so the judge is additionally gated on !prevOnSurface (above):
+    // a jet that was on the surface last step is riding/bouncing,
+    // not landing.
+    // The bank rule is gated on the jet actually DESCENDING
+    // (impactVs > 1): a climbing wingtip graze (F-18 hands-off on
+    // Charlie, bank 34° at +55 m/s climbing past a peak) must not
+    // crash — the branch below only judges bank on the ground.
+    // And the whole judge is gated on !prevOnSurface (see above):
+    // a jet that was on the surface last step is riding/bouncing,
+    // not landing.
+    if (!this.dying && contact && !prevOnSurface) {
+      const impactVs = Math.max(
+        0,
+        -(contact.impactVy - (contact.isDeck ? deckVel.y : 0)),
+      );
+      const impactBank = Math.abs(
+        new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z,
+      );
+      if (
+        impactVs > HARD_LANDING_VS ||
+        (impactVs > 1 && impactBank > HARD_LANDING_BANK)
+      ) {
+        this.crash('hard landing');
+        return;
+      }
+    }
     // Physical ground contact this step — NOT the `grounded` flag. The
     // flag's 0.85xstall rotation gate flips far too early (F-22: 46 m/s
     // vs its 72 m/s Vr), which released the pitch clamp mid-roll and let
@@ -1502,9 +1562,7 @@ export class Aircraft {
       this.pos.y >= surfLo;
     // Whether the jet was on a surface last step — a continuing
     // contact is riding, not a new touchdown (see the vs computation
-    // in the onSurface branch). Captured before the branch updates
-    // the flag.
-    const prevOnSurface = this.onSurface;
+    // in the onSurface branch). Defined above the contact judge.
     // Pass 8 (item 4) — deck-gate HYSTERESIS. The gate is a position
     // check (deck 0.5 m): when terrain-following crests a climb the
     // deck can drop away from the jet by >1 m in one 0.05 s substep

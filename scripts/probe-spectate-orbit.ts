@@ -132,11 +132,19 @@ function main(): void {
   }
   check('main.ts readable for the wiring check', src.length > 0, `${src.length} bytes`);
   const spectateBlock = src.slice(src.indexOf('if (spectating) {'), src.indexOf('if (camMode === 0) {'));
+  // Pass 12 (Worker F): the spectate branch now routes through
+  // orbitCameraPositionDeckAware, which applies the pass-8 terrain
+  // floor AND the deck ceiling internally (the old inline
+  // applyCameraFloor(orbitCameraPosition(...)) had no deck ceiling,
+  // so the free-orbit camera sank into the carrier deck). Either
+  // form satisfies the check — the requirement is that camMode 2
+  // runs through an orbit helper with a floor, not the exact call.
   check(
     'spectating branch runs the free orbit when camMode === 2',
     spectateBlock.includes('camMode === 2') &&
-      spectateBlock.includes('orbitCameraPosition') &&
-      spectateBlock.includes('applyCameraFloor'),
+      (spectateBlock.includes('orbitCameraPositionDeckAware') ||
+        (spectateBlock.includes('orbitCameraPosition') &&
+          spectateBlock.includes('applyCameraFloor'))),
     'spectate block routes camMode 2 through the orbit helpers',
   );
   check(

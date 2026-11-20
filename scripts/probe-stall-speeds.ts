@@ -757,6 +757,162 @@ async function main(): Promise<void> {
     dispose(ac);
   }
 
+  // ---- 5. The live 41% throttle case (pass 12): an F-22 at 150 kt,
+  // level-ish at 141-163 kt on 41% throttle collapsed to 5-9 kt with
+  // the STALL banner at 447 ft — while §1 holds 150 kt level and §2
+  // measures the power-off stall at 120 kt. Reconcile: at 41%
+  // throttle the thrust (0.41 x 312 kN = 128 kN) far exceeds the
+  // level-flight drag at 150 kt (~41 kN), so a level 41% flight
+  // must ACCELERATE, not collapse — unless the collapse came from
+  // the stick (a held pull driving the AoA past the peak into the
+  // separation-drag wall, where drag exceeds thrust and the speed
+  // bleeds to near zero). Three variants, all F-22 from 150 kt:
+  //   5a altitude-hold autopilot, throttle fixed 0.41 (the live
+  //      "level-ish" case as flown: hold altitude, see what the
+  //      speed does);
+  //   5b full pull held, throttle fixed 0.41 (the pull hypothesis:
+  //      it MUST stall and decelerate hard — the question is
+  //      whether it then recovers/dives or HANGS at <20 kt, the
+  //      live 5-9 kt signature);
+  //   5c hands-off (pitchIn 0), throttle fixed 0.41.
+  console.log('--- 5. Live 41% throttle case, F-22 from 150 kt (BET) ---');
+  const lowPowerRun = async (
+    tag: string,
+    mode: 'hold' | 'pull' | 'handsOff',
+    seconds: number,
+  ): Promise<{
+    minKt: number;
+    finalKt: number;
+    stalled: boolean;
+    crashed: boolean;
+    hangS: number;
+    maxAoA: number;
+    log: string;
+  }> => {
+    const key = 'f22';
+    const spec = SPECS[key]!;
+    const ac = await makeAircraft(key, true);
+    ac.resetAt(alpha.x, 400, alpha.z, alpha.hdg);
+    ac.setAirspeed(150 * KT2MS);
+    ac.thrTarget = 0.41;
+    ac.throttle = 0.41;
+    const alt0 = ac.pos.y;
+    let stalled = false;
+    let maxAoA = -90;
+    let minKt = Infinity;
+    let hangS = 0;
+    let simT = 0;
+    const rows: string[] = [];
+    while (simT < seconds) {
+      const dt = nextDt();
+      simT += dt;
+      if (mode === 'hold') {
+        ac.pitchIn = levelPitchIn(ac, key, alt0, spec.clCurve.peakAoA + 1, 4, 0.03, 0.5, 0.3);
+      } else if (mode === 'pull') {
+        ac.pitchIn = -1;
+      } else {
+        ac.pitchIn = 0;
+      }
+      ac.thrTarget = 0.41;
+      ac.rollIn = 0;
+      ac.yawIn = 0;
+      substep(ac, dt);
+      if (!ac.alive) break;
+      if (ac.stalled) stalled = true;
+      maxAoA = Math.max(maxAoA, ac.aoaDeg);
+      const kt = ac.ias * MS2KT;
+      minKt = Math.min(minKt, kt);
+      const agl = ac.pos.y - heightAt(ac.pos.x, ac.pos.z);
+      if (kt < 20 && agl > 50) hangS += dt;
+      if (Math.abs(simT % 5) < dt) {
+        rows.push(`t=${simT.toFixed(0)}s ${kt.toFixed(0)}kt alt=${ac.pos.y.toFixed(0)}m aoa=${ac.aoaDeg.toFixed(1)} stalled=${ac.stalled} vsi=${ac.vsi.toFixed(1)}`);
+      }
+    }
+    const finalKt = ac.ias * MS2KT;
+    const crashed = !ac.alive;
+    const log = rows.join(' | ');
+    dispose(ac);
+    console.log(`  [5${tag}] ${log} => minKt=${minKt.toFixed(0)} finalKt=${finalKt.toFixed(0)} maxAoA=${maxAoA.toFixed(1)} stalled=${stalled} crashed=${crashed} hang<20kt=${hangS.toFixed(1)}s`);
+    return { minKt, finalKt, stalled, crashed, hangS, maxAoA, log };
+  };
+  {
+    const r = await lowPowerRun('a hold', 'hold', 20);
+    check(
+      'low-power 5a: F-22 at 41% throttle holding altitude does NOT collapse (thrust 128 kN >> ~41 kN drag at 150 kt)',
+      !r.crashed && r.minKt >= 140 && r.finalKt >= 150,
+      `minKt=${r.minKt.toFixed(0)} finalKt=${r.finalKt.toFixed(0)} stalled=${r.stalled} crashed=${r.crashed}`,
+    );
+  }
+  {
+    const r = await lowPowerRun('b pull', 'pull', 60);
+    check(
+      'low-power 5b: F-22 at 41% throttle with FULL PULL held does NOT hang at <20 kt airborne for >10 s (it must stall, then dive/recover or crash — the live 5-9 kt hang)',
+      r.hangS <= 10,
+      `hang<20kt=${r.hangS.toFixed(1)}s minKt=${r.minKt.toFixed(0)} maxAoA=${r.maxAoA.toFixed(1)} stalled=${r.stalled} crashed=${r.crashed}`,
+    );
+  }
+  {
+    const r = await lowPowerRun('c hands-off', 'handsOff', 30);
+    check(
+      'low-power 5c: F-22 at 41% throttle hands-off does NOT stall or collapse',
+      !r.crashed && !r.stalled && r.minKt >= 120,
+      `minKt=${r.minKt.toFixed(0)} finalKt=${r.finalKt.toFixed(0)} stalled=${r.stalled} crashed=${r.crashed} maxAoA=${r.maxAoA.toFixed(1)}`,
+    );
+  }
+  // 5d: the remaining collapse candidate — a BANKED turn at 41%.
+  // Level flight cannot collapse (5a/5c accelerate; 5b mushes at
+  // ~131 kt), but a 60 deg bank doubles the load factor, so the
+  // stall speed rises to Vs*sqrt(2) ≈ 170 kt: a jet at 150 kt in
+  // the turn is already stalled, and holding the bank bleeds the
+  // speed fast. If the live test was turning, this is the collapse.
+  {
+    const key = 'f22';
+    const spec = SPECS[key]!;
+    const ac = await makeAircraft(key, true);
+    ac.resetAt(alpha.x, 400, alpha.z, alpha.hdg);
+    ac.setAirspeed(150 * KT2MS);
+    ac.thrTarget = 0.41;
+    ac.throttle = 0.41;
+    const alt0 = ac.pos.y;
+    const bankDes = 60 * D2R;
+    let stalled = false;
+    let minKt = Infinity;
+    let simT = 0;
+    const rows: string[] = [];
+    while (simT < 30) {
+      const dt = nextDt();
+      simT += dt;
+      const bankNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
+      ac.rollIn = Math.max(-1, Math.min(1, (bankDes - bankNow) * 2));
+      ac.pitchIn = levelPitchIn(ac, key, alt0, spec.clCurve.peakAoA + 1, 4, 0.03, 0.5, 0.3);
+      ac.thrTarget = 0.41;
+      ac.yawIn = 0;
+      substep(ac, dt);
+      if (!ac.alive) break;
+      if (ac.stalled) stalled = true;
+      const kt = ac.ias * MS2KT;
+      minKt = Math.min(minKt, kt);
+      if (Math.abs(simT % 5) < dt) {
+        rows.push(`t=${simT.toFixed(0)}s ${kt.toFixed(0)}kt alt=${ac.pos.y.toFixed(0)}m aoa=${ac.aoaDeg.toFixed(1)} bank=${(bankNow / D2R).toFixed(0)} stalled=${ac.stalled}`);
+      }
+    }
+    const finalKt = ac.ias * MS2KT;
+    const crashed = !ac.alive;
+    console.log(`  [5d banked] ${rows.join(' | ')} => minKt=${minKt.toFixed(0)} finalKt=${finalKt.toFixed(0)} stalled=${stalled} crashed=${crashed}`);
+    // The banked-turn hypothesis is REFUTED too: the jet accelerates
+    // out of the turn (thrust >> drag even banked) and never stalls
+    // — it sinks to ~193 m trading altitude for speed instead. So
+    // NONE of the four 41% variants collapses: the live 5-9 kt
+    // collapse is not a level/banked/pulled flight-model effect at
+    // 41% throttle, and the probe's 120 kt stall stands.
+    check(
+      'low-power 5d: F-22 at 41% throttle in a 60 deg banked turn does NOT collapse either (accelerates, no stall flag)',
+      !stalled && !crashed && minKt >= 140,
+      `minKt=${minKt.toFixed(0)} finalKt=${finalKt.toFixed(0)} stalled=${stalled} crashed=${crashed}`,
+    );
+    dispose(ac);
+  }
+
   console.log(failures === 0 ? '\nALL STALL-SPEED CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

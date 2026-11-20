@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.6.1, 20 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.7, 20 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -252,6 +252,7 @@
   <div class="pill"><b id="hudAlt">0</b> ft</div>
   <div class="pill"><b id="hudVsi">0</b> fpm</div>
   <div class="pill"><b id="hudHdg">000°</b></div>
+  <div class="pill">CV <b id="hudCarrier">—</b></div>
   <div class="pill">AoA <b id="hudAoA">0°</b></div>
   <div class="pill">Bank <b id="hudBank">0°</b></div>
   <div class="pill hidden" id="vecPill">VEC <b id="hudVec">0°</b></div>
@@ -293,7 +294,7 @@
 <div id="debug" class="hidden"></div>
 
 <div id="thrWrap"><span class="tLab">THR</span><input type="range" id="thr" min="0" max="100" value="0"><span id="thrVal">0%</span></div>
-<div id="joy"><div id="joyKnob"></div><div id="joyLab">PITCH · ROLL</div></div>
+<div id="joy"><div id="joyKnob"></div><div id="joyLab">PITCH · ROLL — drag up to climb</div></div>
 
 <div id="ctlPanel">
   <div class="cRow"><label>Flaps <b id="flapVal">0°</b></label><input type="range" id="flapSl" min="0" max="30" value="0"></div>
@@ -330,7 +331,7 @@
       </div></div>
       <div class="seaRow"><span class="lab" id="jetSpec">Stall 128 kt · 9 G · carrier-capable</span></div>
       <div class="seaRow"><span class="lab">Spawn</span><div class="seg" id="segSpawn">
-        <button data-v="alpha" class="on">Alpha runway<small>land · 650 m</small></button><button data-v="carrier">Helicarrier deck<small>fly at 350 m</small></button></div></div>
+        <button data-v="alpha" class="on">Alpha runway<small>land · 650 m</small></button><button data-v="bravo">Bravo runway<small>dirt · 600 m</small></button><button data-v="charlie">Charlie runway<small>land · 650 m</small></button><button data-v="carrier">Helicarrier deck<small>fly at 350 m</small></button></div></div>
     </div>
     <div class="seaBox">
       <h3>🎮 Controls — keyboard stick</h3>
@@ -377,7 +378,7 @@
         <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v4.6.1 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.7 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 
@@ -385,18 +386,18 @@
   <div class="card">
     <h2>Controls</h2>
     <div class="keys">
-      <b>Stick</b> (bottom-left) — pitch / roll. Drag, release to centre.<br>
+      <b>Stick</b> (bottom-left) — pitch / roll. Drag up to climb, down to descend; drag left / right to bank. Release to centre.<br>
       <b>Throttle</b> (left slider) — W / S, or Shift / Ctrl.<br>
       <b>Flaps / Airbrake / Vector</b> — right panel sliders. Vector only on the F-35A: at 90° the throttle becomes lift — hover, then descend under 4 m/s onto a VTOL pad.<br>
       <b>Keyboard —</b> <b>Stick</b> arrow keys (pitch / roll) · <b>Rudder</b> Q / E · <b>Throttle</b> W / S (or Shift / Ctrl) · <b>Flaps</b> [ / ] (±10°) · <b>Airbrake</b> X (toggle) · <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only) · <b>Camera</b> C · <b>Camera reset</b> R · <b>Pause</b> P. Mouse: drag on the canvas steers (mouse yoke) in Chase / Cockpit cam. Tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
-      <b>Stick feel:</b> the keyboard stick slews at ~3°/s per frame step so it moves like a real stick, not a switch. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
+      <b>Stick feel:</b> the keyboard stick ramps like a real stick, not a switch — pitch slews at 3/s, roll snaps over at 12/s and returns at 2.5/s, so a tap banks the jet. The touch stick's authority falls with speed, so a full drag stays gentle at high speed. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
       <b>Camera</b> C — Chase / Cockpit / Free orbit (drag to orbit, pinch to zoom in Free). R resets the camera.<br>
       <b>Pause</b> P · <b>Restart</b> ↻ button · <b>Setup</b> (pause menu) — change the sandbox settings mid-flight and Apply &amp; Restart, or Resume with the old settings.<br>
-      <b>Spawn:</b> Alpha runway, or the Helicarrier deck (setup menu) — the jet starts on the deck at the carrier's heading and speed, ready to roll off the bow.<br>
+      <b>Spawn:</b> Alpha, Bravo or Charlie runway, or the Helicarrier deck (setup menu) — the jet starts on the deck at the carrier's heading and speed, ready to roll off the bow.<br>
       <b>Carrier trap:</b> hook down, under 140 kt over one of the three stern wires — the wire catches you and hauls you to a stop. Over that speed it snaps.<br>
       <b>VTOL pad:</b> F-35A only — vector 70°+, slow vertical descent onto a marked yellow pad on the deck.<br>
       <b>Lead pipper:</b> the gold ring on the HUD is where your gun rounds will meet the locked target — put the ring on the jet, not the jet itself.<br>
-      <b>ROTATE:</b> the green cue appears on the runway roll at your jet's rotation speed — hold ↑ (keyboard) or pull the stick back (drag down) and HOLD it, not before, and not a tap.<br>
+      <b>ROTATE:</b> the green cue appears on the runway roll at your jet's rotation speed — hold ↑ (keyboard) or drag the stick up and HOLD it, not before, and not a tap.<br>
       <b>CCIP:</b> with bombs carried, the gold crosshair ring marks where a bomb released now would hit; it turns red (and the HUD warns PULL UP) when you are below the minimum-release altitude for your dive — the 4&nbsp;g pull-out needs that height.<br>
       <b>Spin:</b> if the jet departs into a spin the HUD shows an arrow — push the stick WITH the arrow, nose down, and the spin unwinds.<br>
       <b>Stall:</b> below stall speed the wing drops and the nose falls — push the nose down and add power to recover.<br>

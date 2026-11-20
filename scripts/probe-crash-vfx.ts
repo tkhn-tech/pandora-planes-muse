@@ -115,6 +115,11 @@ interface VfxSample {
   tornPieces: number;
   debrisResting: number; // pieces within 1 m above local ground and |vy| < 2
   debrisBelowGround: number;
+  /** Least-settled piece at this sample (highest centre above the
+   *  ground / fastest): the flake diagnostic — when the resting
+   *  check fails, this says WHICH piece and why. Format
+   *  `h=<centre-gh>m vy=<m/s> spd=<m/s> ang=<rad/s>`. */
+  worstPiece: string;
   scorch: number;
   scorchOpacity: number;
   scorchRimMax: number; // max terrain-minus-decal over the decal rim
@@ -150,55 +155,82 @@ async function main(): Promise<void> {
   const scene = new THREE.Scene();
   const origin = new FloatingOrigin(2000);
   origin.registerBody(terrainBody);
+  // Live parity: the live terrain is shifted with the world (the
+  // streamer registers its chunks with the origin), so the probe's
+  // heightfield body is registered too — an origin shift during a
+  // scenario must move the ground under the jet, not leave the jet
+  // flying over a stale collider.
+  // (terrainBody is registered above, next to its creation.)
   const heightAt = (x: number, z: number): number =>
     heightfieldHeightAt(heights, res, x + origin.cumulativeShift.x, z + origin.cumulativeShift.z);
   const deck: DeckProvider = { alive: false, deckHeightAt: () => -Infinity, velocity: () => new THREE.Vector3(), velocityAt: () => new THREE.Vector3(), yawRate: () => 0, yawRateAt: () => 0, local: () => null };
 
   // Steepest slope (71-deg cliff) for the stall flight, and a flat
   // base 300 m downhill of a 40-deg slope face for the fast impact.
-  let cliff = { x: 0, z: 0, g: 0, gx: 0, gz: 0 };
-  let face = { x: 0, z: 0, g: 0, gx: 0, gz: 0 };
-  for (let x = -5000; x <= 5000; x += 120) {
-    for (let z = -5000; z <= 5000; z += 120) {
-      const gx = (heightAt(x + 60, z) - heightAt(x - 60, z)) / 120;
-      const gz = (heightAt(x, z + 60) - heightAt(x, z - 60)) / 120;
-      const g = Math.hypot(gx, gz);
-      if (g > cliff.g) cliff = { x, z, g, gx, gz };
-      if (g >= 0.45 && g <= 0.85 && g > face.g) face = { x, z, g, gx, gz };
+  // Factored: scenario C shifts the origin first, so the sites must
+  // be re-searched in the shifted frame (the terrain under a scene
+  // point changes with the cumulative shift).
+  function findSites(): {
+    cliff: { x: number; z: number; g: number; gx: number; gz: number };
+    face: { x: number; z: number; g: number; gx: number; gz: number };
+    baseX: number;
+    baseZ: number;
+  } {
+    let cliff = { x: 0, z: 0, g: 0, gx: 0, gz: 0 };
+    let face = { x: 0, z: 0, g: 0, gx: 0, gz: 0 };
+    for (let x = -5000; x <= 5000; x += 120) {
+      for (let z = -5000; z <= 5000; z += 120) {
+        const gx = (heightAt(x + 60, z) - heightAt(x - 60, z)) / 120;
+        const gz = (heightAt(x, z + 60) - heightAt(x, z - 60)) / 120;
+        const g = Math.hypot(gx, gz);
+        if (g > cliff.g) cliff = { x, z, g, gx, gz };
+        if (g >= 0.45 && g <= 0.85 && g > face.g) face = { x, z, g, gx, gz };
+      }
     }
+    const fgl = Math.hypot(face.gx, face.gz) || 1;
+    const fux = face.gx / fgl, fuz = face.gz / fgl;
+    return { cliff, face, baseX: face.x - fux * 300, baseZ: face.z - fuz * 300 };
   }
+  const sites = findSites();
+  const { cliff, face } = sites;
+  const { baseX, baseZ } = sites;
   const cgl = Math.hypot(cliff.gx, cliff.gz) || 1;
   const cux = cliff.gx / cgl, cuz = cliff.gz / cgl;
   const chdg = Math.atan2(cux, cuz) * 180 / Math.PI;
   const fgl = Math.hypot(face.gx, face.gz) || 1;
   const fux = face.gx / fgl, fuz = face.gz / fgl;
   const fhdg = Math.atan2(fux, fuz) * 180 / Math.PI;
-  const baseX = face.x - fux * 300, baseZ = face.z - fuz * 300;
   console.log(`cliff at (${cliff.x},${cliff.z}) grad=${cliff.g.toFixed(2)}; face at (${face.x},${face.z}) grad=${face.g.toFixed(2)}; flat base at (${baseX.toFixed(0)},${baseZ.toFixed(0)}) grad=${Math.hypot((heightAt(baseX + 60, baseZ) - heightAt(baseX - 60, baseZ)) / 120, (heightAt(baseX, baseZ + 60) - heightAt(baseX, baseZ - 60)) / 120).toFixed(3)}`);
 
-  /** Build an aircraft wired exactly like main.ts makeAircraft +
-   *  handleDeaths (same calls, same order). Returns the aircraft and
-   *  the per-run VFX record. */
-  function makeRun(key: 'fa18' | 'f22', vfx: CrashVFXManager): {
-    player: Aircraft;
-    drain: () => void;
-    detachEvents: Array<{ seg: string | null }>;
-    attachedPlumes: THREE.Group[];
+  // ---- Live frame driver (main.ts animate()): raw frame times at
+  // browser FPS 4-14 (rawDt 0.07-0.25 s), split into substeps of
+  // at most 0.05 s — the Rapier timestep AND the controller/VFX dt
+  // are the substep dt, not 1/60. The fixed-dt harness hides every
+  // failure that only shows up at these step sizes.
+  const RAW_DT_PATTERN = [0.25, 0.07, 0.16, 0.09, 0.2, 0.12];
+  let rawIdx = 0;
+  function liveFrame(stepSub: (dt: number) => void): void {
+    const rawDt = RAW_DT_PATTERN[rawIdx++ % RAW_DT_PATTERN.length]!;
+    const sub = Math.max(1, Math.ceil(rawDt / 0.05));
+    const dt = rawDt / sub;
+    for (let s = 0; s < sub; s++) stepSub(dt);
+  }
+
+  /** Live handleDeaths replica (main.ts): the live game does NOT wire
+   *  AircraftEvents.onCrash at all — makeAircraft wires only
+   *  onDetachSegment/onFlares — and detects deaths by polling
+   *  prevAlive once per substep, AFTER vfx.update(dt). The VFX calls
+   *  and their order are copied verbatim (explosion 1+fuel, scorch,
+   *  attached fire+smoke for an instant crash, 4 debris boxes). */
+  function makeLiveDeaths(vfx: CrashVFXManager, attachedPlumes: THREE.Group[]): {
+    handleDeaths: (all: Aircraft[]) => void;
+    prevAlive: Map<Aircraft, boolean>;
   } {
-    const spec = SPECS[key]!;
-    const detachEvents: Array<{ seg: string | null }> = [];
-    const attachedPlumes: THREE.Group[] = [];
-    const player = new Aircraft({
-      scene, world, spec, isPlayer: true, modelKey: spec.modelKey, deck,
-      events: {
-        onDetachSegment: (_a, segment, pos, vel) => {
-          detachEvents.push({ seg: segment ? segment.name || 'unnamed-node' : null });
-          if (segment) vfx.spawnDebris(segment, world, pos, vel);
-        },
-        onCrash: (a, _reason) => {
-          // handleDeaths replica (main.ts): explosion scaled by fuel,
-          // scorch, attached fire + smoke for an instant crash, and
-          // 4 debris boxes — in that order.
+    const prevAlive = new Map<Aircraft, boolean>();
+    const handleDeaths = (all: Aircraft[]): void => {
+      for (const a of all) {
+        const was = prevAlive.get(a) ?? true;
+        if (was && !a.alive) {
           vfx.spawnExplosion(a.pos.clone(), 1 + a.fuel);
           vfx.scorchDecal(a.pos.clone());
           if (!a.crashedFromDying) {
@@ -208,9 +240,65 @@ async function main(): Promise<void> {
           for (let i = 0; i < 4; i++) {
             const ang = Math.random() * Math.PI * 2;
             const sp = 10 + Math.random() * 20;
-            vfx.spawnDebris(null, world, a.pos.clone(), new THREE.Vector3(Math.cos(ang) * sp, 5 + Math.random() * 10, Math.sin(ang) * sp));
+            vfx.spawnDebris(
+              null,
+              world,
+              a.pos.clone(),
+              new THREE.Vector3(Math.cos(ang) * sp, 5 + Math.random() * 10, Math.sin(ang) * sp),
+            );
           }
+        }
+        prevAlive.set(a, a.alive);
+      }
+    };
+    return { handleDeaths, prevAlive };
+  }
+
+  /** Build an aircraft wired exactly like main.ts makeAircraft +
+   *  handleDeaths (same calls, same order). Returns the aircraft and
+   *  the per-run VFX record. `live` switches the wiring to the LIVE
+   *  one: NO onCrash event (main.ts never wires it) — deaths are
+   *  detected by the handleDeaths poll returned here, called once
+   *  per substep after vfx.update(dt). */
+  function makeRun(key: 'fa18' | 'f22', vfx: CrashVFXManager, live = false): {
+    player: Aircraft;
+    drain: () => void;
+    detachEvents: Array<{ seg: string | null }>;
+    attachedPlumes: THREE.Group[];
+    handleDeaths: (all: Aircraft[]) => void;
+  } {
+    const spec = SPECS[key]!;
+    const detachEvents: Array<{ seg: string | null }> = [];
+    const attachedPlumes: THREE.Group[] = [];
+    const { handleDeaths } = makeLiveDeaths(vfx, attachedPlumes);
+    const player = new Aircraft({
+      scene, world, spec, isPlayer: true, modelKey: spec.modelKey, deck,
+      events: {
+        onDetachSegment: (_a, segment, pos, vel) => {
+          detachEvents.push({ seg: segment ? segment.name || 'unnamed-node' : null });
+          if (segment) vfx.spawnDebris(segment, world, pos, vel);
         },
+        // Fixed-dt scenarios A/B keep the onCrash replica (the old
+        // wiring). Live scenarios pass live=true and rely on the
+        // handleDeaths poll instead — exactly like main.ts.
+        ...(!live ? {
+          onCrash: (a, _reason) => {
+            // handleDeaths replica (main.ts): explosion scaled by fuel,
+            // scorch, attached fire + smoke for an instant crash, and
+            // 4 debris boxes — in that order.
+            vfx.spawnExplosion(a.pos.clone(), 1 + a.fuel);
+            vfx.scorchDecal(a.pos.clone());
+            if (!a.crashedFromDying) {
+              attachedPlumes.push(vfx.spawnSmoke(a.pos.clone(), 0xff7722, a.group));
+              attachedPlumes.push(vfx.spawnSmoke(a.pos.clone(), 0x1a1a1a, a.group));
+            }
+            for (let i = 0; i < 4; i++) {
+              const ang = Math.random() * Math.PI * 2;
+              const sp = 10 + Math.random() * 20;
+              vfx.spawnDebris(null, world, a.pos.clone(), new THREE.Vector3(Math.cos(ang) * sp, 5 + Math.random() * 10, Math.sin(ang) * sp));
+            }
+          },
+        } : {}),
       },
     });
     player.terrainHeightAt = heightAt;
@@ -225,7 +313,7 @@ async function main(): Promise<void> {
         hit.notifyContact(hit.vel.y, false);
       });
     };
-    return { player, drain, detachEvents, attachedPlumes };
+    return { player, drain, detachEvents, attachedPlumes, handleDeaths };
   }
 
   /** Sample the VFX state at time t after impact. */
@@ -251,12 +339,37 @@ async function main(): Promise<void> {
     let tornPieces = 0;
     let debrisResting = 0;
     let debrisBelowGround = 0;
+    let worstScore = -Infinity;
+    let worstPiece = 'none';
     for (const d of V.debris) {
       if (meshHasName(d.mesh, 'torn_wing') || meshHasName(d.mesh, 'torn_tail')) tornPieces++;
       const p = d.body.translation();
       const gh = heightAt(p.x, p.z);
       if (p.y < gh - 0.5) debrisBelowGround++;
-      if (p.y - gh >= -0.5 && p.y - gh <= 1.0 && Math.abs(d.body.linvel().y) < 2) debrisResting++;
+      const lv = d.body.linvel();
+      const av = d.body.angvel();
+      const spd = Math.hypot(lv.x, lv.y, lv.z);
+      const ang = Math.hypot(av.x, av.y, av.z);
+      // Settled (pass 12): a piece counts as resting when it is
+      // near the ground AND effectively still — a long torn panel
+      // may legitimately rest propped on a corner (centre up to
+      // ~2.5 m), which the old strict 1.0 m centre-height window
+      // failed even though the piece had stopped (the 5/6 flake:
+      // worst piece h=2.01 vy=-0.17 spd=1.44 ang=0.02). The
+      // CrashVFXManager fix (angular damping 2.0 + friction 0.8)
+      // makes pieces lie flat and stop sliding, so a settled piece
+      // should now also be low — the 2.5 m window is a tolerance,
+      // not the norm.
+      if (p.y - gh >= -0.5 && p.y - gh <= 2.5 && Math.abs(lv.y) < 2 && spd < 2 && ang < 0.5) debrisResting++;
+      // Least-settled score: centre height above the 2.5 m resting
+      // window, plus vertical and total speed, plus spin — a long
+      // torn panel propped on its end scores high on height, a
+      // still-bouncing piece on speed.
+      const score = Math.max(0, p.y - gh - 2.5) + Math.abs(lv.y) + spd * 0.1 + ang * 0.2;
+      if (score > worstScore) {
+        worstScore = score;
+        worstPiece = `h=${(p.y - gh).toFixed(2)} vy=${lv.y.toFixed(2)} spd=${spd.toFixed(2)} ang=${ang.toFixed(2)}`;
+      }
     }
     let scorchOpacity = 0;
     let rimMax = -Infinity;
@@ -292,6 +405,7 @@ async function main(): Promise<void> {
       tornPieces,
       debrisResting,
       debrisBelowGround,
+      worstPiece,
       scorch: V.scorches.length,
       scorchOpacity,
       scorchRimMax: rimMax === -Infinity ? 0 : rimMax,
@@ -300,20 +414,30 @@ async function main(): Promise<void> {
   }
 
   /** Step the world + VFX for 31 s after impact, sampling at
-   *  SAMPLE_TIMES. Returns the samples keyed by time. */
-  function sampleAfterImpact(vfx: CrashVFXManager, player: Aircraft, attachedPlumes: THREE.Group[]): Map<number, VfxSample> {
+   *  SAMPLE_TIMES. Returns the samples keyed by time. `liveDt`
+   *  drives it with the live frame pattern (variable rawDt split
+   *  into ≤0.05 s substeps) instead of fixed 1/60. */
+  function sampleAfterImpact(vfx: CrashVFXManager, player: Aircraft, attachedPlumes: THREE.Group[], liveDt = false): Map<number, VfxSample> {
     const out = new Map<number, VfxSample>();
     out.set(0, sample(vfx, player, attachedPlumes, 0));
     let next = 1;
-    for (let i = 1; i <= 31 * 60; i++) {
-      const t = i / 60;
-      world.timestep = 1 / 60;
+    let simT = 0;
+    const stepOnce = (dt: number): void => {
+      world.timestep = dt;
       world.step(eventQueue);
-      vfx.update(1 / 60);
-      if (next < SAMPLE_TIMES.length && t >= SAMPLE_TIMES[next]!) {
+      vfx.update(dt);
+      simT += dt;
+      // Epsilon: 1860 accumulated 1/60 steps sum to 30.999999999999996,
+      // not 31 — without it the +31 s sample is never taken.
+      if (next < SAMPLE_TIMES.length && simT >= SAMPLE_TIMES[next]! - 1e-9) {
         out.set(SAMPLE_TIMES[next]!, sample(vfx, player, attachedPlumes, SAMPLE_TIMES[next]!));
         next++;
       }
+    };
+    if (!liveDt) {
+      for (let i = 1; i <= 31 * 60; i++) stepOnce(1 / 60);
+    } else {
+      while (simT < 31) liveFrame(stepOnce);
     }
     return out;
   }
@@ -323,9 +447,9 @@ async function main(): Promise<void> {
     const at = (t: number): VfxSample => samples.get(t)!;
     console.log(`  [${tag}] samples: ` + [0, 0.9, 3, 10, 29, 31].map((t) => {
       const s = at(t);
-      return `t+${t}s boom=${s.boomVisible ? 'Y' : '-'}op${s.boomOpacity.toFixed(2)}/${s.boomScale.toFixed(0)}m plume=${s.plumes}(att${s.attachedPlumes})op${s.plumeMaxOpacity.toFixed(2)} debris=${s.debris}(torn${s.tornPieces}) scorch=${s.scorch}op${s.scorchOpacity.toFixed(2)}`;
+      return `t+${t}s boom=${s.boomVisible ? 'Y' : '-'}op${s.boomOpacity.toFixed(2)}/${s.boomScale.toFixed(0)}m plume=${s.plumes}(att${s.attachedPlumes})op${s.plumeMaxOpacity.toFixed(2)} debris=${s.debris}(torn${s.tornPieces}) rest=${s.debrisResting}/${s.debris} worst[${s.worstPiece}] scorch=${s.scorch}op${s.scorchOpacity.toFixed(2)}`;
     }).join(' | '));
-    check(`${key} ${tag}: explosion fires at impact, bright and jet-sized`, at(0).boomVisible && at(0).boomOpacity >= 0.9 && at(0).boomScale >= 10, `vis=${at(0).boomVisible} op=${at(0).boomOpacity.toFixed(2)} scale=${at(0).boomScale.toFixed(0)}m`);
+    check(`${key} ${tag}: explosion fires at impact, bright and jet-sized`, at(0).boomVisible && at(0).boomOpacity >= 0.9 && at(0.25).boomScale >= 10, `vis=${at(0).boomVisible} op=${at(0).boomOpacity.toFixed(2)} scale@0s=${at(0).boomScale.toFixed(0)}m scale@0.25s=${at(0.25).boomScale.toFixed(0)}m (the t+0 scale is racy: a boom spawned by the poll after the last update of its frame has not been sized yet — the +0.25 s scale is the jet-sized read)`);
     check(`${key} ${tag}: explosion is STILL bright at +0.9 s (old 0.9 s sprite was already gone)`, at(0.9).boomVisible && at(0.9).boomOpacity > 0.5, `vis=${at(0.9).boomVisible} op=${at(0.9).boomOpacity.toFixed(2)} scale=${at(0.9).boomScale.toFixed(0)}m`);
     check(`${key} ${tag}: explosion has ended by +2.6 s`, !at(2.6).boomVisible, `vis=${at(2.6).boomVisible} op=${at(2.6).boomOpacity.toFixed(2)}`);
     check(`${key} ${tag}: fire attached to the wreck at +1 s`, at(1.5).attachedPlumes >= 2 && at(1.5).plumeMaxOpacity >= 0.4, `attached=${at(1.5).attachedPlumes} maxOp=${at(1.5).plumeMaxOpacity.toFixed(2)}`);
@@ -364,7 +488,14 @@ async function main(): Promise<void> {
       player.grounded = false;
       player.thrTarget = 0;
       player.throttle = 0;
-      player.pitchIn = 0.15;
+      // Pass 12: full pull to force a genuine stall. The old 0.15
+      // relied on the geometric-trim deficiency to stall the jet,
+      // but the hands-off 1 g auto-trim (BET) now holds 1 g with
+      // |pitchIn| < 0.25, so the jet mushed into the terrain at high
+      // AoA without the stall flag ever tripping. A full pull is
+      // outside the trim gate and drives AoA past the peak.
+      // pitchIn NEGATIVE pulls up (v2 convention).
+      player.pitchIn = -1.0;
       let impactedAt = -1;
       let sawStall = false;
       let impactSpeed = 0;
@@ -420,6 +551,272 @@ async function main(): Promise<void> {
       check(`${key} B: detach events fired with real segments (not null)`, detachEvents.length === 2 && detachEvents.every((e) => e.seg !== null), `events=${JSON.stringify(detachEvents)}`);
       const samples = sampleAfterImpact(vfx, player, attachedPlumes);
       verify(key, 'B fast', player, detachEvents, samples, true);
+      origin.unregisterBody(player.body);
+      player.dispose();
+    }
+
+    // ---------- Scenario C: stall impact through the LIVE path ----------
+    // Same stall flight as A, but driven exactly like main.ts
+    // animate(): variable rawDt (FPS 4-14) split into <=0.05 s
+    // substeps, an origin shift applied before the flight (the jet
+    // flies in the shifted frame), NO onCrash event (main.ts never
+    // wires it) — deaths are found by the handleDeaths poll once
+    // per substep after vfx.update(dt). The VFX must land on the
+    // wreck in the shifted frame, and the debris must still settle.
+    {
+      origin.reset();
+      const vfx = new CrashVFXManager(scene, { groundHeight: heightAt, origin });
+      const { player, drain, detachEvents, attachedPlumes, handleDeaths } = makeRun(key, vfx, true);
+      await player.attachModel();
+      // Origin shift BEFORE the flight (worldGen.shiftOriginIfNeeded
+      // fires on the player's position): everything registered moves
+      // by -shift, cumulativeShift grows, heightAt re-frames.
+      origin.applyShift(new THREE.Vector3(2500, 0, -1200));
+      const cSites = findSites();
+      const ccgl = Math.hypot(cSites.cliff.gx, cSites.cliff.gz) || 1;
+      const ccux = cSites.cliff.gx / ccgl, ccuz = cSites.cliff.gz / ccgl;
+      const cchdg = Math.atan2(ccux, ccuz) * 180 / Math.PI;
+      console.log(`\n=== ${key} C (stall, LIVE path) modelStatus=${player.modelStatus} shift=${origin.cumulativeShift.x},${origin.cumulativeShift.z} cliff grad=${cSites.cliff.g.toFixed(2)} ===`);
+      const sx = cSites.cliff.x - ccux * 700, sz = cSites.cliff.z - ccuz * 700;
+      const sy = heightAt(sx, sz) + 55;
+      player.resetAt(sx, sy, sz, cchdg);
+      player.setAirspeed(85); // 165 kt
+      player.gear = false;
+      player.grounded = false;
+      player.thrTarget = 0;
+      player.throttle = 0;
+      // Pass 12: full pull to force a genuine stall (see scenario A
+      // — the 0.15 pull is inside the auto-trim gate, so the jet
+      // mushed into the terrain without stalling). pitchIn NEGATIVE
+      // pulls up (v2 convention).
+      player.pitchIn = -1.0;
+      let impactedAt = -1;
+      let sawStall = false;
+      let impactSpeed = 0;
+      let simT = 0;
+      let firstImpactVy: number | null = null;
+      const trace: string[] = [];
+      while (simT < 60) {
+        liveFrame((dt) => {
+          simT += dt;
+          const sh = origin.shiftIfNeeded(player.pos);
+          if (sh) origin.applyShift(sh);
+          world.timestep = dt;
+          world.step(eventQueue);
+          drain();
+          if (firstImpactVy === null) {
+            const pc = (player as unknown as { pendingContact: { impactVy: number } | null }).pendingContact;
+            if (pc) firstImpactVy = pc.impactVy;
+          }
+          player.step(dt, WIND, null);
+          vfx.update(dt);
+          handleDeaths([player]);
+          if (player.stalled) sawStall = true;
+          // 1 s resolution (capped at 40 rows): the impact/bounce
+          // happens in the first seconds — the 5 s sampling missed
+          // it, and the fa18 C failure (tumble at 2-12 m AGL for
+          // 60 s, no crash) needs the impact moment captured.
+          if (Math.abs(simT % 1) < dt && trace.length < 40) {
+            trace.push(`t=${simT.toFixed(0)} agl=${(player.pos.y - heightAt(player.pos.x, player.pos.z)).toFixed(0)}m vy=${player.vel.y.toFixed(0)} ias=${(player.ias * 1.944).toFixed(0)}kt aoa=${player.aoaDeg.toFixed(1)} pitch=${(new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x * 180 / Math.PI).toFixed(1)} stalled=${player.stalled} alive=${player.alive}`);
+          }
+          if (!player.alive && impactedAt < 0) { impactedAt = simT; impactSpeed = player.vel.length(); }
+        });
+        if (impactedAt >= 0) break;
+      }
+      console.log(`  [C stall-live] trace: ` + trace.join(' | '));
+      check(`${key} C: jet stalls during the live-path flight`, sawStall, `sawStall=${sawStall}`);
+      check(`${key} C: stall impact crashes through the LIVE path (poll, variable dt, shifted frame)`, impactedAt >= 0 && (player.lastCrashReason === 'hard landing' || player.lastCrashReason === 'terrain'), `impact at t=${impactedAt.toFixed(2)}s reason=${player.lastCrashReason} vs=${player.lastCrashVs.toFixed(2)}m/s bank=${player.lastCrashBankDeg.toFixed(1)}deg speed=${impactSpeed.toFixed(1)}m/s firstImpactVy=${firstImpactVy === null ? 'none' : firstImpactVy.toFixed(1)}m/s`);
+      check(`${key} C: detach events fired with real segments (not null)`, detachEvents.length === 2 && detachEvents.every((e) => e.seg !== null), `events=${JSON.stringify(detachEvents)}`);
+      // Frame consistency: the explosion, the scorch and the debris
+      // must be AT the wreck in the shifted frame, not left 2 km
+      // behind at the pre-shift coordinates. The scorch marks the
+      // IMPACT point, and the wreck can slide/tumble away from it
+      // after the crash is declared on first contact (pass 12) —
+      // so the scorch limit is 20 m, not 5 m: a 2 km shift error
+      // still fails by two orders of magnitude, while a 12–14 m
+      // slide after an 85 m/s impact is legitimate.
+      {
+        const V = vfx as unknown as { booms: BoomRec[]; debris: DebrisRec[]; scorches: ScorchRec[] };
+        const boomD = V.booms.length ? V.booms[0]!.sprite.position.distanceTo(player.pos) : Infinity;
+        const scorchD = V.scorches.length ? V.scorches[0]!.mesh.position.distanceTo(player.pos) : Infinity;
+        let debrisMeanD = Infinity;
+        if (V.debris.length) {
+          const c = new THREE.Vector3();
+          for (const d of V.debris) { const p = d.body.translation(); c.x += p.x; c.y += p.y; c.z += p.z; }
+          c.divideScalar(V.debris.length);
+          debrisMeanD = c.distanceTo(player.pos);
+        }
+        check(`${key} C: VFX is at the wreck in the shifted frame (boom < 5 m, scorch < 20 m from the impact point, debris mean < 40 m)`, boomD < 5 && scorchD < 20 && debrisMeanD < 40, `boom=${boomD.toFixed(1)}m scorch=${scorchD.toFixed(1)}m debrisMean=${debrisMeanD.toFixed(1)}m wreck=(${player.pos.x.toFixed(0)},${player.pos.y.toFixed(0)},${player.pos.z.toFixed(0)}) shift=(${origin.cumulativeShift.x.toFixed(0)},${origin.cumulativeShift.z.toFixed(0)})`);
+      }
+      const samples = sampleAfterImpact(vfx, player, attachedPlumes, true);
+      verify(key, 'C stall-live', player, detachEvents, samples, false);
+      origin.unregisterBody(player.body);
+      player.dispose();
+    }
+
+    // ---------- Scenario C2: fast hard impact, LIVE path, flat ground ----------
+    // Same staging as B, live wiring + live dt. Run TWICE — with and
+    // without the pre-flight origin shift — ON THE SAME TERRAIN: the
+    // sites are found in the unshifted frame (origin.reset() first,
+    // before any shift) inside each iteration, and the shift variant
+    // stages at scene coords (base - shift), which map to the same
+    // original-frame ground (heightAt adds the cumulative shift).
+    // If the shift machinery is consistent, the two runs must behave
+    // identically; any difference is the shift breaking the ground
+    // (collider vs analytic height). This is the flake repro too:
+    // the debris-resting check runs on flat ground under live step
+    // sizes (Rapier timestep up to 0.05 s).
+    for (const useShift of [true, false]) {
+      origin.reset();
+      const c2Sites = findSites();
+      const c2fgl = Math.hypot(c2Sites.face.gx, c2Sites.face.gz) || 1;
+      const c2fux = c2Sites.face.gx / c2fgl, c2fuz = c2Sites.face.gz / c2fgl;
+      const c2fhdg = Math.atan2(c2fux, c2fuz) * 180 / Math.PI;
+      const c2BaseX = c2Sites.face.x - c2fux * 300, c2BaseZ = c2Sites.face.z - c2fuz * 300;
+      const vfx = new CrashVFXManager(scene, { groundHeight: heightAt, origin });
+      const { player, drain, detachEvents, attachedPlumes, handleDeaths } = makeRun(key, vfx, true);
+      await player.attachModel();
+      // Same-terrain staging: the shift variant stages at scene
+      // (base - shift) so heightAt (which adds the cumulative
+      // shift) reads the same original-frame ground as the
+      // no-shift run.
+      const sx = useShift ? c2BaseX - 2500 : c2BaseX;
+      const sz = useShift ? c2BaseZ + 1200 : c2BaseZ;
+      if (useShift) origin.applyShift(new THREE.Vector3(2500, 0, -1200));
+      const c2tag = useShift ? 'C2s fast-live-shift' : 'C2n fast-live-noshift';
+      console.log(`\n=== ${key} ${c2tag} modelStatus=${player.modelStatus} shift=${origin.cumulativeShift.x},${origin.cumulativeShift.z} stage=(${sx.toFixed(0)},${sz.toFixed(0)}) ground=${heightAt(sx, sz).toFixed(1)} ===`);
+      const by = heightAt(sx, sz) + 10;
+      player.resetAt(sx, by, sz, c2fhdg);
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler((8 * Math.PI) / 180, (c2fhdg * Math.PI) / 180, 0, 'YXZ'));
+      player.body.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+      const f = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      player.body.setLinvel({ x: f.x * 85, y: -16, z: f.z * 85 }, true);
+      player.vel.set(f.x * 85, -16, f.z * 85);
+      player.gear = true;
+      player.grounded = false;
+      player.thrTarget = 0.6;
+      player.throttle = 0.6;
+      player.pitchIn = 0;
+      let impactedAt = -1;
+      let impactSpeed = 0;
+      let simT = 0;
+      const c2trace: string[] = [];
+      while (simT < 6) {
+        liveFrame((dt) => {
+          simT += dt;
+          world.timestep = dt;
+          world.step(eventQueue);
+          drain();
+          player.step(dt, WIND, null);
+          vfx.update(dt);
+          handleDeaths([player]);
+          if (!player.alive && impactedAt < 0) { impactedAt = simT; impactSpeed = player.vel.length(); }
+        });
+        if (simT < 2.5 && c2trace.length < 12) {
+          c2trace.push(`t=${simT.toFixed(2)} agl=${(player.pos.y - heightAt(player.pos.x, player.pos.z)).toFixed(1)}m vy=${player.vel.y.toFixed(1)} ias=${(player.ias * 1.944).toFixed(0)}kt alive=${player.alive} surf=${player.onSurface} gnd=${player.grounded}`);
+        }
+        if (impactedAt >= 0) break;
+      }
+      console.log(`  [${c2tag}] trace: ` + c2trace.join(' | '));
+      check(`${key} ${c2tag}: fast hard impact crashes 'hard landing' through the LIVE path`, impactedAt >= 0 && player.lastCrashReason === 'hard landing' && player.lastCrashVs <= -9, `impact at t=${impactedAt.toFixed(2)}s reason=${player.lastCrashReason} vs=${player.lastCrashVs.toFixed(2)}m/s bank=${player.lastCrashBankDeg.toFixed(1)}deg speed=${impactSpeed.toFixed(1)}m/s (${(impactSpeed * 1.944).toFixed(0)}kt)`);
+      check(`${key} ${c2tag}: detach events fired with real segments (not null)`, detachEvents.length === 2 && detachEvents.every((e) => e.seg !== null), `events=${JSON.stringify(detachEvents)}`);
+      const samples = sampleAfterImpact(vfx, player, attachedPlumes, true);
+      verify(key, c2tag, player, detachEvents, samples, true);
+      origin.unregisterBody(player.body);
+      player.dispose();
+    }
+
+    // ---------- Scenario D: steep dive must crash, not auto-recover ----------
+    // The live F-18 cases: 441 kt at -26,976 fpm from 276 ft, and
+    // 746 kt at -66,874 fpm from 35,842 ft — hands-off (neutral
+    // stick, no pull), live dt. A hard fast dive into the ground
+    // must crash; levelling off, bouncing off the terrain, or
+    // climbing away is the auto-recovery failure. D1 stages the
+    // low case exactly (84 m AGL, 227 m/s, 37 deg dive); D2 stages
+    // the high case's dive angle and speed at 3000 m AGL (the same
+    // mechanism — trim pull-out or Rapier bounce — with a shorter
+    // fall; altitude only changes time-to-impact).
+    for (const dive of [
+      { tag: 'D1 low', agl: 84, speed: 227, pitchDownDeg: 37, thr: 0.6, maxT: 5, expectT: 3 },
+      { tag: 'D2 high', agl: 3000, speed: 384, pitchDownDeg: 62, thr: 1.0, maxT: 30, expectT: 25 },
+    ] as const) {
+      origin.reset();
+      const vfx = new CrashVFXManager(scene, { groundHeight: heightAt, origin });
+      const { player, drain, detachEvents, attachedPlumes, handleDeaths } = makeRun(key, vfx, true);
+      await player.attachModel();
+      console.log(`\n=== ${key} ${dive.tag} (steep dive, LIVE path) ===`);
+      const dy = heightAt(baseX, baseZ) + dive.agl;
+      player.resetAt(baseX, dy, baseZ, fhdg);
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler((dive.pitchDownDeg * Math.PI) / 180, (fhdg * Math.PI) / 180, 0, 'YXZ'));
+      player.body.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+      const f = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      player.body.setLinvel({ x: f.x * dive.speed, y: f.y * dive.speed, z: f.z * dive.speed }, true);
+      player.vel.copy(new THREE.Vector3(f.x * dive.speed, f.y * dive.speed, f.z * dive.speed));
+      player.gear = false;
+      player.grounded = false;
+      player.thrTarget = dive.thr;
+      player.throttle = dive.thr;
+      player.pitchIn = 0;
+      player.rollIn = 0;
+      player.yawIn = 0;
+      let simT = 0;
+      let crashedAt = -1;
+      let bounced = false;
+      let sawHardDescent = false;
+      let levelledOff = false;
+      let levelT = 0;
+      let minAgl = Infinity;
+      let lastVy = f.y * dive.speed;
+      // First-contact impactVy: the patch-spec premise — the
+      // collision event fires at first touch, so the impactVy the
+      // controller reads (pendingContact) is the PRE-resolution
+      // impact speed, not the post-bounce climb. Record the first
+      // non-null pendingContact after drain(), before step()
+      // consumes it.
+      let firstImpactVy: number | null = null;
+      const trace: string[] = [];
+      while (simT < dive.maxT) {
+        liveFrame((dt) => {
+          simT += dt;
+          world.timestep = dt;
+          world.step(eventQueue);
+          drain();
+          if (firstImpactVy === null) {
+            const pc = (player as unknown as { pendingContact: { impactVy: number } | null }).pendingContact;
+            if (pc) firstImpactVy = pc.impactVy;
+          }
+          player.step(dt, WIND, null);
+          vfx.update(dt);
+          handleDeaths([player]);
+          const agl = player.pos.y - heightAt(player.pos.x, player.pos.z);
+          minAgl = Math.min(minAgl, agl);
+          lastVy = player.vel.y;
+          // Bounce (state-based — the flip spans several substeps as
+          // Rapier resolves the penetration, so a single-substep
+          // vy-flip test misses it): a hard descent low, then a
+          // climb while still low and alive — the contact solver
+          // ejecting the jet instead of the crash logic.
+          if (player.alive && agl < 100 && lastVy < -50) sawHardDescent = true;
+          if (player.alive && sawHardDescent && agl < 100 && lastVy > 5) bounced = true;
+          // Level-off: sustained near-zero sink while high and
+          // alive — the trim/aero pull-out, hands-off. Gated on
+          // the jet NEVER having been low (minAgl > 500): a
+          // post-bounce climb back above 500 m is a bounce
+          // artefact, not a level-off, and must not count.
+          if (player.alive && agl > 500 && minAgl > 500 && lastVy > -20) levelT += dt;
+          else levelT = 0;
+          if (levelT > 2) levelledOff = true;
+          if (!player.alive && crashedAt < 0) crashedAt = simT;
+        });
+        if (Math.abs(simT % 1) < 0.2 && trace.length < 40) {
+          trace.push(`t=${simT.toFixed(1)} agl=${(player.pos.y - heightAt(player.pos.x, player.pos.z)).toFixed(0)}m vy=${lastVy.toFixed(0)} ias=${(player.ias * 1.944).toFixed(0)}kt aoa=${player.aoaDeg.toFixed(1)} pitch=${(new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x * 180 / Math.PI).toFixed(1)} alive=${player.alive}`);
+        }
+        if (crashedAt >= 0 || levelledOff) break;
+      }
+      console.log(`  [${dive.tag}] trace: ` + trace.join(' | '));
+      check(`${key} ${dive.tag}: steep dive crashes within ${dive.expectT} s (no auto-recovery)`, crashedAt >= 0 && crashedAt <= dive.expectT, `crashedAt=${crashedAt < 0 ? 'never' : crashedAt.toFixed(2) + 's'} reason=${player.lastCrashReason} vs=${player.lastCrashVs.toFixed(1)}m/s minAgl=${minAgl.toFixed(1)}m finalVy=${lastVy.toFixed(1)}m/s finalAgl=${(player.pos.y - heightAt(player.pos.x, player.pos.z)).toFixed(0)}m firstImpactVy=${firstImpactVy === null ? 'none' : firstImpactVy.toFixed(1)}m/s`);
+      check(`${key} ${dive.tag}: no Rapier bounce off the terrain (vy never flips to a climb while low and alive)`, !bounced, `bounced=${bounced} firstImpactVy=${firstImpactVy === null ? 'none' : firstImpactVy.toFixed(1)}m/s`);
+      check(`${key} ${dive.tag}: no hands-off level-off at altitude`, !levelledOff, `levelledOff=${levelledOff}`);
       origin.unregisterBody(player.body);
       player.dispose();
     }

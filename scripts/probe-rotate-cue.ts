@@ -75,6 +75,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
+import { FlightHUD } from '../src/ui/FlightHUD';
 import {
   generateHeights,
   heightfieldHeightAt,
@@ -166,6 +167,7 @@ async function main(): Promise<void> {
     ac.thrTarget = 1;
     let cueOnAtVr = false;
     let cueOffAfterLiftoff = false;
+    let cueBackOn = false; // pass 12: must NEVER reappear in flight
     let liftedOffAt = -1;
     let maxBank = 0;
     let maxBankAt = '';
@@ -209,6 +211,11 @@ async function main(): Promise<void> {
       if (liftedOffAt >= 0 && t > liftedOffAt + 1 && !ac.rotateCue) {
         cueOffAfterLiftoff = true;
       }
+      // Pass 12: once off after liftoff it must stay off for the
+      // rest of the flight (5 s window) — never flicker back on.
+      if (liftedOffAt >= 0 && t > liftedOffAt + 1 && ac.rotateCue) {
+        cueBackOn = true;
+      }
       if (liftedOffAt >= 0 && t > liftedOffAt + 5) {
         headingAtEnd = headingDeg;
         break;
@@ -222,6 +229,13 @@ async function main(): Promise<void> {
     check(
       `${key}: ROTATE cue is OFF 1 s after liftoff`,
       cueOffAfterLiftoff,
+      liftedOffAt >= 0
+        ? `liftoff at t=${liftedOffAt.toFixed(1)}s`
+        : 'never lifted off',
+    );
+    check(
+      `${key}: ROTATE cue NEVER comes back in the 5 s after liftoff`,
+      !cueBackOn,
       liftedOffAt >= 0
         ? `liftoff at t=${liftedOffAt.toFixed(1)}s`
         : 'never lifted off',
@@ -309,6 +323,141 @@ async function main(): Promise<void> {
     );
     ac.dispose();
     ac2.dispose();
+  }
+
+  // --- FlightHUD DOM test (pass 12, worker D): the ROTATE cue's
+  // text must leave the DOM when the cue hides, not just go
+  // transparent (opacity 0). The v4.6.1 live check read
+  // "ROTATE — HOLD ↑ / PULL BACK" in the DOM while flying, with
+  // nothing visible — the static HTML text lingered after the
+  // `show` class was removed. FlightHUD now writes the text only
+  // while the cue is shown. This drives the real FlightHUD against
+  // a stub document and a fake aircraft (only the fields update()
+  // reads).
+  {
+    type StubEl = {
+      textContent: string;
+      className: string;
+      style: Record<string, string>;
+      parentElement: null;
+      classList: {
+        add(c: string): void;
+        remove(c: string): void;
+        toggle(c: string, force?: boolean): void;
+        contains(c: string): boolean;
+      };
+      querySelector(_sel: string): StubEl;
+    };
+    const makeStubEl = (): StubEl => {
+      const classes = new Set<string>();
+      const el: StubEl = {
+        textContent: '',
+        className: '',
+        style: {},
+        parentElement: null,
+        classList: {
+          add: (c) => {
+            classes.add(c);
+          },
+          remove: (c) => {
+            classes.delete(c);
+          },
+          toggle: (c, force) => {
+            if (force === undefined) {
+              if (classes.has(c)) classes.delete(c);
+              else classes.add(c);
+            } else if (force) classes.add(c);
+            else classes.delete(c);
+          },
+          contains: (c) => classes.has(c),
+        },
+        querySelector: (_sel) => makeStubEl(),
+      };
+      return el;
+    };
+    const els = new Map<string, StubEl>();
+    const docHolder = globalThis as unknown as {
+      document?: Record<string, unknown>;
+    };
+    const docObj = (docHolder.document ?? {}) as Record<string, unknown>;
+    docObj['getElementById'] = (id: string): unknown => {
+      if (id === 'miniCv') return { getContext: () => null };
+      if (!els.has(id)) els.set(id, makeStubEl());
+      return els.get(id);
+    };
+    docHolder.document = docObj;
+    const hud = new FlightHUD();
+    const rc = els.get('rotateCue')!;
+    // Mirror the real DOM: index.html ships #rotateCue with static
+    // text ("ROTATE — HOLD ↑ / PULL BACK"). Without this seed the
+    // test would pass vacuously — the stub would start empty and
+    // staying empty looks identical to being cleared.
+    rc.textContent = 'ROTATE — HOLD ↑ / PULL BACK';
+    const fakeAc = (over: { alive: boolean; rotateCue: boolean }): Aircraft => {
+      const ac = {
+        grounded: true,
+        vel: new THREE.Vector3(0, 0, 0),
+        ias: 0,
+        pos: new THREE.Vector3(0, 50, 0),
+        vsi: 0,
+        fwd: () => new THREE.Vector3(0, 0, 1),
+        aoa: 0,
+        quat: new THREE.Quaternion(),
+        gload: 1,
+        fuel: 1,
+        alive: over.alive,
+        rotateCue: over.rotateCue,
+        msl: 6,
+        flares: 30,
+        bombs: 4,
+        damageEntity: {
+          maxHpFor: (_z: string) => 100,
+          hpFor: (_z: string) => 100,
+        },
+        fireZone: null,
+        dying: false,
+        spin: 0,
+        spinArrow: 0,
+        fireKind: null,
+        stalled: false,
+        spec: { vtol: false },
+        vector: 0,
+        lockT: 0,
+        lockTarget: null,
+      };
+      return ac as unknown as Aircraft;
+    };
+    const game = { score: 0, kills: 0, traps: 0, elapsed: 0, lockTarget: null };
+    hud.update(fakeAc({ alive: true, rotateCue: true }), game);
+    check(
+      'HUD ROTATE shown: class show + text present while on runway at Vr',
+      rc.classList.contains('show') && rc.textContent.includes('ROTATE'),
+      `text=${JSON.stringify(rc.textContent)}`,
+    );
+    hud.update(fakeAc({ alive: true, rotateCue: false }), game);
+    check(
+      'HUD ROTATE hidden in flight: no show class AND text cleared from DOM',
+      !rc.classList.contains('show') && rc.textContent === '',
+      `text=${JSON.stringify(rc.textContent)}`,
+    );
+    hud.update(fakeAc({ alive: false, rotateCue: true }), game);
+    check(
+      'HUD ROTATE hidden while dead: no show class AND text cleared',
+      !rc.classList.contains('show') && rc.textContent === '',
+      `text=${JSON.stringify(rc.textContent)}`,
+    );
+    hud.update(fakeAc({ alive: true, rotateCue: true }), game);
+    check(
+      'HUD ROTATE shows again after hiding: text restored',
+      rc.classList.contains('show') && rc.textContent.includes('ROTATE'),
+      `text=${JSON.stringify(rc.textContent)}`,
+    );
+    hud.clearTransient();
+    check(
+      'HUD clearTransient: ROTATE hidden AND text cleared',
+      !rc.classList.contains('show') && rc.textContent === '',
+      `text=${JSON.stringify(rc.textContent)}`,
+    );
   }
 
   console.log(failures === 0 ? '\nALL ROTATE-CUE CHECKS PASSED' : `\n${failures} ROTATE-CUE CHECK(S) FAILED`);

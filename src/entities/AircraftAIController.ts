@@ -78,7 +78,14 @@ export class AircraftAIController {
   dropBomb = false;
 
   private decideT = 0;
-  private fireT = 0;
+  /** Gun cooldown (s); the missile has its own (below). Pass 12:
+   *  one shared fireT let a missile launch (3 s) suppress the gun
+   *  through the whole 900 m head-on crossing — the AI fired its
+   *  missile at ~1800 m and coasted through gun range unable to
+   *  shoot. The gun and the missile are independent weapons. */
+  private fireGunT = 0;
+  /** Missile cooldown (s). */
+  private fireMslT = 0;
   private evadeT = 0;
   /** Throttle target is stateful (v2 integrates ac.thrTarget); kept here
    *  since the controller no longer writes the aircraft's field. */
@@ -192,9 +199,16 @@ export class AircraftAIController {
         // single range it dropped to patrol on the overshoot and flew
         // away instead of re-attacking, so it never closed to firing
         // range. Disengage only beyond 5000 m (slow) / 4000 m (fast).
+        // Pass 12 (Worker E): the fast disengage range is 6000 m,
+        // not 4000 m — after a head-on pass the AI needs ~18 s to
+        // reverse onto the player's tail, during which the player
+        // extends ~2.7 km; at 4000 m it dropped to patrol mid-turn
+        // and flew away instead of re-attacking. The engage range
+        // is unchanged (2600/3500 m), so the hysteresis is wider,
+        // not the trigger.
         const slowTarget = player.ias < 50;
         const engageRange = slowTarget ? 3500 : 2600;
-        const disengageRange = slowTarget ? 5000 : 4000;
+        const disengageRange = slowTarget ? 5000 : 6000;
         const dist = ac.pos.distanceTo(player.pos);
         if (this.state === 'engage') {
           this.state = pFair && dist < disengageRange ? 'engage' : 'patrol';
@@ -205,21 +219,26 @@ export class AircraftAIController {
       if (this.state === 'patrol' || this.state === 'rtb') {
         if (this.rng() < 0.3) this.pickNav(player);
       }
-      // Bombing run: a jet with bombs (Su-34) in patrol has a chance to
-      // attack the player's runway instead of circling. Target is Alpha,
-      // the player's home base.
-      // Pass 8 (item 2): gated on pFair — the bomb state has no
-      // grounded/spawn-protection check of its own, so a Su-34 in
-      // patrol at round start rolled straight into a bombing run on
-      // Alpha while the player was still parked and spawn-protected
-      // (probe-ai-live: e1 was 'bomb' at t=0). A bombing run is an
-      // attack on the player, so it needs a fair target like engage.
+      // Pass 12 (Worker E): a Su-34 in patrol entered a bombing run
+      // on a 25% roll per ~0.1 s decide tick — i.e. within ~0.5 s of
+      // being in patrol with a fair player — so both Su-34s spent
+      // most of a round 10-20 km away bombing Alpha instead of
+      // fighting (probe-ai-live baseline: 107 of 960 enemy-seconds
+      // in 'bomb', entered while the player was 1-2 km away). A
+      // bombing run is only a fallback when there is no dogfight to
+      // join: the player must be beyond engage range. And a bomb
+      // run ABORTS back to engage when the player closes inside
+      // engage range — the run must not preempt a fight.
+      const distToPlayer = ac.pos.distanceTo(player.pos);
+      const slowTgt = player.ias < 50;
+      const engageR = slowTgt ? 3500 : 2600;
       if (
         this.role === 'enemy' &&
         ac.bombs > 0 &&
         this.state === 'patrol' &&
         pFair &&
-        this.rng() < 0.25
+        distToPlayer > engageR &&
+        this.rng() < 0.05
       ) {
         this.state = 'bomb';
         this.bombState = 'none';
@@ -229,6 +248,10 @@ export class AircraftAIController {
           alpha.elev,
           alpha.z - this.originShift.z,
         );
+      }
+      if (this.state === 'bomb' && pFair && distToPlayer < engageR) {
+        this.state = 'engage';
+        this.bombState = 'none';
       }
       // Leaving RTB / bomb resets the pattern / run so re-entering
       // recomputes it from the jet's current position.
@@ -251,8 +274,19 @@ export class AircraftAIController {
     // from the player (probe-ai-live: e0/e1 at 17-23 km), far outside
     // the 12 km map and out of engagement for a whole 2.5 min round.
     // 100 m/s keeps the patrol inside the map and near the action.
+    // Pass 12 (Worker E): 130 m/s, not 100 — a patrol at 100 m/s
+    // cannot re-close on a player cruising at 150 m/s: after a
+    // disengage the gap only grows, so the AI never re-enters the
+    // 2600 m engage range. 130 m/s still keeps the patrol circuits
+    // near the player (the navTarget is re-picked around the player
+    // every ~0.3 s) while letting the AI gain on a cruising player
+    // when the geometry favours it.
+    // Heading now (used by the engage corner-speed rule below and
+    // by the steering section; computed once).
+    const fwd = ac.fwd();
+    const curHdg = Math.atan2(fwd.x, fwd.z);
     let goal: THREE.Vector3 = this.navTarget;
-    let speedWant = 100;
+    let speedWant = 130;
     let gearDown = false;
     let hookDown = false;
     let vsCap = 15; // vertical-speed demand cap (m/s); bomb dive raises it
@@ -269,10 +303,55 @@ export class AircraftAIController {
       speedWant = rg.speed;
       gearDown = rg.gear;
     } else if (this.state === 'engage' && player.alive && !player.dying) {
-      const lead = this.skill.lead;
-      const tGo = ac.pos.distanceTo(player.pos) / 280;
+      const distToP = ac.pos.distanceTo(player.pos);
+      // Pass 12 (Worker E): the steering lead blends out at close
+      // range. At full lead (veteran 0.5, tGo = dist/280) the goal
+      // sits ~15 deg off the player in a crossing geometry at EVERY
+      // range — the nose tracked the intercept point, never the
+      // player, so the 12 deg gun cone never closed even at 133 m
+      // (probe-ai-live: nose 60-97 deg off while circling at
+      // ~1300 m, chasing a lead point that itself moves at 150 m/s).
+      // Beyond 2000 m the full lead stands (a real intercept); inside
+      // it the goal becomes the player itself — pure pursuit, nose on
+      // the target for the gun. The skill lead still differentiates
+      // the long intercept.
+      const leadScale = clamp(distToP / 2000, 0, 1);
+      const lead = this.skill.lead * leadScale;
+      const tGo = distToP / 280;
       goal = this.tmpB.copy(player.pos).addScaledVector(player.vel, lead * tGo);
-      speedWant = clamp(player.ias + 25, 90, 240);
+      // Pass 12 (Worker E): the speed cap was 240 m/s — a fast player
+      // (F-22 at full throttle reaches 270+ m/s) outran the AI in a
+      // tail chase, so the AI only ever closed head-on. 280 m/s lets
+      // it match and close on a fast player; the want is still only
+      // player speed + 25 m/s, so it does not overshoot a slow one.
+      speedWant = clamp(player.ias + 25, 90, 280);
+      // Pass 12 (Worker E): corner speed. A 70 deg bank at 175 m/s
+      // turns at ~9 deg/s, barely above the line-of-sight rate of a
+      // crossing player at 1300 m (~7 deg/s) — the AI circled the
+      // player for 30+ s with its nose 60-97 deg off, never settling.
+      // At 120 m/s the same bank turns at ~13 deg/s and the bearing
+      // rate falls too, so the nose catches the goal. When the turn
+      // is big (> 60 deg of heading error) the AI slows to corner
+      // speed; when aligned it accelerates back to player speed + 25.
+      const desHdgHere = Math.atan2(goal.x - ac.pos.x, goal.z - ac.pos.z);
+      let hdgErrHere = desHdgHere - curHdg;
+      while (hdgErrHere > Math.PI) hdgErrHere -= 2 * Math.PI;
+      while (hdgErrHere < -Math.PI) hdgErrHere += 2 * Math.PI;
+      // Pass 12 (Worker E): the 30 deg threshold, not 60 — the AI
+      // converges on the target's bearing at only ~3 deg/s at
+      // 175 m/s, so it spent 20-30 s per pass circling with its nose
+      // 30-70 deg off (probe-ai-live PASS trace). Corner speed
+      // applies for most of the approach, not just the reversal.
+      if (Math.abs(hdgErrHere) > (30 * Math.PI) / 180) {
+        speedWant = Math.min(speedWant, 120);
+      }
+      // Pass 12 (Worker E): climb/dive authority in a dogfight.
+      // vsCap 15 m/s let a player climbing at 20-40 m/s (routine for
+      // a fighter at full throttle) out-climb the AI forever — the
+      // AI's nose sat below the player and the fire cones never
+      // closed. 30 m/s follows a climbing/diving player; the hard
+      // floor and terrain pull-up still apply.
+      vsCap = 30;
     } else if (this.state === 'evade') {
       // v2: ac.pos + (player.pos - ac.pos) * -1 + (0, 120, 0) — away from
       // the player and climbing.
@@ -303,9 +382,8 @@ export class AircraftAIController {
     // is what makes a negative (right-turn) rate bank right. Pass 11:
     // the old comment claimed heading increases right and negative
     // phi is a right bank — both backwards; the code was right and
-    // the comment was the trap.
-    const fwd = ac.fwd();
-    const curHdg = Math.atan2(fwd.x, fwd.z);
+    // the comment was the trap. (fwd / curHdg are computed above the
+    // goal section — the engage corner-speed rule uses them too.)
     const desHdg = Math.atan2(toGoal.x, toGoal.z);
     let hdgErr = desHdg - curHdg;
     while (hdgErr > Math.PI) hdgErr -= 2 * Math.PI;
@@ -340,6 +418,26 @@ export class AircraftAIController {
     // around the downwind waypoint). The gain is 1.0 in RTB (1.5
     // elsewhere) so the commanded rate stays proportional over a
     // wider error range instead of saturating at max above ~3.5 deg.
+    // Pass 12 (coordinator): the combat cap stays 0.6x. Raising it
+    // to 0.9x/0.75x was tried and reverted: the gun fired more
+    // (5-21 shots) but the AI bled speed in sustained hard turns
+    // and the probe outcomes swung chaotically with small changes
+    // (player lock 0.00-7.47 s, gun 0-21 across runs), so no
+    // higher cap is reliably better. The sustained-rate formula is
+    // optimistic (ignores separation drag), so 0.6x is the safe
+    // cap; the missiles — the AI's primary weapon — engage
+    // reliably at 0.6x (4-13 launched, player shot down).
+    // Pass 12 (coordinator): engage/evade use 0.9x, not 0.6x. At
+    // corner speed (120 m/s) 0.6x is ~7.4 deg/s — barely above the
+    // player's 5.6 deg/s turn, and the bearing rotates away at
+    // ~3 deg/s as the player closes from behind, so the heading
+    // error GREW at 1.4 deg/s for 35 s (probe-ai-live: e0 banked
+    // 57 deg steady, omegaSm -0.13, hdgErr 118 -> 166 deg) and the
+    // gun never fired. 0.9x is ~11 deg/s (bank ~67 deg, inside the
+    // 70 deg cap) — enough to gain on the error and close it. The
+    // sustained-rate formula is optimistic (ignores separation
+    // drag), so 1.0x is not used; the AoA limiter + corner-speed
+    // throttle guard the departure if the jet bleeds speed.
     const omegaCapFrac =
       this.state === 'rtb'
         ? Math.abs(hdgErr) > (60 * Math.PI) / 180
@@ -362,15 +460,62 @@ export class AircraftAIController {
     // the commanded turn inside the envelope the solver can actually
     // hold (the formula ignores separation drag, so the raw max is
     // optimistic).
+    // Pass 12 (Worker E): the combat bank cap was 45 deg — at the
+    // AI's 150-175 m/s that turns at g*tan(45)/V = 3.7-4.4 deg/s,
+    // so a 180 deg reversal after a head-on pass took ~45 s while
+    // the commanded rate (0.6 * sustained, ~11 deg/s) needed 71 deg
+    // of bank. Measured in probe-ai-live: in 54 s of close
+    // engagement the nose never got within 32 deg of the player
+    // (146 deg at < 900 m) and the AI fired zero times. Combat
+    // (engage/evade) may now use 70 deg (~2.9 g): the sustained-turn
+    // envelope at 150 m/s is ~4.9 g for the MiG-29, so 2.9 g is
+    // inside it, and the AoA limiter (10 deg banked) + sink unload
+    // still guard the departure the old 60 deg cap was protecting
+    // against. Patrol/traffic stay gentle (30 deg); RTB/bomb keep
+    // 45 deg.
     const bankCap =
       this.state === 'patrol' || this.role === 'traffic'
         ? (30 * Math.PI) / 180
-        : (45 * Math.PI) / 180;
+        : this.state === 'engage' || this.state === 'evade'
+          ? ((ac.pos.distanceTo(goal) > 1200 ? 45 : 70) * Math.PI) / 180
+          : (45 * Math.PI) / 180;
+    // (pass 12, Worker E: the combat bank cap is range-gated. In a
+    // 70 deg bank the pitch input rotates the nose in the roll plane,
+    // so the jet cannot descend — it stays 500-2700 m above the
+    // player while the vs-law commands a descent it cannot fly, and
+    // the player can never lock a target 1000 m above it (the
+    // vertical angle alone is 15-20 deg). At long range (>1200 m)
+    // the bearing rate is low, so a 45 deg bank (5.6 deg/s) still
+    // intercepts while the pitch is free to descend to the player's
+    // altitude; inside 1200 m the full 70 deg returns for the
+    // dogfight, where the jet is already co-altitude. An
+    // altitude-gated cap was tried first and crippled the close-in
+    // turn whenever the jet was off-altitude, even in the fight.)
     let phiDes = clamp(
       -Math.atan((this.omegaSm * Math.max(ac.ias, 1)) / 9.81),
       -bankCap,
       bankCap,
     );
+    // Pass 12 (coordinator): low-energy bank cap. When the jet is
+    // slow (ias < 1.5x stall speed) a hard bank bleeds the remaining
+    // speed faster than full throttle can replace it — the induced
+    // drag at 70 deg bank exceeds the thrust, so the jet keeps
+    // slowing until it stalls and cannot climb out of the ground.
+    // Capping the bank at 30 deg (1.15 g) when low on energy lets
+    // the jet hold altitude and accelerate back to a safe speed
+    // before it turns hard again. At healthy speed the cap does not
+    // apply, so the dogfight turn rate (probe-ai-live) is untouched.
+    // This is the guard that saves the AI engaging a slow/hovering
+    // player at low altitude: the sink unload below only fires when
+    // the jet sinks FASTER than commanded, and a jet descending
+    // toward a low player is descending AS commanded — so the
+    // unload never fired while the MiG-29 bled to 83 kt and died
+    // "hard landing" 39 m above terrain (probe-ai-hover, seeded).
+    // The threshold is 1.5x (not 1.3x): the bleed is gradual and
+    // the stall is sudden, so 1.3x fired only after the jet was
+    // already stalling and the death time did not move at all.
+    const lowEnergy = ac.ias < 1.5 * S.stallSpeed;
+    if (lowEnergy) phiDes = clamp(phiDes, (-30 * Math.PI) / 180, (30 * Math.PI) / 180);
     // Sink unload: in a bank the vertical lift is lift·cos(phi), so a
     // hard-banked turn that cannot hold altitude sinks — and the
     // vs-pitch then pulls to climb, the AoA overshoots past the stall,
@@ -391,7 +536,32 @@ export class AircraftAIController {
     // and failed: once the jet is within 100 m of pattern altitude
     // the unload fired again on the final part of the descent.
     const vsDesHere = clamp((goal.y - ac.pos.y) * (this.state === 'rtb' ? 0.08 : 0.03), -vsCap, vsCap);
-    if (ac.vsi < vsDesHere - 5) phiDes *= 0.3;
+    // Pass 12 (Worker E): the unload does NOT fire in combat
+    // (engage/evade) at healthy speed. In a hard-banked turn the jet
+    // sinks, and the unload cut the bank to 30% — killing the turn
+    // rate exactly when the AI needed it, so it circled the player
+    // for 20-30 s with its nose 30-70 deg off and never closed to
+    // gun range (probe-ai-live PASS trace). The stall guard in
+    // combat is the AoA limiter above (pitch capped at level past
+    // 10-12 deg), not the unload: the jet sinks in the turn instead
+    // of departing, and the hard floor + terrain pull-up still catch
+    // it. In patrol/RTB/bomb the unload stays — that is where the
+    // sink-into-stall departure was observed.
+    // Pass 12 (coordinator): BUT the unload DOES fire in combat
+    // when the jet is low on energy (ias < 1.3x stall speed). The
+    // AoA limiter alone does not save a jet that has bled below
+    // stall in a sustained hard turn: a stalled jet cannot climb,
+    // so the hard floor + terrain pull-up cannot catch it either —
+    // the MiG-29 bled to 83 kt (vs 124 kt Vs), sank at -10 m/s, and
+    // died "hard landing" 39 m above terrain engaging a hovering
+    // player (probe-ai-hover, seeded). Levelling the wings restores
+    // vertical lift and lets the jet accelerate out of the sink
+    // before it stalls. At healthy speed the unload still does not
+    // fire in combat, so the turn rate (probe-ai-live) is untouched.
+    // (lowEnergy is defined above, at the bank cap — 1.5x stall
+    // speed, so it fires early in the bleed, not after the stall.)
+    const inCombat = this.state === 'engage' || this.state === 'evade';
+    if (ac.vsi < vsDesHere - 5 && (!inCombat || lowEnergy)) phiDes *= 0.3;
     const phiNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
     let rollIn = clamp((phiDes - phiNow) * 2.0, -1, 1);
     // v2 evade weave: sin(performance.now() * 0.004); time here is seconds,
@@ -422,23 +592,38 @@ export class AircraftAIController {
     // vsDes = (goal.y - pos.y) * gain - ias * tan(3.5 deg), so the
     // jet descends at the slope rate even when exactly on the slope
     // and the proportional term only corrects small errors.
-    const vsGain = this.state === 'rtb' ? 0.08 : 0.03;
+    const vsGain =
+      this.state === 'rtb' ? 0.08 : this.state === 'engage' || this.state === 'evade' ? 0.015 : 0.03;
+    // (pass 12, Worker E: engage/evade 0.015, was 0.03. The outer
+    // altitude loop saturated — vsDes clamped at +-vsCap for any
+    // altitude error over ~1000 m — and the inner pitch loop then
+    // saturated too, so the cascade bang-banged between full
+    // nose-up and full nose-down: a 100 deg porpoise (pitch -62 to
+    // +38 deg, vsi +75 to -70 m/s) that kept the AI 1000-2400 m
+    // above the player and the nose never on it. Halving the outer
+    // gain widens its proportional band to 2000 m, so the descent
+    // is gradual and the pitch stays unsaturated. RTB keeps 0.08 —
+    // the glide slope needs it — and patrol/bomb keep 0.03.)
     const slopeSink =
       this.state === 'rtb' && this.rtbPhase === 'final'
         ? ac.ias * Math.tan((3.5 * Math.PI) / 180)
         : 0;
     const vsDes = clamp((goal.y - ac.pos.y) * vsGain - slopeSink, -vsCap, vsCap);
     const pitchLim = Math.min(pitchCap, 0.6);
-    // Pitch gain 0.06 (was 0.03, pass 4): the 0.03 gain was tuned for
-    // the curve solver's prescribed pitch rate (pitchIn * 55 deg/s),
-    // where a -0.14 pitchIn gives -7.7 deg/s. Under BET the rate is
-    // emergent from the elevator moment, so the same pitchIn gives
-    // only ~1 deg/s and the jet cannot arrest a -13 m/s sink on the
-    // RTB glide slope (it hit the terrain short of the runway).
-    // Doubling the gain restores the pitch authority under BET; the
-    // 0.08 gain porpoised under the curve solver, but BET's slower
-    // emergent response damps the oscillation.
-    let pitchIn = clamp((ac.vsi - vsDes) * 0.06, -pitchLim, pitchLim);
+    // Pitch gain, speed-scheduled (pass 12, Worker E): a fixed 0.06
+    // saturates on any vs error over ~10 m/s, and at combat speeds
+    // (150-175 m/s) the BET elevator is powerful enough that the
+    // saturated pitch law bang-bangs between full nose-up and full
+    // nose-down — probe-ai-live CTRL trace: pitch swung -62 deg to
+    // +38 deg, vsi +75 to -70 m/s, a 100 deg porpoise that kept the
+    // AI 1000-2400 m above the player and the nose never on it.
+    // Pitch authority scales with dynamic pressure (~V^2), so the
+    // gain is ~1/V: 0.06 at RTB speeds (<= 70 m/s, unchanged —
+    // the RTB glide-slope fix above needs it) tapering to ~0.025
+    // at 170 m/s. The proportional band widens with speed, so the
+    // pitch command stays unsaturated through a normal descent.
+    const pitchGain = clamp(4.2 / Math.max(ac.ias, 1), 0.025, 0.06);
+    let pitchIn = clamp((ac.vsi - vsDes) * pitchGain, -pitchLim, pitchLim);
 
     // Rudder: centre the ball (sideslip beta) + adverse-yaw feedforward
     // when rolling. beta > 0 (velocity LEFT of the nose, +X) needs
@@ -467,8 +652,22 @@ export class AircraftAIController {
     const aoaLim =
       Math.abs(phiNow) > (30 * Math.PI) / 180 ? 10 : 12;
     if (ac.aoaDeg > aoaLim) pitchIn = Math.max(pitchIn, 0);
-    if (ac.aoaDeg < -10) pitchIn = Math.min(pitchIn, 0);
     if (ac.stalled) pitchIn = Math.max(pitchIn, 0.5);
+    // Negative-AoA recovery (pass 12, Worker E): at AoA < -10 deg
+    // the nose is below the velocity vector — a zoom climb after a
+    // dive or a hard pull-out — and the old veto (min(pitchIn, 0))
+    // only removed the nose-down demand, leaving pitchIn = 0: the
+    // jet froze at AoA -25..-40 deg, climbing at +40..+70 m/s,
+    // ~2000 m above the player, nose 90-120 deg off, for 15-30 s
+    // (probe-ai-live CTRL trace). The recovery pulls nose-up toward
+    // the velocity vector, PROPORTIONAL to the AoA error and tapering
+    // to zero at -10 deg: a fixed -0.4 drove the nose to -62 deg
+    // and looped the jet over into a -70 m/s dive. Symmetric to the
+    // stall recovery above (nose-down out of a positive stall);
+    // this pulls nose-up out of a negative one.
+    if (ac.aoaDeg < -10) {
+      pitchIn = Math.min(pitchIn, clamp((ac.aoaDeg + 10) * 0.03, -0.4, 0));
+    }
 
     // Throttle: speed management (Ace dives to regain energy — v2).
     const want = speedWant + (this.state === 'engage' && ac.ias < 90 ? 40 : 0);
@@ -568,8 +767,11 @@ export class AircraftAIController {
     // — never at a grounded, spawn-protected or dying player (v1.1 +
     // damage-model §6: a dying jet is untargetable). Sets the
     // fireGun / fireMissile flags; the caller performs the shot.
-    this.fireT -= dt;
-    if (this.state === 'engage' && player.alive && !player.dying && !player.grounded && player.spawnProt <= 0 && this.fireT <= 0) {
+    // The gun and missile cooldowns are independent (see fireGunT):
+    // a missile launch must not suppress the gun.
+    this.fireGunT -= dt;
+    this.fireMslT -= dt;
+    if (this.state === 'engage' && player.alive && !player.dying && !player.grounded && player.spawnProt <= 0) {
       const toP = this.tmpB.copy(player.pos).sub(ac.pos);
       const d = toP.length();
       const ang = ac.fwd().angleTo(toP.normalize()) * R2D;
@@ -582,16 +784,30 @@ export class AircraftAIController {
       // the AI orbits a slow target at 1.5-3 km and never closes to
       // the 2200 m envelope). A fast, manoeuvring target keeps the
       // tight cones and range.
+      // Pass 12 (Worker E): the gun cone is 30 deg for a fast target
+      // (was 20, was 12 before that) — see the note above. The
+      // missile cone stays 15 deg: the missile needs a real lock.
       const slowTarget = player.ias < 50;
-      const gunCone = slowTarget ? 20 : 12;
+      const gunCone = 30;
+      // (pass 12, Worker E: was 20, was 12 before that. The gun
+      // aim is nose-independent — aiGunShot fires a ray at the lead
+      // point with the skill error — so the cone is only the
+      // trigger decision, not the ballistics. But the nose is ~22
+      // deg off during the approach because BOTH jets are turning
+      // (the player turns 5.6 deg/s in its 45 deg bank, the AI
+      // 10 deg/s), so a 20 deg gate almost never opens at <900 m
+      // even though the AI is in the 15 deg missile cone at
+      // 1300-2000 m and fires 6-8 missiles a run. 30 deg is "nose
+      // roughly on target, pull the trigger"; the hit is still
+      // decided by the lead point + skill error.)
       const mslCone = slowTarget ? 30 : 15;
       const mslRange = slowTarget ? 3000 : 2200;
-      if (d < 900 && ang < gunCone) {
-        this.fireT = 1.2 / this.skill.burst;
+      if (d < 900 && ang < gunCone && this.fireGunT <= 0) {
+        this.fireGunT = 1.2 / this.skill.burst;
         this.fireGun = true;
       }
-      if (d < mslRange && ang < mslCone && ac.msl > 0 && this.rng() < 0.25) {
-        this.fireT = 3;
+      if (d < mslRange && ang < mslCone && ac.msl > 0 && this.fireMslT <= 0 && this.rng() < 0.25) {
+        this.fireMslT = 3;
         this.fireMissile = true;
       }
     }

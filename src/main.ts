@@ -57,27 +57,30 @@ import {
 } from './aircraft/CockpitBuilder';
 import {
   applyCameraFloor,
+  applyDeckCeiling,
+  deckChaseCameraPosition,
+  deckOrbitYaw,
   orbitCameraPosition,
+  orbitCameraPositionDeckAware,
 } from './camera/OrbitCamera';
 import { TerrainStreamer } from './world/TerrainStreamer';
 import { FloatingOrigin } from './world/FloatingOrigin';
 import { HELICARRIER_GLB } from './assets/models/helicarrier';
 import { PandoraWorldGenerator } from './world/PandoraWorldGenerator';
-import type { RunwayDef } from './world/PandoraWorldGenerator';
 import { RunwayPlacer } from './world/RunwayPlacer';
 import { RUNWAY_TABLE } from './world/PandoraTerrainWorker';
 import { HelicarrierController, CARRIER_START_POS, CARRIER_WAYPOINTS, carrierLoop } from './entities/HelicarrierController';
 import { WeaponSystem } from './combat/WeaponSystem';
 import { CrashVFXManager } from './combat/CrashVFXManager';
-import { FlightHUD } from './ui/FlightHUD';
+import { FlightHUD, MS2KT } from './ui/FlightHUD';
 import { SandboxMenu } from './ui/SandboxMenu';
 import type { SandboxConfig } from './ui/SandboxMenu';
 import { PCFlightInput } from './input/PCFlightInput';
-import { MobileFlightInput } from './input/MobileFlightInput';
+import { MobileFlightInput, touchStickScale, touchPitchScale, touchDeadzone } from './input/MobileFlightInput';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.6.1 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.7 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -1136,6 +1139,7 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   const choice: RespawnTargetId = target ?? lastRespawnChoice;
   lastSpawnLabel = choice;
   const shift = floatingOrigin.cumulativeShift;
+  let spawnedOnDeck = false;
   // Pass 8 (item 4): a deck respawn needs a LIVE carrier. The old
   // check was only `heliCountActive > 0` — after a CARRIER DOWN the
   // primary carrier is dead (its deck is gone: deckHeightAt returns
@@ -1165,6 +1169,7 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
     const dv = deckProvider.velocityAt(sx, sz);
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
     player.vel.copy(dv);
+    spawnedOnDeck = true;
   } else {
     // Runway respawn: the chosen runway (Alpha / Bravo / Charlie),
     // defaulting to Alpha. The runway table is in ORIGINAL-frame
@@ -1206,7 +1211,9 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   // jet fills the frame) state from the previous life must not
   // persist into the new one.
   camDist = 30;
-  camOrbit = { yaw: 0, pitch: 0.32 };
+  camOrbit = spawnedOnDeck
+    ? { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 }
+    : { yaw: 0, pitch: 0.32 };
   clearTransientUI();
 }
 
@@ -1376,7 +1383,6 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // Player spawn: Alpha runway, or the helicarrier deck. A deck spawn
   // with 0 carriers falls back to Alpha (the menu hides the option,
   // but a stale saved config could still ask for it).
-  const r0: RunwayDef = worldGen.runways[0]!;
   if (cfg.spawn === 'carrier' && heliCount > 0) {
     // Deck spawn: DECK_SPAWN_AFT_M aft of the deck centre (the full
     // deck ahead for the roll), facing the bow at the carrier's
@@ -1405,11 +1411,20 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
     player.vel.copy(dv);
     lastSpawnLabel = 'carrier';
+    camDist = 30;
+    camOrbit = { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 };
   } else {
-    // Runway spawn — gear feet on the box top (elev + 2.25, see
-    // respawnPlayer above for why not elev + 2).
-    player.resetAt(r0.x, r0.elev + 2.25, r0.z, r0.hdg);
-    lastSpawnLabel = 'alpha';
+    // Runway spawn — Alpha / Bravo / Charlie (pass 12, worker D).
+    // Gear feet on the box top (elev + 2.25, see respawnPlayer
+    // above for why not elev + 2). The runway table is in
+    // original-frame coords; startRound runs right after
+    // worldGen.resetOrigin(), so the shift is 0 and the table
+    // coords are scene coords here (the same reason the Alpha
+    // branch used r0 directly).
+    const idx = cfg.spawn === 'bravo' ? 1 : cfg.spawn === 'charlie' ? 2 : 0;
+    const r = RUNWAY_TABLE[idx]!;
+    player.resetAt(r.x, r.elev + 2.25, r.z, r.hdg);
+    lastSpawnLabel = cfg.spawn;
   }
   // Pass 8 (item 1): a new round starts with neutral controls (see
   // resetFlightInputs — a stuck yoke / deflected joystick / tilt
@@ -1539,7 +1554,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
       ' · ' +
       (cfg.enemies === 0 ? 'no enemies' : cfg.enemies + ' enemies') +
       ' · ' +
-      (cfg.spawn === 'carrier' ? 'deck spawn' : 'Alpha') +
+      (cfg.spawn === 'carrier' ? 'deck spawn' : cfg.spawn === 'bravo' ? 'Bravo' : cfg.spawn === 'charlie' ? 'Charlie' : 'Alpha') +
       ' · ' +
       weatherLabel(cfg) +
       ' weather',
@@ -1670,7 +1685,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.6.1 · Vite + Rapier).
+// Footer version string (v4.7 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1737,10 +1752,12 @@ function updateCamera(dt: number): void {
   // after impact) the velocity is ~0, so fall back to the body fwd.
   if (spectating) {
     if (camMode === 2) {
-      const orbitPos = applyCameraFloor(
-        orbitCameraPosition(p.pos, camOrbit, camDist),
+      const orbitPos = orbitCameraPositionDeckAware(
         p.pos,
+        camOrbit,
+        camDist,
         heightfieldGroundHeight,
+        p.onDeck ? carrier.deckTopY : null,
       );
       camera.position.copy(orbitPos);
       camera.lookAt(p.pos.clone());
@@ -1774,10 +1791,11 @@ function updateCamera(dt: number): void {
     return;
   }
   if (camMode === 0) {
-    const want = p.pos
-      .clone()
-      .addScaledVector(fwd, -camDist)
-      .addScaledVector(up, camDist * 0.34);
+    // Pass 12 (carrier deck camera): on a deck, cap the chase under
+    // the detail_0 overhead sheet (deckTop + 4.7 m) so the jet stays
+    // visible. Off a deck deckTopY is null and the plain chase is returned.
+    const deckTopY = p.onDeck ? carrier.deckTopY : null;
+    const want = deckChaseCameraPosition(p.pos, fwd, up, camDist, deckTopY);
     // v1.1: keep the sightline clear — clear not just the ground under the
     // camera but the terrain between it and the jet. Sampled mesh height:
     // the analytic heightAt() can sit ~13 m below the rendered surface
@@ -1789,6 +1807,7 @@ function updateCamera(dt: number): void {
       p.pos.y + 2,
     );
     if (want.y < floor) want.y = floor;
+    if (deckTopY !== null) applyDeckCeiling(want, deckTopY);
     camera.position.lerp(want, 1 - Math.pow(0.001, dt));
     if (shakeT > 0) {
       camera.position.x += (Math.random() - 0.5) * shakeT * 4;
@@ -1816,12 +1835,18 @@ function updateCamera(dt: number): void {
       .addScaledVector(up, eye.y);
     camera.quaternion.copy(cockpitCameraQuaternion(p.quat));
   } else {
-    const cx =
-      p.pos.x + Math.sin(camOrbit.yaw) * Math.cos(camOrbit.pitch) * camDist;
-    const cz =
-      p.pos.z + Math.cos(camOrbit.yaw) * Math.cos(camOrbit.pitch) * camDist;
-    const cy = p.pos.y + Math.sin(camOrbit.pitch) * camDist;
-    camera.position.set(cx, Math.max(cy, heightfieldGroundHeight(cx, cz) + 3), cz);
+    // Pass 12: the live inline orbit clamped only at the camera's own
+    // (x, z) and had no deck awareness. Orbit the JET (never the
+    // carrier), with the pass-8 floor (camera + midpoint + target + 2 m)
+    // and the deck ceiling.
+    const orbitPos = orbitCameraPositionDeckAware(
+      p.pos,
+      camOrbit,
+      camDist,
+      heightfieldGroundHeight,
+      p.onDeck ? carrier.deckTopY : null,
+    );
+    camera.position.copy(orbitPos);
     camera.lookAt(p.pos);
   }
 }
@@ -1937,14 +1962,18 @@ function playerInput(dt: number): void {
     px = pcPitch;
     rx = pcRoll;
   } else {
-    // Touch stick, sim-style: pull BACK (drag down, joy.y > 0) = nose
-    // up (px < 0); stick right (joy.x > 0) = bank right (rx > 0 —
-    // the physics maps rollIn > 0 to a right bank). Pass 11: this
-    // was rx = -joy.x, which rolled the jet LEFT when the stick
-    // went right. This matches the help text ("pull the stick
-    // back") and the keyboard (ArrowUp = nose up).
-    px = -joy.y;
-    rx = joy.x;
+    // Touch stick, direct (pass 12, worker D): drag UP (joy.y < 0)
+    // = nose up (px < 0), so the touch stick agrees with the
+    // keyboard (ArrowUp = nose up) and the mouse yoke (drag up =
+    // nose up). The old sim-style px = -joy.y (drag down = nose up)
+    // read as backwards live — the pilot dragged up expecting a
+    // climb and got a dive, then dragged down and looped. Both axes
+    // run through the deadzone and the speed scales (roll linear,
+    // pitch squared — probe-roll section E), so a full drag at
+    // 586 kt no longer yanks the jet to ~10 G in half a second.
+    const iasKt = p.ias * MS2KT;
+    px = touchDeadzone(joy.y) * touchPitchScale(iasKt);
+    rx = touchDeadzone(joy.x) * touchStickScale(iasKt);
   }
   px += tilt.pitch ?? 0;
   rx += tilt.roll ?? 0;
@@ -2233,7 +2262,6 @@ function animate(): void {
     renderer.render(scene, camera);
     return;
   }
-  const prevElapsed = elapsed;
   elapsed += rawDt;
   // Pass 8 (item 1): the floating-origin shift fires at the START of
   // the frame, not the end. At the end of the frame player.pos is
@@ -2432,47 +2460,7 @@ function animate(): void {
     );
     if (spawnTrace.length > 180) spawnTrace.shift();
   }
-  // Survival score: +1 per second alive AND AIRBORNE (research §6 — the
-  // old version paid +1/s while the jet sat stuck on the runway).
-  // Gated on AGL > 10 m (live finding 7), not !grounded: grounded
-  // flickers false while the jet rolls on the ground, so the score
-  // ticked ~1/s at 6 kt rolling after a respawn. AGL is the exact
-  // heightfield surface, so it cannot flicker.
-  // Pass 5 (item 9): the AGL gate alone was not enough — a jet
-  // PARKED ON THE DECK sits at y=350 over terrain at ~43 m, so its
-  // "AGL" is ~307 m and the score ticked ~1/s while parked on the
-  // deck at 0% throttle (and a hovering jet, airborne at ~0 kt,
-  // ticked too). The score is a flight/survival counter: it now
-  // requires the jet to be actually flying — airborne (not grounded,
-  // not on a deck), above 10 m, AND moving (> 20 m/s). Parked and
-  // hovering no longer tick.
-  // Pass 8 (item 6): the speed gate uses the DECK-RELATIVE speed
-  // when the jet is on or just above a deck. A jet riding the deck
-  // reads the carrier's ~40 m/s as absolute velocity, so it ticked
-  // whenever grounded/onDeck flickered false (the deck-gate drop).
-  // The deck-relative speed is ~0 for a parked jet and only a
-  // genuinely flying jet reads > 20 m/s. The hysteresis fix (item 4)
-  // stops the flicker; this is the belt-and-braces half.
-  const deckYForScore = player
-    ? deckProvider.deckHeightAt(player.pos.x, player.pos.z)
-    : -Infinity;
-  const speedForScore =
-    player && deckYForScore > -Infinity && player.pos.y - deckYForScore < 5
-      ? player.vel
-          .clone()
-          .sub(deckProvider.velocityAt(player.pos.x, player.pos.z))
-          .length()
-      : (player?.vel.length() ?? 0);
-  if (
-    player?.alive &&
-    !player.grounded &&
-    !player.onDeck &&
-    player.pos.y - heightfieldGroundHeight(player.pos.x, player.pos.z) > 10 &&
-    speedForScore > 20 &&
-    Math.floor(elapsed) !== Math.floor(prevElapsed)
-  ) {
-    score += 1;
-  }
+  // Score is kills / traps / VTOL landings only (pass 12, worker D): the survival +1/s tick was removed — it paid the pilot for merely flying (the v4.6.1 live check's 0→439 with 0 kills).
   if (shakeT > 0) shakeT = Math.max(0, shakeT - rawDt);
   updateCamera(rawDt);
   hudT += rawDt;
@@ -2488,6 +2476,17 @@ function animate(): void {
       );
       if (ccip) hud.showCcip(ccip.x, ccip.y, ccip.belowMinAlt);
       else hud.hideCcip();
+      // Carrier bearing/distance (pass 12, worker F): the v4.6.1 live
+      // check's "carrier cannot be found" was a HUD gap — the player
+      // had no bearing or distance to fly back on. Formula verified
+      // in probe-deck-roll §F (rel 0.00°/85.0 m at deck spawn,
+      // rel 180.00°/3000.0 m at 3 km east heading east).
+      const cdx = carrier.pos.x - player.pos.x;
+      const cdz = carrier.pos.z - player.pos.z;
+      const carrierAbsDeg = ((Math.atan2(cdx, cdz) * 180) / Math.PI + 360) % 360;
+      const playerHdgDeg = ((Math.atan2(player.fwd().x, player.fwd().z) * 180) / Math.PI + 360) % 360;
+      const carrierRelDeg = ((carrierAbsDeg - playerHdgDeg + 540) % 360) - 180;
+      const carrierHdgDeg = ((carrier.yaw * 180) / Math.PI + 360) % 360;
       hud.update(player, {
         score,
         kills,
@@ -2495,6 +2494,7 @@ function animate(): void {
         elapsed,
         lockTarget: player.lockTarget,
         belowMinReleaseAlt: ccip?.belowMinAlt ?? false,
+        carrier: { absDeg: carrierAbsDeg, relDeg: carrierRelDeg, distM: Math.hypot(cdx, cdz), carrierHdgDeg, deckRelHdgDeg: player.onDeck ? ((playerHdgDeg - carrierHdgDeg + 540) % 360) - 180 : null },
       });
       // The automatic gear (pass 10, item 3) can move the gear without
       // a button press — keep the button's state in step with it.

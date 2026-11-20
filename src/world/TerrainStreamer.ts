@@ -117,9 +117,14 @@ export const STREAM_CHUNK_SEGMENTS = 50;
 /** Samples per chunk side (segments + 1, edges shared with neighbours). */
 export const STREAM_CHUNK_RESOLUTION = STREAM_CHUNK_SEGMENTS + 1;
 /** Chebyshev radius (chunks) of the loaded window around the player's
- *  chunk: 5x5 = 25 chunks = 15x15 km of terrain, edge ~7.5 km away
- *  (~66% fogged at the clear-weather fog far of 11 km). */
-export const STREAM_RADIUS = 2;
+ *  chunk: 7x7 = 49 chunks = 21x21 km of terrain, edge ~10.5 km away
+ *  (inside the clear-weather fog far of 11 km). Pass 12 (worker F):
+ *  at radius 2, 41% of the ground disc within 11 km of the carrier
+ *  had NO mesh — beyond the central block + streamer window the frame
+ *  showed flat background colour below the horizon. Radius 3 closes
+ *  the band; cost is ~2x chunk count/tris on a simple Lambert
+ *  material. */
+export const STREAM_RADIUS = 3;
 /** Max chunks given mesh + collider per update() call (the player's own
  *  chunk is always created synchronously on top of this). At 200 m/s a
  *  chunk takes 15 s to cross, so the window fills far ahead of the jet. */

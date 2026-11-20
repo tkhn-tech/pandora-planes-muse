@@ -15,6 +15,45 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
+/** On-screen joystick (touch stick, wired in main.ts) authority scale
+ *  vs indicated airspeed, pass 12 worker D. At low speed the stick is
+ *  1:1; at high speed its authority falls as 150/ias (floored at
+ *  0.30), so a full drag at 586 kt no longer commands the ±10 G /
+ *  instant-loop response the v4.6.1 live check saw — the stick's
+ *  FEEL stays roughly constant across the speed range instead of
+ *  getting twitchier as q rises. main.ts applies this in the touch
+ *  branch of the playerInput merge (patch spec — MobileFlightInput
+ *  only owns tilt; the touch stick itself lives in main.ts). */
+export function touchStickScale(iasKt: number): number {
+  if (!Number.isFinite(iasKt) || iasKt <= 150) return 1;
+  return Math.max(0.3, Math.min(1, 150 / iasKt));
+}
+
+/** Pitch-only touch-stick scale. Pitch needs a STRONGER curve than
+ *  roll: probe-roll section E measured that the linear 150/ias scale
+ *  (0.30 at 586 kt) only moved a full drag-up's G@0.5 s from 9.9 G
+ *  to 8.5 G — a pull-up's G builds with v * pitch-rate, and at
+ *  586 kt even a 0.3-stick pull reaches high G in half a second,
+ *  because the AoA the jet integrates makes huge lift at that q.
+ *  The squared curve (0.27 at 287 kt, 0.12 at 450+ kt) keeps a
+ *  0.5 s full drag under ~5 G at any speed while a 2 s drag still
+ *  loops the jet — it tames the gain, it does not neuter the axis.
+ *  The keyboard keeps full pitch authority (ArrowUp = full rate)
+ *  for when the pilot wants it. */
+export function touchPitchScale(iasKt: number): number {
+  if (!Number.isFinite(iasKt) || iasKt <= 150) return 1;
+  return Math.max(0.12, Math.min(1, (150 / iasKt) ** 2));
+}
+
+/** On-screen joystick deadzone (stick units): a resting finger or a
+ *  5% offset must not roll/pitch the jet. Rescaled so full deflection
+ *  is still full deflection. */
+export function touchDeadzone(v: number): number {
+  const DZ = 0.06;
+  if (Math.abs(v) < DZ) return 0;
+  return (v - Math.sign(v) * DZ) / (1 - DZ);
+}
+
 export class MobileFlightInput implements IFlightInputProvider {
   private enabled = false;
   private have = false;

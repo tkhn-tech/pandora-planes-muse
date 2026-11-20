@@ -59,13 +59,26 @@ const DEFAULT_SHAPING: StickShaping = {
 
 /** Keyboard stick slew, units/s — the arrow-key stick ramps to its
  *  target instead of jumping, so it moves like a real stick. */
-/** Keyboard stick slew rate (per second): how fast the virtual stick
- *  moves toward the held key's target. 5/s (was 3/s): at 3/s a 0.1 s
- *  tap only reached 0.3 of full pull and the live F-18 did not
- *  rotate from a tap at 142 kt; 5/s gives a meaningful pull from a
- *  short hold while a tap still does not rotate the jet by itself
- *  (rotation needs a SUSTAINED pull — the ROTATE cue says so). */
-const STICK_SLEW = 5;
+/** Keyboard ROLL slew rates (per second), pass 12 worker D. The old
+ *  single 5/s rate is why the v4.6.1 live check saw NO roll from
+ *  taps: a 100 ms Right-Arrow tap only slewed kbRoll to 0.50 and
+ *  decayed in 0.1 s, so the roll impulse was ~0.05 s of full
+ *  deflection — about 2 deg of bank, which the airborne auto-level
+ *  erased before the pilot could see it (probe-roll section D:
+ *  peak bank 1.9 deg, bank@+0.5 s -0.5 deg), while ArrowUp/Down DID
+ *  pitch because pitch has no auto-level spring to erase it.
+ *  Roll now rises FAST (12/s: a 100 ms tap reaches full deflection,
+ *  like a real stick snapping over) and returns SLOW (2.5/s: the
+ *  deflection lingers ~0.4 s after release, so the impulse is
+ *  ~0.25 s of full deflection and the bank is ~10-15 deg and still
+ *  visible 0.5 s later). Pitch keeps its own slower 3/s slew (a
+ *  fast pitch slew over-rotates — live finding 8) and is symmetric:
+ *  only roll gets the slow return, because only roll is erased by
+ *  the auto-level. A 1 s hold still banks ~54 deg (F-18, 287 kt),
+ *  unchanged from before — the fix is in the tap response, not the
+ *  hold authority. */
+const ROLL_SLEW_UP = 12;
+const ROLL_SLEW_DOWN = 2.5;
 /** Keyboard PITCH slew rate (per second) — slower than roll (live
  *  finding 8): one ArrowUp tap at 5/s swung the vertical speed by
  *  5,000-13,000 fpm and the pitch persisted (enough to loop/stall),
@@ -219,9 +232,11 @@ export class PCFlightInput implements IFlightInputProvider {
       rx = clamp(this.yoke.dx / 60, -1, 1); // pass 11: was -dx (inverted roll)
     }
     // Keyboard stick: arrow keys (+ A/D roll) give a -1..1 target; the
-    // stick slews toward it at STICK_SLEW/s, then inversion + the
-    // sensitivity exponent shape it. This is the keyboard-only path —
-    // the mouse yoke and gamepad above are analogue and unshaped.
+    // stick slews toward it (pitch at PITCH_SLEW/s, roll at
+    // ROLL_SLEW_UP/s rising and ROLL_SLEW_DOWN/s returning), then
+    // inversion + the sensitivity exponent shape it. This is the
+    // keyboard-only path — the mouse yoke and gamepad above are
+    // analogue and unshaped.
     const kbPitchTarget =
       (held('ArrowDown') ? 1 : 0) - (held('ArrowUp') ? 1 : 0);
     // Pass 11 (item 7): the roll was INVERTED on every player input
@@ -247,8 +262,14 @@ export class PCFlightInput implements IFlightInputProvider {
       if (cur > target) return Math.max(target, cur - step);
       return cur;
     };
+    // Roll slews asymmetrically (pass 12): fast toward the held key,
+    // slow back to centre — see ROLL_SLEW_UP / ROLL_SLEW_DOWN.
+    const slewRoll = (cur: number, target: number): number => {
+      const rising = Math.abs(target) > Math.abs(cur);
+      return slew(cur, target, rising ? ROLL_SLEW_UP : ROLL_SLEW_DOWN);
+    };
     this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1), PITCH_SLEW);
-    this.kbRoll = slew(this.kbRoll, clamp(kbRollTarget, -1, 1), STICK_SLEW);
+    this.kbRoll = slewRoll(this.kbRoll, clamp(kbRollTarget, -1, 1));
     const shape = (v: number, gamma: number, invert: boolean): number => {
       const s = invert ? -v : v;
       return Math.sign(s) * Math.pow(Math.abs(s), gamma);

@@ -21,6 +21,22 @@ import {
 
 const WIND = new THREE.Vector3(3, 0, 0);
 let failures = 0;
+
+// Deterministic Math.random (pass 12, coordinator): the AI controller
+// and WeaponSystem use Math.random() directly (bomb-entry rolls, evade
+// choices, gun error, flare/ignition rolls), so two runs of the same
+// code diverged wildly — the enemy survived 90 s, died at t=8.0 s, or
+// died at t=39.0 s — from unseeded randomness alone. probe-ai-live
+// already seeds for exactly this reason ("a probe must be
+// reproducible"). Seed it from a SEPARATE LCG so the terrain seed
+// above is untouched. This is probe scaffolding only — the live game
+// keeps the real Math.random.
+const rngMathState = { s: 987654321 };
+Math.random = (): number => {
+  rngMathState.s = (rngMathState.s * 1103515245 + 12345) & 0x7fffffff;
+  return rngMathState.s / 0x7fffffff;
+};
+
 function check(name: string, ok: boolean, detail = ''): void {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
   if (!ok) failures++;

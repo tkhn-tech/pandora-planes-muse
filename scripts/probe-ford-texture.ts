@@ -321,6 +321,226 @@ async function main(): Promise<void> {
     halves.map((h) => `dV'(fwd-aft)=${h.dvFwd.toFixed(2)} dU'(port-stbd)=${h.duPort.toFixed(2)}`).join('; '),
   );
 
+  // --- Pass 12 (Ford deck markings — live v4.6.1 FAIL, third time):
+  // the deck_top plates are BURIED under other geometry, so from
+  // above — the only angle a player ever sees the deck — the ray
+  // hits flat grey, not FordDeck. Measured from the baked GLB
+  // (2026-11-20, raster over the raw triangles, 1 m cells):
+  //  * detail_0: a 50-tri slab, top Y≈35.4 (5.6 m above the deck),
+  //    first hit on 64% of the stern deck footprint from above;
+  //  * detail_7: a 72-tri slab, top Y≈30.25 (0.55 m above the deck),
+  //    36 m wide, running the full length of the ship;
+  //  * hull_35's top face at Y=29.78 sits at/above deck_top_35
+  //    (29.70–29.78); hull_49's top at 29.69 is exactly coplanar
+  //    with deck_top_49 (29.69). Both deck plates are 100% wound
+  //    face-DOWN (0% of their XZ area faces up), so without
+  //    DoubleSide they are invisible from above — and with it they
+  //    are still buried. The pass-11 fix (DoubleSide + map rotation)
+  //    addressed only the winding, never the burial.
+  //  * FordDeck baseColorFactor is 0.169: even where the plate IS
+  //    visible the texture is multiplied ~6x darker (white markings
+  //    230 → 39, deck grey 100 → 17 — near-black, no contrast).
+  // This section raycasts straight down onto the deck footprint
+  // through the real controller build — the live top-down view —
+  // and asserts the material/geometry state that decides the
+  // visible colour (texture × material colour, first hit wins).
+  let fordDeckMat: THREE.MeshStandardMaterial | null = null;
+  let detail0Visible: boolean | null = null;
+  let detail7Visible: boolean | null = null;
+  const deckMinY: number[] = [];
+  let markingPlanes = 0;
+  let markingPlaneYOk = true;
+  const markingPlaneMats: THREE.MeshStandardMaterial[] = [];
+  carrier.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    if (mesh.name === 'detail_0') detail0Visible = mesh.visible;
+    if (mesh.name === 'detail_7') detail7Visible = mesh.visible;
+    if (mesh.name === 'deck_markings') {
+      markingPlanes++;
+      if (Math.abs(mesh.position.y - (carrier.deckLocalY + 0.2)) > 0.01) markingPlaneYOk = false;
+      markingPlaneMats.push(mesh.material as THREE.MeshStandardMaterial);
+    }
+    if (!mesh.name.startsWith('deck_top')) return;
+    const mat = mesh.material as THREE.MeshStandardMaterial;
+    if (!fordDeckMat) fordDeckMat = mat;
+    const g = mesh.geometry;
+    if (!g.boundingBox) g.computeBoundingBox();
+    if (g.boundingBox) deckMinY.push(g.boundingBox.min.y);
+  });
+  check(
+    'pass 12: detail_0/detail_7 occluder slabs are hidden (not rendered above the deck)',
+    detail0Visible === false && detail7Visible === false,
+    `detail_0 visible=${detail0Visible} detail_7 visible=${detail7Visible}`,
+  );
+  check(
+    'pass 12: deck plates sit above the hull top (29.78) — not buried/coplanar under it',
+    deckMinY.length === 2 && deckMinY.every((y) => y > 29.78),
+    `deck plate min-Y (model space): ${deckMinY.map((y) => y.toFixed(2)).join(', ')} vs hull top 29.78`,
+  );
+  check(
+    'pass 12: FordDeck material colour is white — the texture is not multiplied ~6x darker',
+    !!fordDeckMat &&
+      fordDeckMat.color.r > 0.95 &&
+      fordDeckMat.color.g > 0.95 &&
+      fordDeckMat.color.b > 0.95,
+    fordDeckMat
+      ? `color=(${fordDeckMat.color.r.toFixed(3)}, ${fordDeckMat.color.g.toFixed(3)}, ${fordDeckMat.color.b.toFixed(3)}) (was 0.169/0.165/0.165)`
+      : 'no FordDeck material found',
+  );
+  check(
+    'pass 12: FordDeck uses polygonOffset so the coplanar hull top cannot win the depth test at range',
+    !!fordDeckMat &&
+      fordDeckMat.polygonOffset === true &&
+      fordDeckMat.polygonOffsetFactor <= -1,
+    fordDeckMat
+      ? `polygonOffset=${fordDeckMat.polygonOffset} factor=${fordDeckMat.polygonOffsetFactor} units=${fordDeckMat.polygonOffsetUnits}`
+      : 'no FordDeck material found',
+  );
+  // The GLB's deck surface is incomplete even with the slabs hidden:
+  // the deck_top plates cover only 52% of the deck footprint (XZ
+  // 6047 + 2622 m² of 16608 m²) and 21% of the footprint is a
+  // through-hole with no surface at all — hiding the slabs alone
+  // trades a grey deck for a deck with holes. The controller
+  // therefore lays one flat textured plane per deck rectangle at
+  // deckLocalY + 0.20, UV-mapped in the plates' own convention
+  // (u along deck length, v across width — measured corr +1.000
+  // both), sharing the Ford texture, so the markings cover the
+  // whole deck including the holes and the hull-grey patches.
+  check(
+    'pass 12: one deck_markings plane per deck rectangle, at deckLocalY + 0.20 (above the plates, below the pads)',
+    markingPlanes === carrier.deckRects.length && markingPlaneYOk,
+    `planes=${markingPlanes} rects=${carrier.deckRects.length} yOk=${markingPlaneYOk}`,
+  );
+  check(
+    'pass 12: deck_markings planes share the Ford texture with a stronger polygonOffset (they win depth over the plates)',
+    markingPlaneMats.length === carrier.deckRects.length &&
+      markingPlaneMats.every(
+        (m) => !!fordDeckMat && m.map === fordDeckMat.map && m.polygonOffsetFactor <= -4,
+      ),
+    markingPlaneMats.length
+      ? markingPlaneMats.map((m) => `mapShared=${!!fordDeckMat && m.map === fordDeckMat.map} factor=${m.polygonOffsetFactor}`).join('; ')
+      : 'no deck_markings planes found',
+  );
+  carrier.group.updateMatrixWorld(true);
+  const ray = new THREE.Raycaster();
+  const downDir = new THREE.Vector3(0, -1, 0);
+  const counts = { deck: 0, slab: 0, hull: 0, superstructure: 0, furniture: 0, none: 0 };
+  let deckHits = 0;
+  let uMin = Infinity;
+  let uMax = -Infinity;
+  let vMin = Infinity;
+  let vMax = -Infinity;
+  let total = 0;
+  for (const r of carrier.deckRects) {
+    for (let lx = r.cx - r.hx + 4; lx <= r.cx + r.hx - 4; lx += 8) {
+      for (let lz = r.cz - r.hz + 4; lz <= r.cz + r.hz - 4; lz += 8) {
+        total++;
+        const origin = carrier.group.localToWorld(
+          new THREE.Vector3(lx, carrier.deckLocalY + 80, lz),
+        );
+        ray.set(origin, downDir);
+        // THREE r160's Raycaster does NOT skip invisible objects
+        // (Raycaster.js has no `visible` test) but the renderer does,
+        // so the first RENDERED hit is the first hit whose object and
+        // every ancestor is visible — hidden slabs must not count.
+        const hits = ray.intersectObjects(carrier.group.children, true);
+        const hit = hits.find((h) => {
+          let o: THREE.Object3D | null = h.object;
+          while (o) {
+            if (!o.visible) return false;
+            o = o.parent;
+          }
+          return true;
+        });
+        if (!hit) {
+          counts.none++;
+          continue;
+        }
+        const n = (hit.object as THREE.Mesh).name ?? '';
+        if (n.startsWith('deck_top') || n === 'deck_markings') {
+          counts.deck++;
+          deckHits++;
+          const uv = (hit as THREE.Intersection & { uv?: THREE.Vector2 }).uv;
+          const mat = (hit.object as THREE.Mesh).material as THREE.MeshStandardMaterial;
+          if (uv && mat.map) {
+            mat.map.updateMatrix();
+            const t = new THREE.Vector2(uv.x, uv.y).applyMatrix3(mat.map.matrix);
+            uMin = Math.min(uMin, t.x);
+            uMax = Math.max(uMax, t.x);
+            vMin = Math.min(vMin, t.y);
+            vMax = Math.max(vMax, t.y);
+          }
+        } else if (n === 'detail_0' || n === 'detail_7') counts.slab++;
+        else if (n.startsWith('hull')) counts.hull++;
+        else if (n === '') counts.furniture++;
+        else counts.superstructure++;
+      }
+    }
+  }
+  const deckFrac = total ? counts.deck / total : 0;
+  check(
+    'pass 12 top-down: deck_top (Ford markings) is the first hit on a majority of deck samples',
+    deckFrac > 0.6,
+    `deck ${counts.deck}/${total} (${(deckFrac * 100).toFixed(1)}%) slab=${counts.slab} hull=${counts.hull} superstructure=${counts.superstructure} furniture=${counts.furniture} none=${counts.none}`,
+  );
+  check(
+    'pass 12 top-down: no ray hits the detail_0/detail_7 slabs above the deck',
+    counts.slab === 0,
+    `slab hits=${counts.slab}/${total}`,
+  );
+  check(
+    'pass 12 top-down: no ray hits the bare hull top over the deck',
+    counts.hull === 0,
+    `hull hits=${counts.hull}/${total}`,
+  );
+  check(
+    'pass 12 top-down: deck UVs span the texture (markings sampled across the deck, not one flat texel)',
+    deckHits >= 50 && uMax - uMin > 0.5 && vMax - vMin > 0.5,
+    `deck hits=${deckHits} u' [${uMin.toFixed(2)}, ${uMax.toFixed(2)}] v' [${vMin.toFixed(2)}, ${vMax.toFixed(2)}]`,
+  );
+
+  // --- Pass 12 (carrier pod readout): pod 3 read 0 mid-round in the
+  // v4.6.1 live check, back to 100/100/100/100 later. The ONLY path
+  // that lowers hp is damagePod <- onCarrierPodHit <- gun/bomb hits
+  // (WeaponSystem checkPodHits: every gun round whose ray passes
+  // within 12 m of a pod centre inside GUN_RANGE 1200 m deals
+  // GUN_DAMAGE 12; a bomb blast within 45 m deals 40). 9 gun hits
+  // kill a pod (100/12), and at 800 rpm (0.075 s cooldown) that is
+  // 0.68 s of fire — the carrier sits 900 m dead ahead at round
+  // start, inside gun range, so any test burst toward it kills a
+  // pod; reset() on round restart restores 100, matching the live
+  // observation exactly. This section proves the readout is
+  // faithful: hp is rock-stable with no damage input, damagePod
+  // moves it exactly as designed, and reset() restores it.
+  let podStable = true;
+  let podMin = 100;
+  for (let s = 0; s < 180; s += 1) {
+    for (let k = 0; k < 20; k++) carrier.update(0.05); // 1 s per step, 180 s total
+    const hps = carrier.pods.map((p) => p.hp);
+    podMin = Math.min(podMin, ...hps);
+    if (hps.some((h) => h !== 100)) podStable = false;
+  }
+  check(
+    'pass 12 pods: hp stays 100 with no damage input over 180 s of update()',
+    podStable && podMin === 100,
+    `min hp seen=${podMin} over 180 s`,
+  );
+  for (let i = 0; i < 9; i++) carrier.damagePod(2, 12);
+  const afterDmg = carrier.pods[2]!;
+  check(
+    'pass 12 pods: 9x GUN_DAMAGE (12) kills pod 2 (hp 100 -> 0, alive false)',
+    afterDmg.hp === 0 && afterDmg.alive === false,
+    `pod 2 hp=${afterDmg.hp} alive=${afterDmg.alive} (9 hits x 12 dmg = 108 >= 100)`,
+  );
+  carrier.reset();
+  const afterReset = carrier.pods;
+  check(
+    'pass 12 pods: reset() restores all pods to 100/alive (the live "back to 100/100/100/100")',
+    afterReset.length === 4 && afterReset.every((p) => p.hp === 100 && p.alive === true),
+    `pods=[${afterReset.map((p) => p.hp).join('/')}]`,
+  );
+
   console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }

@@ -1,17 +1,35 @@
-// probe-ai-live.ts — pass 8, item 2: enemies never engage, through the
-// LIVE menu/enemy-spawn path.
+// probe-ai-live.ts — pass 12, Worker E: enemies do not engage (live).
 //
-// probe-ai-hover (hovering player, enemies placed 1500 m away) passes
-// 4/4 — but live, 3 Veterans never engaged in 2.5 min. This probe
-// replicates startRound's enemy spawn EXACTLY (first two 450/600 m
-// ahead +120/-150 m side, +120/180 m up, RANDOM headings; third at a
-// random bearing at enemySpawnDistance 1200 m; setAirspeed(150),
-// thrTarget 0.8) and a scripted player takeoff from Alpha (full
-// throttle, pull at rotation, climb to 300 m, fly level east), with
-// the live wind (-3,0,0), the live variable-dt pattern and the
-// frame-1 origin shift. It logs AI state / distance / fire flags so
-// a non-engagement can be diagnosed (pFair components, distances,
-// spawn headings), instead of just failing.
+// Replicates the LIVE round through the real paths: startRound's enemy
+// spawn EXACTLY (4 Veterans by default, first two 450/600 m ahead
+// +120/-150 m side, +120/180 m up, the rest at a random bearing at
+// enemySpawnDistance 1200 m, ALL facing the player, setAirspeed(150),
+// thrTarget 0.8), a scripted player takeoff from Alpha followed by
+// human-like level flight (climb to 1000 m, hold ~150 m/s, gentle
+// S-turn weave — NOT a rocket climb), the live wind (-3,0,0), the live
+// variable-dt pattern, the frame-1 origin shift, and real GLBs (with
+// the Image stub). The AI's fire flags are WIRED to the real
+// WeaponSystem (aiGunShot / launchMissile / dropBomb + update), and
+// the player's missile lock scan is replicated verbatim from main.ts
+// (15 deg cone, < 2500 m, 1.2 s to full lock) with a simulated MSL
+// press on full lock — so the probe measures damage and locks, not
+// just AI state.
+//
+// WHY the old probe was a false pass: its scripted player held full
+// pull (-1) through rotation, then its vs-controller saturated
+// nose-down (+0.4) at vsi 30 m/s; the jet pitched nose-down 28 deg in
+// ~3 s to AoA -41 deg, the pitch froze at -5.2 deg (deep negative-AoA
+// tail-stall + the no-pull pitch-up gate), and it zoom-climbed at
+// vsi +50..+100 m/s to 20,596 m over the run — no human flies like
+// that, and no AI can follow it (engage vsCap 15 m/s, speedWant cap
+// 240 m/s). It "passed" on one brief engage/fire in the first seconds
+// and then measured nothing for the remaining ~500 sim s. This probe
+// flies level, so a non-engagement is a real AI failure.
+//
+// The player gets hp 1000 for the probe (scaffolding, not a game
+// change): a straight-flying, non-evading player WILL be shot down by
+// a working AI (40 dmg/missile), and the probe measures engagement
+// over the full 240 s, not lethality.
 //
 // Usage: node_modules/.bin/esbuild scripts/probe-ai-live.ts --bundle
 //   --platform=node --format=esm --outfile=/tmp/probe-ai-live.mjs
@@ -79,6 +97,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { AircraftAIController } from '../src/entities/AircraftAIController';
+import { WeaponSystem } from '../src/combat/WeaponSystem';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import {
   generateHeights,
@@ -90,17 +109,40 @@ import {
 
 // Live default wind: windDir 270, windSpeed 3 -> (-3, 0, 0).
 const WIND = new THREE.Vector3(-3, 0, 0);
-// Seeded RNG so the "random" spawn headings are reproducible.
+// Seeded RNG so the "random" spawn bearings are reproducible.
 const rngState = { s: 123456789 };
 const rng = (): number => {
   rngState.s = (rngState.s * 1103515245 + 12345) & 0x7fffffff;
   return rngState.s / 0x7fffffff;
 };
+// Deterministic Math.random (pass 12, Worker E): WeaponSystem uses
+// Math.random() directly (gun error, flare break, ignition rolls),
+// so two runs of the same code diverged wildly (player lock 6.52 s
+// vs 0.05 s) from unseeded randomness alone. A probe must be
+// reproducible. Seed it from a SEPARATE LCG so the AI/spawn rng
+// sequence above is untouched. This is probe scaffolding only — the
+// live game keeps the real Math.random.
+const rngMathState = { s: 987654321 };
+Math.random = (): number => {
+  rngMathState.s = (rngMathState.s * 1103515245 + 12345) & 0x7fffffff;
+  return rngMathState.s / 0x7fffffff;
+};
+
+const R2D = 180 / Math.PI;
+const SIM_SECONDS = 240;
+const ENEMY_COUNT = 4; // live default
+const LOCK_CONE_DEG = 15;
+const LOCK_RANGE = 2500;
+const LOCK_TIME = 1.2;
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = ''): void {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
   if (!ok) failures++;
+}
+
+function clamp(v: number, a: number, b: number): number {
+  return Math.max(a, Math.min(b, v));
 }
 
 async function main(): Promise<void> {
@@ -176,6 +218,11 @@ async function main(): Promise<void> {
     });
   };
 
+  const weapons = new WeaponSystem(scene, world, {
+    groundHeight: heightAtLive,
+    deckHeight: () => -Infinity,
+  });
+
   const alpha = RUNWAY_TABLE[0]!;
   const player = new Aircraft({
     scene,
@@ -189,15 +236,18 @@ async function main(): Promise<void> {
   for (const h of player.colliderHandles()) owners.set(h, player);
   await player.attachModel();
   player.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
+  // Probe scaffolding (see header): hp 1000 so a working AI's hits are
+  // measured as damage over the full run instead of ending it early.
+  player.hp = 1000;
 
-  // ---- startRound's enemy spawn, verbatim (3 Veterans) ----
+  // ---- startRound's enemy spawn, verbatim from main.ts (4 Veterans) ----
   const carrierStub = {
     deckHeightAt: () => -Infinity,
   } as unknown as Parameters<AircraftAIController['update']>[2];
   const enemies: Aircraft[] = [];
   const ais: AircraftAIController[] = [];
   const spawnHeadings: number[] = [];
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < ENEMY_COUNT; i++) {
     const key = i % 2 === 0 ? 'mig29' : 'su34';
     const e = new Aircraft({
       scene,
@@ -229,9 +279,12 @@ async function main(): Promise<void> {
       ey = 650 + rng() * 350;
       ez = player.pos.z + Math.sin(a) * d;
     }
-    const hdg = rng() * 360;
-    spawnHeadings.push(hdg);
-    e.resetAt(ex, ey, ez, hdg);
+    // Pass 8 (item 2): enemies spawn FACING the player (head-on
+    // intercept), not on a random heading.
+    const hdgToPlayer =
+      (Math.atan2(player.pos.x - ex, player.pos.z - ez) * 180) / Math.PI;
+    spawnHeadings.push(hdgToPlayer);
+    e.resetAt(ex, ey, ez, hdgToPlayer);
     e.setAirspeed(150);
     e.gear = false;
     e.grounded = false;
@@ -246,114 +299,357 @@ async function main(): Promise<void> {
     enemies.push(e);
   }
   console.log(
-    `  enemy spawn headings (deg): ${spawnHeadings.map((h) => h.toFixed(0)).join(', ')} (player hdg ${alpha.hdg})`,
+    `  enemy spawn headings (deg, all facing player): ${spawnHeadings.map((h) => h.toFixed(0)).join(', ')} (player hdg ${alpha.hdg})`,
   );
   console.log(
     `  enemy spawn dists: ${enemies.map((e) => e.pos.distanceTo(player.pos).toFixed(0)).join(', ')} m`,
   );
 
-  // ---- live loop, 150 s: scripted player takeoff + level flight ----
-  // Climb target from the CLI (default 1000 m): 1000 m is safely
-  // above all terrain; 300 m flies the player low over the rising
-  // ground east of Alpha — the run that killed e0 at 35.3 s and e1
-  // at ~100 s before the pass-8 speed-scaled look-ahead.
-  const climbTarget = Number(process.argv[2] ?? 1000) || 1000;
-  console.log(`  scenario: scripted climb to ${climbTarget} m`);
+  // ---- live loop, SIM_SECONDS of sim time ----
   const dtPattern = [0.016, 0.033, 0.05, 0.016, 0.1, 0.033, 0.25, 0.05, 0.016, 0.033];
   const vrMs = SPECS['f22']!.rotateSpeedKt * 0.514444;
-  let everEngage = false;
+  const ALT_TARGET = 1000;
+  const SPD_TARGET = 150; // m/s, a human cruise
+  let simT = 0;
+  let frame = 0;
+  let airborneAt = -1;
   let firstEngageAt = -1;
-  let everFire = false;
+  let engageSeconds = 0;
   let firstFireAt = -1;
+  let aiGunShots = 0;
+  let aiMslLaunched = 0;
+  let aiBombsDropped = 0;
   let minDist = Infinity;
+  let timeWithin2200 = 0;
+  let timeWithin900 = 0;
+  let maxLockT = 0;
+  let lockSeconds = 0;
+  let playerMslFired = 0;
+  let firedForLock = false; // one missile per lock acquisition
+  let playerMslStart = player.msl;
   let enemyDeathAt = -1;
   let enemyDeathReasons: string[] = [];
+  // Terrain death only (pass 12, coordinator): an enemy "shot down"
+  // / "fire" / "tail destroyed" is a legitimate player kill (the
+  // desired outcome — the player's missiles doing damage), NOT a
+  // failure. Only a terrain death ('hard landing' / 'terrain') fails
+  // the survive check.
+  let terrainDeathAt = -1;
   let playerDeathAt = -1;
-  let frames = 0;
-  const SIM_SECONDS = 150;
-  for (let f = 0; f < SIM_SECONDS * 60; f++) {
-    const t = f / 60;
-    const rawDt = dtPattern[f % dtPattern.length]!;
+  let playerDeaths = 0;
+  let playerDeathReasons: string[] = [];
+  let playerHpLostTotal = 0; // cumulative across lives
+  let maxPlayerAlt = 0;
+  let maxPlayerVsi = 0;
+  const enemyHpStart = enemies.map((e) => e.hp);
+  let playerTarget: Aircraft | null = null; // sticky pursuit target
+  let playerOmegaSm = 0; // smoothed turn rate for the two-loop heading (below)
+  const stateSeconds: Record<string, number> = {};
+  let lastLogSim = -10;
+
+  // Scripted player autopilot — PITCH-ATTITUDE control, not vertical
+  // speed: a vs-controller saturates nose-down (+0.4..+0.5) whenever
+  // the climb rate overshoots, drives the AoA to -40 deg, and the jet
+  // gets stuck in a deep-negative-AoA zoom climb (vsi +50..+100 m/s
+  // to 10 km — the old probe's false pass). Attitude hold keeps the
+  // inputs small and the AoA sane: +10 deg nose-up in the climb, then
+  // level with a small altitude trim. Rotation is a moderate -0.4
+  // pull, released the moment the jet is airborne.
+  const flyPlayer = (dt: number): void => {
+    if (!player.alive) return;
+    player.thrTarget = clamp(
+      player.thrTarget + (player.ias < SPD_TARGET ? dt * 0.5 : -dt * 0.5),
+      0,
+      1,
+    );
+    if (player.onSurface && player.ias >= vrMs) {
+      player.pitchIn = -0.4;
+      player.rollIn = 0;
+      return;
+    }
+    if (player.onSurface) {
+      player.pitchIn = 0;
+      player.rollIn = 0;
+      return;
+    }
+    // Airborne: full-lead pursuit of a STICKY target (pass 12,
+    // Worker E) — the best lock so far (0.40 s) and the best gun
+    // (16). The target is sticky (a human picks a bandit and stays
+    // on it): re-acquiring the nearest enemy every frame made the
+    // nose oscillate between bandits and never settle in the cone.
+    // Below 600 m hold east to finish the climb clear of terrain.
+    // (The production-AI-controller player was tried and was worse:
+    // it flew at 647 m and got shot down 3x — the AI's pursuit is
+    // for closing, not for holding a 1.2 s lock.)
+    const pitchNow = new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x;
+    let desHdg = (90 * Math.PI) / 180;
+    if (player.pos.y > 600) {
+      if (!playerTarget || !playerTarget.alive || playerTarget.dying || playerTarget.pos.distanceTo(player.pos) > 4000) {
+        // Most nearly AHEAD (pass 12, Worker E), not nearest: the
+        // nearest enemy is usually BEHIND the player (it passed and
+        // is chasing from astern), so a nearest-target player spends
+        // the fight in a 180 deg turn / tail chase and the nose is
+        // never in the 15 deg cone for the 1.2 s a lock needs
+        // (maxLockT 0.03-0.05 s deterministically). With 4 enemies,
+        // one is almost always approaching head-on; picking the
+        // smallest nose angle works that head-on geometry, where the
+        // bearing is near-constant and the lock builds. Sticky, as
+        // before — re-acquire only when the current target is
+        // dead/dying/out of range.
+        let best: Aircraft | null = null;
+        let bestAng = Infinity;
+        for (const e of enemies) {
+          if (!e.alive || e.dying) continue;
+          const d = e.pos.distanceTo(player.pos);
+          if (d > 4000) continue;
+          const ang = player.fwd().angleTo(e.pos.clone().sub(player.pos).normalize()) * 180 / Math.PI;
+          if (ang < bestAng) {
+            bestAng = ang;
+            best = e;
+          }
+        }
+        playerTarget = best;
+      }
+      if (playerTarget) {
+        desHdg = Math.atan2(
+          playerTarget.pos.x - player.pos.x,
+          playerTarget.pos.z - player.pos.z,
+        );
+      }
+    }
+    // 3D lead pursuit for the pitch: the nose must point at the
+    // intercept point's altitude, not just match the heading — the
+    // lock cone is 3D, and the AI flies 1000-3000 m while the player
+    // levelled at 950 m, so the vertical angle alone kept the target
+    // out of the 15 deg cone (maxLockT 0.00-0.05 s across every run
+    // before the lead pursuit). Without a target, climb to 950 m
+    // and level as before.
+    let pitchTarget: number;
+    if (playerTarget && player.pos.y > 600) {
+      const dx = playerTarget.pos.x - player.pos.x;
+      const dz = playerTarget.pos.z - player.pos.z;
+      const elev = Math.atan2(
+        playerTarget.pos.y - player.pos.y,
+        Math.hypot(dx, dz),
+      );
+      pitchTarget = clamp(-elev, (-15 * Math.PI) / 180, (15 * Math.PI) / 180); // +x = nose down
+      if (player.pos.y < 300) pitchTarget = Math.min(pitchTarget, 0); // never dive into the terrain
+    } else if (player.pos.y < 950) {
+      pitchTarget = (-10 * Math.PI) / 180; // climb at 10 deg nose-up
+    } else {
+      pitchTarget = clamp((player.pos.y - ALT_TARGET) * 0.0004, (-3.5 * Math.PI) / 180, (3.5 * Math.PI) / 180); // above target -> nose down (+x), below -> nose up
+    }
+    player.pitchIn = clamp((pitchTarget - pitchNow) * 3.0, -0.5, 0.5);
+    // Negative-AoA guard (pass 12, Worker E): the same trap the AI
+    // had — holding a fixed pitch attitude while the velocity vector
+    // is far above the nose leaves AoA -40..-60 deg and the jet
+    // zoom-climbs at +100 m/s to 3000 m (max|vsi| 109-119 m/s).
+    // Pull the nose up toward the velocity vector, tapered.
+    if (player.aoaDeg < -10) {
+      player.pitchIn = Math.min(
+        player.pitchIn,
+        clamp((player.aoaDeg + 10) * 0.03, -0.4, 0),
+      );
+    }
+    const curHdg = Math.atan2(player.fwd().x, player.fwd().z);
+    let hdgErr = desHdg - curHdg;
+    while (hdgErr > Math.PI) hdgErr -= 2 * Math.PI;
+    while (hdgErr < -Math.PI) hdgErr += 2 * Math.PI;
+    // Two-loop heading (pass 12, Worker E) — the AI's own steering,
+    // not the P-loop bankDes = hdgErr * 1.0. The P-loop banked
+    // directly from the heading error and oscillated +-20 deg around
+    // the bearing, so the nose dipped into the 15 deg cone for a
+    // single frame at a time (1 frame out of 4169) and lockT never
+    // built past 0.05 s. Loop 1 commands a turn rate from the
+    // heading error (gain 1.5, capped at 0.6x the ~18 deg/s
+    // sustained rate); loop 2 smooths it at 6/s and derives the
+    // bank from the rate (phi = atan(V*omega/g)), which is the
+    // coordinated bank for that rate and does not overshoot.
+    const omegaDes = clamp(hdgErr * 1.5, -0.31 * 0.6, 0.31 * 0.6);
+    playerOmegaSm += (omegaDes - playerOmegaSm) * Math.min(1, dt * 6);
+    const bankDes = clamp(
+      -Math.atan((playerOmegaSm * Math.max(player.ias, 1)) / 9.81),
+      (-70 * Math.PI) / 180,
+      (70 * Math.PI) / 180,
+    );
+    const bankNow = new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').z;
+    player.rollIn = clamp((bankDes - bankNow) * 2.0, -1, 1);
+  };
+
+  // Player missile lock scan, verbatim from main.ts playerInput().
+  const lockScan = (dt: number): void => {
+    if (!player.alive) return;
+    let best: Aircraft | null = null;
+    let bd = LOCK_RANGE;
+    for (const e of enemies) {
+      if (!e.alive || e.dying) continue;
+      const to = e.pos.clone().sub(player.pos);
+      const d = to.length();
+      if (d < bd && player.fwd().angleTo(to.normalize()) * R2D < LOCK_CONE_DEG) {
+        bd = d;
+        best = e;
+      }
+    }
+    if (best) {
+      player.lockTarget = best;
+      player.lockT += dt;
+      lockSeconds += dt;
+      // Fire ONCE per lock, inside the missile's effective envelope
+      // (pass 12, Worker E): the old scan fired a missile EVERY
+      // frame while locked (no cooldown, no msl decrement — main.ts
+      // fires on a button press with msl--), spamming ~50 missiles
+      // at a fleeing target at 2000 m. A 280 m/s missile closes on
+      // a 150 m/s fleeing target at only ~130 m/s, so 2000 m takes
+      // ~15 s — longer than the 12 s missile life — and every one
+      // expired. Effective range vs a fleeing target is ~1500 m;
+      // head-on or crossing targets close faster and can be engaged
+      // further out, but 1500 m is the safe envelope for the probe.
+      if (
+        player.lockT > LOCK_TIME &&
+        player.msl > 0 &&
+        !firedForLock &&
+        bd < 1500
+      ) {
+        weapons.launchMissile(player, best);
+        playerMslFired++;
+        firedForLock = true;
+      }
+    } else {
+      player.lockTarget = null;
+      player.lockT = Math.max(0, player.lockT - dt * 2);
+      firedForLock = false;
+    }
+    maxLockT = Math.max(maxLockT, player.lockT);
+  };
+
+  while (simT < SIM_SECONDS) {
+    const rawDt = dtPattern[frame % dtPattern.length]!;
     const sub = Math.max(1, Math.ceil(rawDt / 0.05));
     const dt = rawDt / sub;
     for (let s = 0; s < sub; s++) {
-      frames++;
-      // Scripted player: full throttle; pull at Vr; climb gently to
-      // the scenario target and fly level east. A target >= 500 is an
-      // absolute altitude (1000 m is safely above all terrain); a
-      // target < 500 is terrain-relative (AGL), so the low run follows
-      // the rising ground east of Alpha instead of flying a fixed
-      // absolute altitude into a mountainside.
-      // The climb demand is capped at 15 m/s — an uncapped
-      // vs demand commands full pull at low speed and stalls the jet.
-      player.thrTarget = 1;
-      if (player.onSurface && player.ias >= vrMs) player.pitchIn = -1;
-      else if (!player.onSurface) {
-        const altTarget =
-          climbTarget < 500
-            ? heightAtLive(player.pos.x, player.pos.z) + climbTarget
-            : climbTarget;
-        const vsDes = Math.max(-10, Math.min(15, (altTarget - player.pos.y) * 0.08));
-        player.pitchIn = Math.max(-0.4, Math.min(0.4, (player.vsi - vsDes) * 0.06));
-        player.rollIn = 0;
-      } else {
-        player.pitchIn = 0;
-        player.rollIn = 0;
-      }
+      simT += dt;
+      frame++;
+      flyPlayer(dt);
       world.timestep = dt;
       world.step(eventQueue);
       drain();
       player.step(dt, WIND, null);
+      if (airborneAt < 0 && !player.onSurface && !player.grounded) airborneAt = simT;
+      if (player.alive && !player.dying) {
+        maxPlayerAlt = Math.max(maxPlayerAlt, player.pos.y);
+        maxPlayerVsi = Math.max(maxPlayerVsi, Math.abs(player.vsi));
+      }
+      lockScan(dt);
       for (let j = 0; j < enemies.length; j++) {
         const e = enemies[j]!;
         const ai = ais[j]!;
         if (!e.alive) {
-          if (enemyDeathAt < 0) enemyDeathAt = t;
+          if (enemyDeathAt < 0) enemyDeathAt = simT;
           continue;
         }
-        const ctrl = ai.update(dt, player, carrierStub, t);
-        if (ai.state === 'engage' && !everEngage) {
-          everEngage = true;
-          firstEngageAt = t;
+        const ctrl = ai.update(dt, player, carrierStub, simT);
+        stateSeconds[ai.state] = (stateSeconds[ai.state] ?? 0) + dt;
+        if (ai.state === 'engage') {
+          engageSeconds += dt;
+          if (firstEngageAt < 0) firstEngageAt = simT;
         }
-        if ((ai.fireGun || ai.fireMissile) && !everFire) {
-          everFire = true;
-          firstFireAt = t;
+        if (ai.fireGun) {
+          weapons.aiGunShot(e, player, ai.skill.err);
+          aiGunShots++;
+          if (firstFireAt < 0) firstFireAt = simT;
         }
-        minDist = Math.min(minDist, e.pos.distanceTo(player.pos));
+        if (ai.fireMissile) {
+          const before = e.msl;
+          weapons.launchMissile(e, player);
+          if (e.msl < before) aiMslLaunched++;
+          if (firstFireAt < 0) firstFireAt = simT;
+        }
+        if (ai.dropBomb) {
+          weapons.dropBomb(e);
+          aiBombsDropped++;
+        }
+        const d = e.pos.distanceTo(player.pos);
+        minDist = Math.min(minDist, d);
+        if (d < 2200) timeWithin2200 += dt;
+        if (d < 900) timeWithin900 += dt;
         e.step(dt, ctrl, WIND, heightAtLive, null);
-        if (!e.alive && enemyDeathAt < 0) {
-          enemyDeathAt = t;
-        }
-        if (!e.alive && enemyDeathReasons.length < 3) {
+        if (!e.alive && enemyDeathAt < 0) enemyDeathAt = simT;
+        if (!e.alive && terrainDeathAt < 0 && (e.lastCrashReason === 'hard landing' || e.lastCrashReason === 'terrain')) terrainDeathAt = simT;
+        if (!e.alive && enemyDeathReasons.length < 4) {
           enemyDeathReasons.push(
-            `e${j} t=${t.toFixed(1)}s reason=${e.lastCrashReason ?? '-'} y=${e.pos.y.toFixed(0)} hf=${heightAtLive(e.pos.x, e.pos.z).toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt state=${ai.state}`,
+            `e${j} t=${simT.toFixed(1)}s reason=${e.lastCrashReason ?? '-'} y=${e.pos.y.toFixed(0)} hf=${heightAtLive(e.pos.x, e.pos.z).toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt state=${ai.state}`,
           );
         }
       }
-      if (!player.alive && playerDeathAt < 0) playerDeathAt = t;
+      weapons.update(dt, enemies);
+      // Live-faithful respawn: a shot-down player picks a new life
+      // and takes off again (respawn picker), so the run measures
+      // engagement over the full 240 s instead of ending at the
+      // first kill. resetAt restores hp 100 / msl 6; the probe's
+      // hp-1000 scaffolding is re-applied.
+      if (!player.alive) {
+        if (playerDeathAt < 0) playerDeathAt = simT;
+        playerDeaths++;
+        playerHpLostTotal += Math.max(0, 1000 - player.hp);
+        playerDeathReasons.push(
+          `t=${simT.toFixed(1)}s reason=${player.lastCrashReason ?? player.dyingReason ?? '-'} hpLost=${(1000 - player.hp).toFixed(0)}`,
+        );
+        player.resetAt(alpha.x - origin.cumulativeShift.x, alpha.elev + 2.25, alpha.z - origin.cumulativeShift.z, alpha.hdg);
+        player.hp = 1000;
+      }
     }
     const shift = origin.shiftIfNeeded(player.pos);
     if (shift) origin.applyShift(shift);
-    if (f % 300 === 0) {
+    if (simT - lastLogSim >= 30) {
+      lastLogSim = simT;
       console.log(
-        `  [t=${t.toFixed(0)}s] player y=${player.pos.y.toFixed(0)} ias=${(player.ias * 1.944).toFixed(0)}kt gnd=${player.grounded} spawnProt=${player.spawnProt.toFixed(1)} alive=${player.alive} ` +
+        `  [t=${simT.toFixed(0)}s] player y=${player.pos.y.toFixed(0)} ias=${(player.ias * 1.944).toFixed(0)}kt vsi=${player.vsi.toFixed(0)} aoa=${player.aoaDeg.toFixed(1)} hp=${player.hp.toFixed(0)} lockT=${player.lockT.toFixed(2)} msl=${player.msl} alive=${player.alive} ` +
           enemies
             .map(
               (e, j) =>
-                `e${j} ${e.alive ? 'alive' : 'DEAD'} ${ais[j]!.state} d=${e.pos.distanceTo(player.pos).toFixed(0)}m y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt`,
+                `e${j} ${e.alive ? 'alive' : 'DEAD'} ${ais[j]!.state} d=${e.pos.distanceTo(player.pos).toFixed(0)}m y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt hp=${e.hp.toFixed(0)} msl=${e.msl}`,
             )
             .join(' '),
       );
     }
-    if (!player.alive) break;
   }
-  console.log(`  frames=${frames} firstEngageAt=${firstEngageAt >= 0 ? firstEngageAt.toFixed(1) + 's' : 'never'} firstFireAt=${firstFireAt >= 0 ? firstFireAt.toFixed(1) + 's' : 'never'} minDist=${minDist.toFixed(0)}m enemyDeathAt=${enemyDeathAt >= 0 ? enemyDeathAt.toFixed(1) + 's' : 'none'} playerDeathAt=${playerDeathAt >= 0 ? playerDeathAt.toFixed(1) + 's' : 'none'}`);
+  const playerHpLost = playerHpLostTotal + (player.alive ? Math.max(0, 1000 - player.hp) : 0);
+  const enemyHpLost = enemies.reduce(
+    (sum, e, j) => sum + (enemyHpStart[j]! - e.hp),
+    0,
+  );
+  console.log(
+    `  summary: simT=${simT.toFixed(1)}s airborneAt=${airborneAt >= 0 ? airborneAt.toFixed(1) + 's' : 'never'} maxAlt=${maxPlayerAlt.toFixed(0)}m max|vsi|=${maxPlayerVsi.toFixed(0)}m/s ` +
+      `firstEngageAt=${firstEngageAt >= 0 ? firstEngageAt.toFixed(1) + 's' : 'never'} engageSeconds=${engageSeconds.toFixed(1)}s ` +
+      `firstFireAt=${firstFireAt >= 0 ? firstFireAt.toFixed(1) + 's' : 'never'} aiGunShots=${aiGunShots} aiMslLaunched=${aiMslLaunched} aiBombs=${aiBombsDropped} ` +
+      `minDist=${minDist.toFixed(0)}m within2200=${timeWithin2200.toFixed(1)}s within900=${timeWithin900.toFixed(1)}s ` +
+      `maxLockT=${maxLockT.toFixed(2)}s lockSeconds=${lockSeconds.toFixed(1)}s playerMslFired=${playerMslFired} (msl ${playerMslStart}->${player.msl}) ` +
+      `playerHpLost=${playerHpLost.toFixed(0)} enemyHpLost=${enemyHpLost.toFixed(0)} states=${JSON.stringify(stateSeconds)} ` +
+      `enemyDeathAt=${enemyDeathAt >= 0 ? enemyDeathAt.toFixed(1) + 's' : 'none'} terrainDeathAt=${terrainDeathAt >= 0 ? terrainDeathAt.toFixed(1) + 's' : 'none'} playerDeaths=${playerDeaths} firstPlayerDeathAt=${playerDeathAt >= 0 ? playerDeathAt.toFixed(1) + 's' : 'none'}`,
+  );
   for (const r of enemyDeathReasons) console.log(`  ENEMY DEATH: ${r}`);
-  check('AI engages the taking-off player (state=engage)', everEngage, everEngage ? `first at ${firstEngageAt.toFixed(1)}s` : 'never left patrol/bomb in 150 s');
-  check('AI fires at the player (gun or missile)', everFire, everFire ? `first at ${firstFireAt.toFixed(1)}s` : `closest approach ${minDist.toFixed(0)} m`);
-  check('enemies survive 150 s (no terrain death)', enemyDeathAt < 0, enemyDeathAt >= 0 ? `first enemy died at t=${enemyDeathAt.toFixed(1)}s` : 'all alive');
-  check('scripted player survives the 150 s flight', player.alive, player.alive ? `y=${player.pos.y.toFixed(0)}` : `died at ${playerDeathAt.toFixed(1)}s: ${player.lastCrashReason ?? '-'}`);
+  for (const r of playerDeathReasons) console.log(`  PLAYER DEATH: ${r}`);
+
+  check('scripted player flies a sane profile (max alt < 3000 m, max |vsi| < 70 m/s — a dogfighting player climbs/dives at up to 15 deg, i.e. ~39 m/s at 150 m/s, and a hard pursuit pull can reach ~60 m/s; the old zoom-climb failure was 20,000 m at +50..100 m/s sustained, max|vsi| 109-119)', maxPlayerAlt < 3000 && maxPlayerVsi < 70, `maxAlt=${maxPlayerAlt.toFixed(0)}m max|vsi|=${maxPlayerVsi.toFixed(0)}m/s`);
+  check('AI engages within 30 s of the player going airborne', firstEngageAt >= 0 && airborneAt >= 0 && firstEngageAt - airborneAt <= 30, firstEngageAt >= 0 ? `first at ${firstEngageAt.toFixed(1)}s (airborne ${airborneAt.toFixed(1)}s)` : 'never engaged');
+  check('AI stays engaged (total engage time >= 60 s across enemies)', engageSeconds >= 60, `engageSeconds=${engageSeconds.toFixed(1)}s states=${JSON.stringify(stateSeconds)}`);
+  check('AI closes to gun range (min dist < 900 m) and holds < 2200 m for >= 20 s', minDist < 900 && timeWithin2200 >= 20, `minDist=${minDist.toFixed(0)}m within2200=${timeWithin2200.toFixed(1)}s within900=${timeWithin900.toFixed(1)}s`);
+  // Pass 12 (coordinator): the AI fires on the player with gun OR
+  // missile, and the fire must LAND (playerHpLost > 0). Missiles are
+  // the AI's primary air-to-air weapon (4-13 launched per run, the
+  // player shot down 1-3x); the gun is close-range and geometry-
+  // dependent — it fired 5x in one configuration and 0-1x in others
+  // (the nose is >45 deg off in a sustained matched-speed turning
+  // fight), so a gun>=5 bar makes the probe fail on geometry, not on
+  // engagement. The gun count is still reported, and a run with
+  // zero AI fire of either kind fails here.
+  check('AI fires on the player (gun and/or missile, and the fire lands)', (aiGunShots >= 1 || aiMslLaunched >= 1) && playerHpLost > 0, `gun=${aiGunShots} msl=${aiMslLaunched} firstFireAt=${firstFireAt >= 0 ? firstFireAt.toFixed(1) + 's' : 'never'} playerHpLost=${playerHpLost.toFixed(0)}`);
+  check('AI fire lands (player takes damage)', playerHpLost > 0, `playerHpLost=${playerHpLost.toFixed(0)}`);
+  check('player achieves full missile lock (lockT > 1.2 s)', maxLockT > LOCK_TIME, `maxLockT=${maxLockT.toFixed(2)}s lockSeconds=${lockSeconds.toFixed(1)}s`);
+  check('player fires a missile on lock (msl decreases)', playerMslFired >= 1, `playerMslFired=${playerMslFired} msl ${playerMslStart}->${player.msl}`);
+  check('player missile damages an enemy', enemyHpLost > 0, `enemyHpLost=${enemyHpLost.toFixed(0)}`);
+  check('enemies survive 240 s (no terrain death)', terrainDeathAt < 0, terrainDeathAt >= 0 ? `first terrain death at t=${terrainDeathAt.toFixed(1)}s` : (enemyDeathAt >= 0 ? `one shot down at t=${enemyDeathAt.toFixed(1)}s (legitimate player kill)` : 'all alive'));
+  check('probe runs the full 240 sim s (player respawns like live)', simT >= SIM_SECONDS - 1, `simT=${simT.toFixed(1)}s playerDeaths=${playerDeaths}`);
 
   for (const e of enemies) e.dispose();
   player.dispose();

@@ -58,8 +58,11 @@ export interface SandboxConfig {
    *  fires it at a random 30–90 s. 'random' as the scenario picks a
    *  random scenario; the timing still comes from failWhen. */
   failWhen: 'start' | 'random';
-  /** Spawn: Alpha land runway, or the helicarrier deck. */
-  spawn: 'alpha' | 'carrier';
+  /** Spawn: Alpha / Bravo / Charlie land runway, or the helicarrier
+   *  deck. Bravo/Charlie were respawn-picker-only (pass 12, worker
+   *  D) — the setup menu offered only Alpha + deck, so they could
+   *  never be a first spawn. */
+  spawn: 'alpha' | 'bravo' | 'charlie' | 'carrier';
   /** Stick shaping (PC keyboard): invert + sensitivity exponent. */
   invertPitch: boolean;
   invertRoll: boolean;
@@ -235,7 +238,7 @@ export class SandboxMenu {
         c.failure = s.failure as FailureScenario;
       }
       if (s.failWhen === 'start' || s.failWhen === 'random') c.failWhen = s.failWhen;
-      if (s.spawn === 'alpha' || s.spawn === 'carrier') c.spawn = s.spawn;
+      if (s.spawn === 'alpha' || s.spawn === 'bravo' || s.spawn === 'charlie' || s.spawn === 'carrier') c.spawn = s.spawn;
       if (typeof s.helicarriers === 'number') {
         c.helicarriers = clamp(Math.round(s.helicarriers), 0, 3);
       }
@@ -276,7 +279,9 @@ export class SandboxMenu {
       this.save();
     });
     this.segWire('segSpawn', (d) => {
-      this.cfg.spawn = d['v'] === 'carrier' ? 'carrier' : 'alpha';
+      const v = d['v'];
+      this.cfg.spawn =
+        v === 'bravo' || v === 'charlie' || v === 'carrier' ? v : 'alpha';
       this.save();
     });
     this.segWire('segSkill', (d) => {

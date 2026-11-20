@@ -91,9 +91,18 @@ const RIG_PATTERNS: Array<[RigSlot, RegExp]> = [
   ['flap_R', /flap.*(r|right)/i],
   ['airbrake', /airbrake|speed.?brake/i],
   ['tailhook', /tailhook|hook/i],
-  ['gear_front', /gear.*(front|nose)/i],
-  ['gear_L', /gear.*(l|left)/i],
-  ['gear_R', /gear.*(r|right)/i],
+  // Gear patterns are END-ANCHORED (pass 12): the loose v2
+  // `gear.*(r|right)` matched "gear_front" — the 'r' in "front" — so
+  // gear_R bound gear_front and the real gear_R mesh was never
+  // animated: it stayed down in flight at y=0 while the probe read
+  // rig.bound (gear_front, stowed) and passed. gear_L had the same
+  // hazard via "gear_leg_..." (the 'l' in "leg"). The numeric suffix
+  // allows Blender duplicates (gear_L.001); the other L/R patterns
+  // (aileron, flap, nozzle...) cannot cross-match this way — their
+  // disambiguator letter never occurs in the opposite slot's name.
+  ['gear_front', /gear[_-]*(front|nose)([._-]\d+)?$/i],
+  ['gear_L', /gear[_-]*(l|left)([._-]\d+)?$/i],
+  ['gear_R', /gear[_-]*(r|right)([._-]\d+)?$/i],
   ['propeller', /propeller|prop/i],
   ['main_rotor', /main.?rotor/i],
   ['tail_rotor', /tail.?rotor/i],
@@ -430,11 +439,19 @@ export class AircraftRigBindings {
     // the lowest airframe surface above its own station (+0.10 m
     // overlap into the fuselage), per jet per station, so the gear
     // connects to the airframe it belongs to.
+    // Procedural legs are built at the physics gear-post stations
+    // (spec.gearPosts when the model sets them — pass 12, item 14 —
+    // else the v2 formula), so the visual legs always sit on the
+    // physics posts. The F-18 never reaches this loop (its GLB gear
+    // is bound above).
+    const postNoseZ = spec.gearPosts?.noseZ ?? 0.35 * spec.length;
+    const postMainZ = spec.gearPosts?.mainZ ?? -0.15 * spec.length;
+    const postMainX = spec.gearPosts?.mainX ?? GEAR_MAIN_X;
     const gearSlots: Array<[RigSlot, number, number, number]> = [
       // slot, x, z, wheel radius
-      ['gear_front', 0, 0.35 * spec.length, 0.3],
-      ['gear_L', -GEAR_MAIN_X, -0.15 * spec.length, 0.35],
-      ['gear_R', GEAR_MAIN_X, -0.15 * spec.length, 0.35],
+      ['gear_front', 0, postNoseZ, 0.3],
+      ['gear_L', -postMainX, postMainZ, 0.35],
+      ['gear_R', postMainX, postMainZ, 0.35],
     ];
     // Belly (lowest fuselage point). normalizeAircraft aligns it to
     // the physics belly (-0.8 m) — or to spec.bellyAlign.targetY for
