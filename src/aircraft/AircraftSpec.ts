@@ -181,6 +181,21 @@ export interface AircraftSpec {
    *  procedural gear). When present, the rig binds these instead of
    *  building procedural legs. */
   includedGear?: IncludedGearStation[];
+  /** Physics gear-post stations (aircraft frame, metres). The
+   *  controller's invisible gear skids AND the rig's procedural legs
+   *  are built at these stations; absent = the v2 formula (nose
+   *  z +0.35·length, mains x ±1.6, z −0.15·length). Set only when a
+   *  model's real gear sits elsewhere. Pass 12: the F-18's visual
+   *  nose gear is at z +3.57 but its physics nose skid was at
+   *  z +6.58 (0.35·18.79) — 3.0 m ahead of the wheels, completely
+   *  outside the skid's 3 m span (5.08–8.08), so on uneven ground /
+   *  deck the contact patch was 3 m ahead of the visible wheel. The
+   *  mains are NOT moved: the visual mains (x ±1.55, z −2.26) already
+   *  sit inside the main skids' footprint (x 1.25–1.95,
+   *  z −4.32–−1.32), and moving them 0.56 m forward would shift the
+   *  rotation pivot and eat the 12° tail-clearance margin (1.17 m
+   *  drop, ~0.2 m clearance → ~0.08 m). Only the nose moves. */
+  gearPosts?: { noseZ?: number; mainZ?: number; mainX?: number };
   /** Rotary parameters (heli only). */
   rotary?: RotaryParams;
 }
@@ -242,6 +257,11 @@ export const SPECS: Record<string, AircraftSpec> = {
       { slot: 'gear_L', x0: -2.2, x1: -0.9, z0: -3.1, z1: -1.6, capY: -1.25 },
       { slot: 'gear_R', x0: 0.9, x1: 2.2, z0: -3.1, z1: -1.6, capY: -1.25 },
     ],
+    // Pass 12, item 14: physics nose post to the model's nose-gear
+    // station (z +3.57, the twin wheels) — the formula put it at
+    // +6.58, 3.0 m ahead of the visible wheels. Mains stay on the
+    // formula (their visual station is already inside the skid).
+    gearPosts: { noseZ: 3.57 },
     turn: 1.0,
     rollDeg: 150,
     pitch: 1.0,

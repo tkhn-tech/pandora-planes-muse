@@ -34,6 +34,8 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
+import { PCFlightInput } from '../src/input/PCFlightInput';
+import { touchStickScale, touchPitchScale, touchDeadzone } from '../src/input/MobileFlightInput';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import {
   generateHeights,
@@ -281,6 +283,354 @@ async function main(): Promise<void> {
     pcYawQ === 1 && pcYawE === -1,
     `Q=${pcYawQ} E=${pcYawE}`,
   );
+
+  // --- D: live keyboard path (pass 12, worker D). The sections above
+  // drive ac.rollIn directly — they prove the PHYSICS responds, not
+  // that the keyboard reaches it. The v4.6.1 live check tapped Right
+  // Arrow x2 (F-18, 287 kt) and Left Arrow x3 (F-15E, 586 kt) and the
+  // bank stayed 0 deg while ArrowUp/Down DID pitch: the keyboard roll
+  // path itself is under test here, through the real PCFlightInput
+  // (real keydown/keyup dispatch, real stick slew, real 60 Hz
+  // getControls cadence) merged exactly as main.ts playerInput does
+  // (PC wins when nonzero, else touch 0, tilt 0).
+  //
+  // Method: a virtual performance.now clock (vnow) advanced 16.67 ms
+  // per sim frame, so the slew timing is the live timing; key events
+  // are dispatched to the window listeners PCFlightInput registered.
+  // A tap is 6 frames (100 ms) down + release; a hold is 60 frames.
+  {
+    const listeners = new Map<string, Array<(e: unknown) => void>>();
+    const g = globalThis as unknown as Record<string, unknown>;
+    g['window'] = globalThis;
+    g['addEventListener'] = (t: string, f: (e: unknown) => void): void => {
+      const arr = listeners.get(t) ?? [];
+      arr.push(f);
+      listeners.set(t, arr);
+    };
+    g['removeEventListener'] = (t: string, f: (e: unknown) => void): void => {
+      listeners.set(t, (listeners.get(t) ?? []).filter((x) => x !== f));
+    };
+    // Node's global `navigator` is getter-only, so a plain assignment
+    // throws — define it the same way `performance` is defined below.
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { getGamepads: () => [] as unknown[] },
+      configurable: true,
+    });
+    let vnow = 0;
+    Object.defineProperty(globalThis, 'performance', {
+      value: { now: () => vnow },
+      configurable: true,
+    });
+    const fakeCanvas = {
+      addEventListener: (): void => {},
+      removeEventListener: (): void => {},
+    } as unknown as HTMLCanvasElement;
+    const fireKey = (type: 'keydown' | 'keyup', code: string): void => {
+      for (const f of listeners.get(type) ?? []) {
+        f({ code, repeat: false, preventDefault: (): void => {} });
+      }
+    };
+    const pc = new PCFlightInput(fakeCanvas);
+    // One 1/60 s frame through the live merge: advance the virtual
+    // clock, consume events then poll (playerInput order), merge as
+    // main.ts does, step. Returns the merged stick actually applied.
+    const frame = (ac: Aircraft): { pitch: number; roll: number } => {
+      vnow += 1000 / 60;
+      pc.consumeEvents();
+      const c = pc.getControls();
+      const pcPitch = c.pitch ?? 0;
+      const pcRoll = c.roll ?? 0;
+      const px = pcPitch !== 0 || pcRoll !== 0 ? pcPitch : 0;
+      const rx = pcPitch !== 0 || pcRoll !== 0 ? pcRoll : 0;
+      ac.pitchIn = Math.max(-1, Math.min(1, px));
+      ac.rollIn = Math.max(-1, Math.min(1, rx));
+      substep(ac, 1 / 60);
+      return { pitch: ac.pitchIn, roll: ac.rollIn };
+    };
+    const runKb = (
+      modelKey: string,
+      speedKt: number,
+      code: 'ArrowRight' | 'ArrowLeft',
+      holdFrames: number,
+    ): {
+      peakRollIn: number;
+      peakBank: number;
+      bankAtHoldEnd: number;
+      bankPlus05: number;
+      bankPlus10: number;
+      bankTrace: string;
+      iasAtEnd: number;
+    } => {
+      const ac = spawnAirborne(modelKey);
+      ac.setAirspeed(speedKt / 1.94384);
+      for (let i = 0; i < 30; i++) frame(ac); // settle 0.5 s hands-off
+      fireKey('keydown', code);
+      let peakRollIn = 0;
+      let peakBank = 0;
+      let bankAtHoldEnd = 0;
+      const trace: string[] = [];
+      for (let i = 0; i < holdFrames; i++) {
+        const c = frame(ac);
+        peakRollIn = Math.max(peakRollIn, Math.abs(c.roll));
+        peakBank = Math.max(peakBank, Math.abs(bankOf(ac)));
+        if (i % 15 === 0 || i === holdFrames - 1) {
+          trace.push(
+            `t=${((i + 1) / 60).toFixed(2)}s rollIn=${c.roll.toFixed(2)} bank=${bankOf(ac).toFixed(1)}`,
+          );
+        }
+        if (i === holdFrames - 1) bankAtHoldEnd = bankOf(ac);
+      }
+      fireKey('keyup', code);
+      let bankPlus05 = 0;
+      let bankPlus10 = 0;
+      for (let i = 0; i < 60; i++) {
+        frame(ac);
+        peakBank = Math.max(peakBank, Math.abs(bankOf(ac)));
+        if (i === 29) bankPlus05 = bankOf(ac);
+        if (i === 59) bankPlus10 = bankOf(ac);
+      }
+      const out = {
+        peakRollIn,
+        peakBank,
+        bankAtHoldEnd,
+        bankPlus05,
+        bankPlus10,
+        bankTrace: trace.join(' | '),
+        iasAtEnd: ac.ias * 1.94384,
+      };
+      dispose(ac);
+      return out;
+    };
+    // D1: the live repro — tap Right 100 ms, F-18 at 287 kt. A tap
+    // must produce a VISIBLE bank that is still there 0.5 s later
+    // (the live check read bank 0 deg after x2 taps).
+    {
+      const r = runKb('fa18', 287, 'ArrowRight', 6);
+      check(
+        'KB tap Right 100ms (fa18 287kt): peak rollIn reaches 0.7+',
+        r.peakRollIn >= 0.7,
+        `peak rollIn=${r.peakRollIn.toFixed(2)} — ${r.bankTrace}`,
+      );
+      check(
+        'KB tap Right 100ms (fa18 287kt): peak bank >= 8 deg',
+        r.peakBank >= 8,
+        `peak bank=${r.peakBank.toFixed(1)} deg`,
+      );
+      check(
+        'KB tap Right 100ms (fa18 287kt): bank still >= 5 deg 0.5 s after release',
+        Math.abs(r.bankPlus05) >= 5 && r.bankPlus05 > 0,
+        `bank@+0.5s=${r.bankPlus05.toFixed(1)} deg`,
+      );
+    }
+    // D2: hold Right 1 s, F-18 at 287 kt — a sustained hold must bank
+    // decisively right.
+    {
+      const r = runKb('fa18', 287, 'ArrowRight', 60);
+      check(
+        'KB hold Right 1s (fa18 287kt): banks RIGHT >= 25 deg',
+        r.bankAtHoldEnd >= 25,
+        `bank=${r.bankAtHoldEnd.toFixed(1)} deg — ${r.bankTrace}`,
+      );
+    }
+    // D3: the second live repro — tap Left 100 ms, F-15E at 586 kt.
+    {
+      const r = runKb('f15e', 586, 'ArrowLeft', 6);
+      check(
+        'KB tap Left 100ms (f15e 586kt): peak rollIn reaches 0.7+',
+        r.peakRollIn >= 0.7,
+        `peak rollIn=${r.peakRollIn.toFixed(2)} — ${r.bankTrace}`,
+      );
+      check(
+        'KB tap Left 100ms (f15e 586kt): peak bank >= 8 deg LEFT',
+        r.peakBank >= 8 && r.bankPlus05 < 0,
+        `peak bank=${r.peakBank.toFixed(1)} deg bank@+0.5s=${r.bankPlus05.toFixed(1)} deg`,
+      );
+    }
+    // D4: hold Left 1 s, F-15E at 586 kt.
+    {
+      const r = runKb('f15e', 586, 'ArrowLeft', 60);
+      check(
+        'KB hold Left 1s (f15e 586kt): banks LEFT <= -25 deg',
+        r.bankAtHoldEnd <= -25,
+        `bank=${r.bankAtHoldEnd.toFixed(1)} deg — ${r.bankTrace}`,
+      );
+    }
+    pc.dispose();
+  }
+
+  // --- E: on-screen joystick (pass 12, worker D). The touch stick is
+  // wired in main.ts (joy/joyKnob + the playerInput merge), so this
+  // probe replicates that merge EXACTLY — old (current main.ts) and
+  // new (the patch spec: direct pitch + touchStickScale + deadzone) —
+  // and flies both through the real Aircraft. Two live findings:
+  // (1) the stick rolls very sensitively at high speed (F-22 to
+  // inverted in ~19 s; full deflection gives +-10 G); (2) pitch is
+  // confusing — drag up and drag down both read as climbs/loops.
+  // The old merge's numbers are the FAIL-before evidence; the new
+  // merge must stay inside the bands below.
+  {
+    const clamp01 = (v: number): number => Math.max(-1, Math.min(1, v));
+    // Current main.ts merge, verbatim: PC wins when nonzero, else
+    // touch sim-style (pull back / drag down = nose up, px = -joy.y;
+    // stick right = bank right, rx = joy.x). No speed scaling, no
+    // deadzone.
+    const mergeOld = (
+      joyX: number,
+      joyY: number,
+    ): { pitch: number; roll: number } => ({
+      pitch: clamp01(-joyY),
+      roll: clamp01(joyX),
+    });
+    // Patched merge (patch spec for main.ts playerInput): direct
+    // pitch — drag UP (joy.y < 0) = nose up (pitchIn < 0), so the
+    // touch stick agrees with the keyboard (ArrowUp = nose up) and
+    // the mouse yoke (drag up = nose up); roll unchanged in sign.
+    // Pitch uses the stronger touchPitchScale, roll the linear
+    // touchStickScale; both axes through the deadzone.
+    const mergeNew = (
+      joyX: number,
+      joyY: number,
+      iasKt: number,
+    ): { pitch: number; roll: number } => ({
+      pitch: clamp01(touchDeadzone(joyY) * touchPitchScale(iasKt)),
+      roll: clamp01(touchDeadzone(joyX) * touchStickScale(iasKt)),
+    });
+    const joyRun = (
+      modelKey: string,
+      speedKt: number,
+      joyX: number,
+      joyY: number,
+      merge: (x: number, y: number, kt: number) => { pitch: number; roll: number },
+    ): { bankAt1: number; bankAt2: number; maxBank: number; maxG: number; gAt025: number; gAt05: number; gAt1: number; iasAt1: number } => {
+      const ac = spawnAirborne(modelKey);
+      ac.setAirspeed(speedKt / 1.94384);
+      for (let i = 0; i < 30; i++) substep(ac, 1 / 60); // settle
+      let maxG = 0;
+      let bankAt1 = 0;
+      let bankAt2 = 0;
+      let maxBank = 0;
+      let gAt025 = 0;
+      let gAt05 = 0;
+      let gAt1 = 0;
+      let iasAt1 = 0;
+      for (let i = 0; i < 120; i++) {
+        const m = merge(joyX, joyY, ac.ias * 1.94384);
+        ac.pitchIn = m.pitch;
+        ac.rollIn = m.roll;
+        substep(ac, 1 / 60);
+        maxG = Math.max(maxG, Math.abs(ac.gload));
+        maxBank = Math.max(maxBank, Math.abs(bankOf(ac)));
+        if (i === 14) gAt025 = ac.gload;
+        if (i === 29) gAt05 = ac.gload;
+        if (i === 59) {
+          bankAt1 = bankOf(ac);
+          gAt1 = ac.gload;
+          iasAt1 = ac.ias * 1.94384;
+        }
+        if (i === 119) bankAt2 = bankOf(ac);
+      }
+      const out = { bankAt1, bankAt2, maxBank, maxG, gAt025, gAt05, gAt1, iasAt1 };
+      dispose(ac);
+      return out;
+    };
+    // E1: pitch direction. Drag UP (joy.y = -1) must pitch the nose
+    // UP (pitchIn < 0). The old merge gives +1 (nose down) — that
+    // sign flip against the keyboard/mouse-yoke convention is the
+    // confusion: the pilot drags up expecting a climb and gets a
+    // dive, then drags down and loops.
+    {
+      const oldUp = mergeOld(0, -1);
+      const newUp = mergeNew(0, -1, 287);
+      const oldDown = mergeOld(0, 1);
+      const newDown = mergeNew(0, 1, 287);
+      check(
+        'JOY pitch direction (old merge): drag UP gives pitchIn +1 (nose DOWN) — reproduces the live confusion',
+        oldUp.pitch > 0 && oldDown.pitch < 0,
+        `drag-up pitchIn=${oldUp.pitch.toFixed(2)} drag-down pitchIn=${oldDown.pitch.toFixed(2)}`,
+      );
+      check(
+        'JOY pitch direction (new merge): drag UP gives pitchIn < 0 (nose UP), drag DOWN gives > 0',
+        newUp.pitch < 0 && newDown.pitch > 0,
+        `drag-up pitchIn=${newUp.pitch.toFixed(2)} drag-down pitchIn=${newDown.pitch.toFixed(2)}`,
+      );
+    }
+    // E2: full drag UP at 586 kt, F-18 — the +-10 G live finding.
+    // Old merge first (evidence), then new merge inside the band.
+    // The band is on the TRANSIENT gain (G at 0.25/0.5 s), not the
+    // 2 s peak: a sustained full-aft drag integrates pitch rate into
+    // AoA, and at 586 kt even a small AoA makes huge lift, so the
+    // 2 s peak stays ~10 G under any stick scale — capping THAT needs
+    // a g-limiter in the controller (patch spec, see the worker
+    // report). What the scale must fix is the gain: a short drag
+    // must not yank the jet to high G at once.
+    {
+      const oldR = joyRun('fa18', 586, 0, -1, (x, y) => mergeOld(x, y));
+      const newR = joyRun('fa18', 586, 0, -1, mergeNew);
+      check(
+        'JOY full drag (old merge, fa18 586kt): G@0.5s > 7 — reproduces the +-10 G live finding',
+        Math.abs(oldR.gAt05) > 7,
+        `old G@0.25s=${oldR.gAt025.toFixed(1)} G@0.5s=${oldR.gAt05.toFixed(1)} G@1s=${oldR.gAt1.toFixed(1)} peak=${oldR.maxG.toFixed(1)}`,
+      );
+      check(
+        'JOY full drag UP (new merge, fa18 586kt): G@0.5s <= 5',
+        Math.abs(newR.gAt05) <= 5,
+        `new G@0.25s=${newR.gAt025.toFixed(1)} G@0.5s=${newR.gAt05.toFixed(1)} G@1s=${newR.gAt1.toFixed(1)} peak=${newR.maxG.toFixed(1)} (old G@0.5s=${oldR.gAt05.toFixed(1)}) ias@1s=${newR.iasAt1.toFixed(0)}kt`,
+      );
+    }
+    // E3: partial drag (0.35) at 586 kt, F-22 — a modest drag must
+    // not roll the jet hard. Old merge first (evidence), then new.
+    {
+      const oldR = joyRun('f22', 586, 0.35, 0, (x, y) => mergeOld(x, y));
+      const newR = joyRun('f22', 586, 0.35, 0, mergeNew);
+      check(
+        'JOY partial drag 0.35 (old merge, f22 586kt): bank@1s > 30 deg — reproduces the oversensitive roll',
+        Math.abs(oldR.bankAt1) > 30,
+        `old bank@1s=${oldR.bankAt1.toFixed(1)} deg`,
+      );
+      check(
+        'JOY partial drag 0.35 (new merge, f22 586kt): bank@1s <= 30 deg',
+        Math.abs(newR.bankAt1) <= 30,
+        `new bank@1s=${newR.bankAt1.toFixed(1)} deg (old=${oldR.bankAt1.toFixed(1)} deg)`,
+      );
+    }
+    // E4: full drag RIGHT at 287 kt still rolls decisively with the
+    // new merge (the scale must tame, not neuter, the stick).
+    {
+      const newR = joyRun('f22', 287, 1, 0, mergeNew);
+      check(
+        'JOY full drag RIGHT (new merge, f22 287kt): bank@1s >= 20 deg',
+        Math.abs(newR.bankAt1) >= 20,
+        `new bank@1s=${newR.bankAt1.toFixed(1)} deg maxG=${newR.maxG.toFixed(1)}`,
+      );
+    }
+    // E5: deadzone — a 0.05 resting offset produces no stick output.
+    {
+      const m = mergeNew(0.05, 0.05, 287);
+      check(
+        'JOY deadzone (new merge): 0.05 offset gives zero stick',
+        m.pitch === 0 && m.roll === 0,
+        `pitch=${m.pitch} roll=${m.roll}`,
+      );
+    }
+    // E6: the scale functions themselves — roll 1.0 at/below 150 kt,
+    // falling with speed, floored at 0.30; pitch squared, floored 0.12.
+    check(
+      'touchStickScale: 1.0 at <= 150 kt, ~0.52 at 287 kt, floored 0.30 at 586 kt',
+      touchStickScale(100) === 1 &&
+        touchStickScale(150) === 1 &&
+        Math.abs(touchStickScale(287) - 150 / 287) < 0.01 &&
+        touchStickScale(586) === 0.3,
+      `s(100)=${touchStickScale(100)} s(287)=${touchStickScale(287).toFixed(2)} s(586)=${touchStickScale(586)}`,
+    );
+    check(
+      'touchPitchScale: 1.0 at <= 150 kt, ~0.27 at 287 kt, floored 0.12 at 586 kt',
+      touchPitchScale(100) === 1 &&
+        touchPitchScale(150) === 1 &&
+        Math.abs(touchPitchScale(287) - (150 / 287) ** 2) < 0.01 &&
+        touchPitchScale(586) === 0.12,
+      `p(100)=${touchPitchScale(100)} p(287)=${touchPitchScale(287).toFixed(2)} p(586)=${touchPitchScale(586)}`,
+    );
+  }
 
   console.log(failures === 0 ? '\nALL PROBE CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

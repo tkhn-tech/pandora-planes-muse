@@ -357,6 +357,9 @@ export class HelicarrierController {
    */
   async build(): Promise<void> {
     let loaded = false;
+    // Pass 12: the FordDeck material found on the deck_top meshes
+    // (null when the GLB failed and the procedural hull is used).
+    let fordDeckMat: THREE.MeshStandardMaterial | null = null;
     if (this.options.modelGlbUri) {
       try {
         const obj = await loadGLB(this.options.modelGlbUri);
@@ -379,16 +382,69 @@ export class HelicarrierController {
         // (u', v') = (v, 1-u) at rotation +PI/2: the strip (image
         // x 0.375-0.70) lands at deck-width fraction 0.375-0.70,
         // centred, and the image top lands at the forward end.
+        //
+        // Pass 12 (live v4.6.1 FAIL — third time, same symptom):
+        // the pass-11 diagnosis was incomplete. The plates were not
+        // merely culled; they are BURIED under other geometry
+        // (measured from the baked GLB, raw-triangle raster, 1 m
+        // cells; the top-down raycast in probe-ford-texture
+        // reproduces it through the live build):
+        //  * detail_0: a 50-tri slab, top Y≈35.4 — 5.6 m ABOVE the
+        //    deck — first hit on 64% of the stern deck footprint;
+        //  * detail_7: a 72-tri slab, top Y≈30.25 — 0.55 m above the
+        //    deck — 36 m wide, running the full length of the ship;
+        //  * hull_35's top face at Y=29.78 sits at/above deck_top_35
+        //    (29.70–29.78), and hull_49's top at 29.69 is exactly
+        //    coplanar with deck_top_49 (29.69).
+        // Both slabs are giant flat shells (16,493 / 17,293 m² of
+        // XZ area from 50 / 72 triangles) in the converter's
+        // "detail" bucket — leftover interior layers the "stripped
+        // of interior" conversion should have removed, not designed
+        // structure (the real parts carry thousands of small tris).
+        // The "plain grey slab" the live check saw IS detail_0's /
+        // detail_7's flat FordDetailGrey top face, with the VTOL
+        // pads (deck + 0.55) poking just above detail_7 — exactly
+        // the reported picture. Fix: hide both slabs, lift the
+        // deck plates 0.15 m clear of the hull tops, and pull the
+        // plates toward the camera in depth (polygonOffset) so the
+        // coplanar hull top cannot win the depth test at range.
+        //  * FordDeck baseColorFactor is 0.169, so even where the
+        //    plate WAS visible the texture was multiplied ~6x
+        //    darker (white markings 230 → 39, deck grey 100 → 17):
+        //    near-black with no contrast. The material colour is
+        //    reset to white so the map shows at full brightness.
+        // The 0.15 m lift puts the visual plate just above the
+        // physical deck (deckLocalY, from the constant, is
+        // unchanged, so the collider and the jets' gear do not
+        // move — the wheels sink 0.15 m into the visual plate,
+        // invisible at game scale). The lift runs before
+        // deckRectsFromModel, which reads X/Z only, so the deck
+        // rectangles are unaffected; the bounding box is recomputed
+        // after the translate so later readers see fresh extents.
         obj.traverse((o) => {
           const mesh = o as THREE.Mesh;
-          if (!mesh.isMesh || !/deck_top/i.test(mesh.name)) return;
+          if (!mesh.isMesh) return;
+          if (/^detail_0$/i.test(mesh.name) || /^detail_7$/i.test(mesh.name)) {
+            mesh.visible = false;
+            return;
+          }
+          if (!/deck_top/i.test(mesh.name)) return;
           const mat = mesh.material as THREE.MeshStandardMaterial | null;
           if (!mat) return;
+          if (!fordDeckMat) fordDeckMat = mat;
           mat.side = THREE.DoubleSide;
           if (mat.map) {
             mat.map.center.set(0.5, 0.5);
             mat.map.rotation = Math.PI / 2;
           }
+          mat.color.setRGB(1, 1, 1);
+          mat.polygonOffset = true;
+          mat.polygonOffsetFactor = -2;
+          mat.polygonOffsetUnits = -2;
+          mat.needsUpdate = true;
+          const g = mesh.geometry;
+          g.translate(0, 0.15, 0);
+          g.computeBoundingBox();
         });
         // Deck top in group coords from the measured source value
         // (29.78 for the SHIELD model) and this load's actual bbox
@@ -416,8 +472,61 @@ export class HelicarrierController {
       this.buildPods();
     }
     this.buildWiresAndPads();
+    // Pass 12: lay the textured marking planes over the deck (see
+    // buildDeckMarkingPlanes) — only when the GLB supplied a FordDeck
+    // material (the procedural fallback hull has none).
+    if (fordDeckMat) this.buildDeckMarkingPlanes(fordDeckMat);
     this.buildDeckBody();
     this.reset();
+  }
+
+  /**
+   * Pass 12 (Ford deck markings — live v4.6.1 FAIL): hiding the
+   * detail_0/detail_7 slabs alone trades a grey deck for a deck
+   * with holes. The GLB's deck surface is incomplete even with the
+   * slabs hidden: the deck_top plates cover only 52% of the deck
+   * footprint (XZ 6047 + 2622 m² of 16608 m²) and 21% of the
+   * footprint is a through-hole with no surface at all (measured
+   * by 1 m raster over the raw triangles; the top-down raycast in
+   * probe-ford-texture reproduces it through the live build — deck
+   * first hit on only 43% of samples, 20% no hit at all). So one
+   * flat textured plane is laid per deck rectangle at deckLocalY +
+   * 0.20 — above the lifted plates (max +0.15), below the VTOL pads
+   * (+0.55) and wires (+0.60) — UV-mapped in the plates' own
+   * convention (u along deck length, v across width; measured
+   * corr +1.000 both, u increasing toward the bow, v toward
+   * starboard) and sharing the Ford texture, so the markings cover
+   * the whole deck including the holes and the hull-grey patches,
+   * and align exactly with the plates' markings where both exist.
+   * The material is a clone of FordDeck with a stronger
+   * polygonOffset (-4) so the planes win depth over the plates.
+   * Visual only: the physical deck (deckLocalY, the Rapier deck
+   * body) is unchanged, so the wheels sink 0.20 m into the visual
+   * plane — invisible at game scale, and far better than the jets
+   * clipping through a 5.6 m phantom slab (what texturing the
+   * detail_0 slab in place would have done).
+   */
+  private buildDeckMarkingPlanes(fordDeckMat: THREE.MeshStandardMaterial): void {
+    const mat = fordDeckMat.clone();
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -4;
+    mat.polygonOffsetUnits = -4;
+    for (const r of this.deckRects) {
+      const geo = new THREE.PlaneGeometry(r.hx * 2, r.hz * 2);
+      geo.rotateX(-Math.PI / 2);
+      const posA = geo.attributes.position as THREE.BufferAttribute;
+      const uvA = geo.attributes.uv as THREE.BufferAttribute;
+      for (let i = 0; i < posA.count; i++) {
+        const x = posA.getX(i) + r.cx;
+        const z = posA.getZ(i) + r.cz;
+        uvA.setXY(i, (z - (r.cz - r.hz)) / (2 * r.hz), (x - (r.cx - r.hx)) / (2 * r.hx));
+      }
+      uvA.needsUpdate = true;
+      const plane = new THREE.Mesh(geo, mat);
+      plane.name = 'deck_markings';
+      plane.position.set(r.cx, this.deckLocalY + 0.2, r.cz);
+      this.group.add(plane);
+    }
   }
 
   /**

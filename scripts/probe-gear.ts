@@ -40,6 +40,21 @@
 // Plus: F-35A gear down in VTOL hover, and F-18 gear down on the
 // helicarrier deck and stowed after a deck takeoff.
 //
+// Plus (pass 12): the LIVE RESTART — main.ts startRound() reuses the
+// player Aircraft when the jet key is unchanged and calls
+// attachModel() AGAIN, and attachModel() cloned a second model into
+// ac.group while `if (!this.rig)` left the rig bound to the FIRST
+// clone. The rig then animated an orphan model's gear while the
+// displayed model's gear stayed down, and the Gear button moved only
+// the orphan — the v4.6.1 live failure (gear down at 776–783 kt,
+// button clicks doing nothing) after three harness passes. This
+// section reproduces that exact path (fly, re-attach like startRound,
+// respawn like startRound, take off again, climb to 700+ kt through
+// a live origin shift) and asserts on the DISPLAYED model (ac.model,
+// never rig.bound), plus the manual override. A patch-spec simulation
+// at the end applies the attachModel fix's exact operations through
+// public API and re-flies, proving the fix's mechanism end to end.
+//
 // Usage: node_modules/.bin/esbuild scripts/probe-gear.ts
 //   --bundle --platform=node --format=esm --outfile=/tmp/probe-gear.mjs
 //   && node /tmp/probe-gear.mjs
@@ -130,6 +145,9 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import type { DeckProvider } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
+import { AircraftRigBindings } from '../src/aircraft/AircraftRigBindings';
+import { buildCockpit } from '../src/aircraft/CockpitBuilder';
+import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import {
   HelicarrierController,
   CARRIER_START_POS,
@@ -374,7 +392,8 @@ async function main(): Promise<void> {
       // Gear stations: the GLB's own stations for the F-18 (its gear
       // sits at the model's stations, not the physics posts — nose
       // z +3.57, mains z -2.26), the physics posts for the procedural
-      // jets (nose (0, +0.35L), mains (x = ±1.6, -0.15L)).
+      // jets (nose (0, gearPosts.noseZ ?? +0.35L), mains
+      // (x = ±(gearPosts.mainX ?? 1.6), gearPosts.mainZ ?? -0.15L)).
       const stations: Array<['gear_front' | 'gear_L' | 'gear_R', number, number]> = spec.includedGear
         ? spec.includedGear.map((st) => [
             st.slot,
@@ -382,9 +401,9 @@ async function main(): Promise<void> {
             (st.z0 + st.z1) / 2,
           ])
         : [
-            ['gear_front', 0, 0.35 * spec.length],
-            ['gear_L', -1.6, -0.15 * spec.length],
-            ['gear_R', 1.6, -0.15 * spec.length],
+            ['gear_front', 0, spec.gearPosts?.noseZ ?? 0.35 * spec.length],
+            ['gear_L', -(spec.gearPosts?.mainX ?? 1.6), spec.gearPosts?.mainZ ?? -0.15 * spec.length],
+            ['gear_R', spec.gearPosts?.mainX ?? 1.6, spec.gearPosts?.mainZ ?? -0.15 * spec.length],
           ];
       for (const [slot, sx, sz] of stations) {
         const leg = rig.bound[slot];
@@ -434,6 +453,32 @@ async function main(): Promise<void> {
           helmet ? `visible=${helmet.visible}` : 'helmet002 not found',
         );
       }
+    }
+
+    // --- F-35A cockpit measurement (open item, pass 12 — INFO only,
+    // not a check: the fix lives in CockpitBuilder, which this probe
+    // does not own). buildCockpit() is what main.ts calls after
+    // attachModel; on the canopy-less F-35A the headrest / helmet
+    // tops must sit at or below the fuselage top, or they read as a
+    // black box on the spine from outside.
+    if (key === 'f35a') {
+      buildCockpit(ac.group, key);
+      const topOf = (name: string): number => {
+        const o = ac.group.getObjectByName(name);
+        return o ? new THREE.Box3().setFromObject(o).max.y : NaN;
+      };
+      let fusTop = -Infinity;
+      ac.model!.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh) return;
+        if (o.name.startsWith('cockpit_') || o.name.startsWith('gear_')) return;
+        const bb = new THREE.Box3().setFromObject(m);
+        const cz = (bb.min.z + bb.max.z) / 2;
+        if (cz >= 3 && cz <= 7) fusTop = Math.max(fusTop, bb.max.y);
+      });
+      console.log(
+        `INFO  f35a cockpit (open item): headrestTop=${topOf('cockpit_headrest').toFixed(2)} helmetTop=${topOf('cockpit_helmet').toFixed(2)} fuselageTop=${fusTop.toFixed(2)} — headrest/helmet above the fuselage top poke through the spine (no canopy)`,
+      );
     }
 
     // --- Spawn on Alpha: gear down, visible, belly on the physics belly.
@@ -705,6 +750,302 @@ async function main(): Promise<void> {
       ac.alive && !ac.gear && rig.gearDeploy < 0.05 && !gearVisible(ac),
       `gear=${ac.gear} deploy=${rig.gearDeploy.toFixed(2)} visible=${gearVisible(ac)} agl=${agl(ac).toFixed(1)}`,
     );
+    for (const h of ac.colliderHandles()) owners.delete(h);
+    ac.dispose();
+  }
+
+  // --- LIVE RESTART (v4.6.1 live failure, 2026-11-20): main.ts
+  // startRound() reuses the player Aircraft when the jet key is
+  // unchanged and calls attachModel() again (main.ts ~1337), then
+  // sets gear = true / clearGearManual() (~1421) and respawns on
+  // Alpha. attachModel() cloned a SECOND model into ac.group and
+  // `if (!this.rig)` kept the rig bound to the FIRST clone — so the
+  // rig animated an orphan's gear while the displayed model's gear
+  // never moved, and setGearManual (the Gear button) moved only the
+  // orphan. Single-attach probes passed three times; live (6 rounds,
+  // same jet) failed at 776–783 kt with button clicks doing nothing.
+  // This section reproduces that exact path and asserts on the
+  // DISPLAYED model (ac.model), never on rig.bound — the rig's own
+  // nodes lie about the bug. fa18 is the reported jet; f22 is the
+  // control (its procedural legs live in the rig, so after a
+  // re-attach the displayed model has NO gear at all).
+  {
+    const origin = new FloatingOrigin(2000);
+    // Ground truth: the gear nodes of the model actually on screen.
+    const displayedGearVisible = (ac: Aircraft): boolean => {
+      const m = ac.model;
+      if (!m) return false;
+      let any = false;
+      m.traverse((o) => {
+        if (
+          o.name === 'gear_front' ||
+          o.name === 'gear_L' ||
+          o.name === 'gear_R' ||
+          o.name.startsWith('gear_leg_')
+        ) {
+          if (o.visible) any = true;
+        }
+      });
+      return any;
+    };
+    const displayedGearPresent = (ac: Aircraft): boolean => {
+      const m = ac.model;
+      if (!m) return false;
+      let any = false;
+      m.traverse((o) => {
+        if (
+          o.name === 'gear_front' ||
+          o.name === 'gear_L' ||
+          o.name === 'gear_R' ||
+          o.name.startsWith('gear_leg_')
+        )
+          any = true;
+      });
+      return any;
+    };
+    const takeoffClimb = (ac: Aircraft): boolean => {
+      ac.brake = false;
+      ac.thrTarget = 1;
+      const startY = ac.pos.y;
+      let t = 0;
+      let pi = 0;
+      let climbed = false;
+      while (t < 40 && !climbed) {
+        const rawDt = DT_PATTERN[pi % DT_PATTERN.length]!;
+        pi++;
+        const sub = Math.ceil(rawDt / 0.05);
+        const dt = rawDt / sub;
+        for (let s = 0; s < sub; s++) substep(ac, dt);
+        t += rawDt;
+        if (ac.onSurface && ac.ias > 55) ac.pitchIn = -1;
+        else if (!ac.onSurface && ac.pos.y < startY + 15) ac.pitchIn = -0.3;
+        else if (!ac.onSurface && agl(ac) < 110) ac.pitchIn = -0.3;
+        else ac.pitchIn = 0;
+        if (!ac.onSurface && agl(ac) > 110) climbed = true;
+        if (!ac.alive) break;
+      }
+      ac.pitchIn = 0;
+      stepFor(ac, 3);
+      return ac.alive && climbed;
+    };
+
+    for (const key of ['fa18', 'f22'] as const) {
+      const spec = SPECS[key]!;
+      const ac = new Aircraft({
+        scene,
+        world,
+        spec,
+        isPlayer: true,
+        modelKey: spec.modelKey,
+        deck: deckProvider,
+      });
+      ac.terrainHeightAt = (x, z) => heightfieldHeightAt(heights, res, x, z);
+      for (const h of ac.colliderHandles()) owners.set(h, ac);
+      await ac.attachModel();
+      check(
+        `${key}-restart: real GLB loaded (not the procedural fallback)`,
+        ac.modelStatus === 'ok',
+        `modelStatus=${ac.modelStatus} error=${ac.modelError ?? 'none'}`,
+      );
+      // Sanity, single attach: takeoff + stow, as the old probe did.
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
+      ac.brake = true;
+      ac.thrTarget = 0;
+      stepFor(ac, 2);
+      const flewOnce = takeoffClimb(ac);
+      check(
+        `${key}-restart: gear stows on the FIRST round (single attach, sanity)`,
+        flewOnce && !ac.gear && !displayedGearVisible(ac),
+        `gear=${ac.gear} displayedVisible=${displayedGearVisible(ac)} agl=${agl(ac).toFixed(1)}`,
+      );
+
+      // The live restart: startRound re-attaches on the SAME Aircraft,
+      // then gear = true / clearGearManual() and a respawn on Alpha.
+      await ac.attachModel();
+      ac.gear = true;
+      ac.clearGearManual();
+      check(
+        `${key}-restart: rig is bound to the DISPLAYED model after re-attach`,
+        !!ac.rig && ac.rig.group === ac.model,
+        `rig.group===model: ${!!ac.rig && ac.rig.group === ac.model}`,
+      );
+      check(
+        `${key}-restart: exactly one model under the aircraft group (no orphan clone)`,
+        ac.group.children.filter((c) => c === ac.model).length === 1 &&
+          ac.group.children.length === 1,
+        `group children=${ac.group.children.length}`,
+      );
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
+      ac.brake = true;
+      ac.thrTarget = 0;
+      stepFor(ac, 2);
+      check(
+        `${key}-restart: gear DOWN and visible on the DISPLAYED model after restart respawn`,
+        ac.alive && ac.gear && displayedGearPresent(ac) && displayedGearVisible(ac) && ac.onSurface,
+        `gear=${ac.gear} present=${displayedGearPresent(ac)} visible=${displayedGearVisible(ac)} onSurf=${ac.onSurface}`,
+      );
+      const flewTwice = takeoffClimb(ac);
+      check(
+        `${key}-restart: gear STOWED on the DISPLAYED model after the restart round's takeoff`,
+        flewTwice && !ac.gear && !displayedGearVisible(ac),
+        `gear=${ac.gear} rigDeploy=${ac.rig?.gearDeploy.toFixed(2)} displayedVisible=${displayedGearVisible(ac)} agl=${agl(ac).toFixed(1)}`,
+      );
+
+      // High-speed leg at the live failure point (776–783 kt):
+      // teleport to level flight at 400 m/s (~778 kt) at 2,000 m and
+      // fly the live loop for 10 s, applying a live origin shift
+      // whenever the 2 km threshold is crossed (the shift moves the
+      // Rapier body and ac.pos; the probe's fixed heightfield is
+      // read in the shifted frame, which at 2,000 m cannot touch
+      // the gear gates — agl stays >> 100 m either way).
+      {
+        origin.registerBody(ac.body);
+        origin.registerVector(ac.pos);
+        const hdgRad = (alpha.hdg * Math.PI) / 180;
+        const fwdX = Math.sin(hdgRad);
+        const fwdZ = Math.cos(hdgRad);
+        const tx = alpha.x;
+        const ty = alpha.elev + 2000;
+        const tz = alpha.z;
+        const spd = 400;
+        const half = hdgRad / 2;
+        ac.body.setTranslation({ x: tx, y: ty, z: tz }, true);
+        ac.body.setRotation({ x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) }, true);
+        ac.body.setLinvel({ x: fwdX * spd, y: 0, z: fwdZ * spd }, true);
+        ac.pos.set(tx, ty, tz);
+        ac.vel.set(fwdX * spd, 0, fwdZ * spd);
+        ac.quat.set(0, Math.sin(half), 0, Math.cos(half));
+        ac.pitchIn = 0;
+        ac.rollIn = 0;
+        ac.yawIn = 0;
+        ac.thrTarget = 1;
+        let peakIas = 0;
+        let shifts = 0;
+        for (let s = 0; s < 10; s++) {
+          stepFor(ac, 1);
+          peakIas = Math.max(peakIas, ac.ias);
+          const sh = origin.shiftIfNeeded(ac.pos);
+          if (sh) {
+            origin.applyShift(sh);
+            shifts++;
+          }
+        }
+        check(
+          `${key}-restart: gear STAYS stowed at 700+ kt after a restart (live failure point)`,
+          ac.alive && peakIas > 360 && !ac.gear && !displayedGearVisible(ac),
+          `peakIas=${peakIas.toFixed(0)} m/s (${(peakIas * 1.944).toFixed(0)} kt) endIas=${ac.ias.toFixed(0)} m/s alt=${(ac.pos.y * 3.28084).toFixed(0)} ft gear=${ac.gear} displayedVisible=${displayedGearVisible(ac)} originShifts=${shifts} cumulativeShift=${origin.cumulativeShift.x.toFixed(0)},${origin.cumulativeShift.z.toFixed(0)}`,
+        );
+        // Manual override, exactly as the Gear button does it
+        // (main.ts gearBtn -> setGearManual(!gear)): click 1 deploys,
+        // click 2 stows. Live, both clicks did nothing.
+        ac.setGearManual(true);
+        stepFor(ac, 3);
+        check(
+          `${key}-restart: Gear button click 1 DEPLOYS the displayed gear in flight`,
+          ac.alive && ac.gear && displayedGearVisible(ac),
+          `gear=${ac.gear} displayedVisible=${displayedGearVisible(ac)}`,
+        );
+        ac.setGearManual(false);
+        stepFor(ac, 3);
+        check(
+          `${key}-restart: Gear button click 2 STOWS the displayed gear in flight`,
+          ac.alive && !ac.gear && !displayedGearVisible(ac),
+          `gear=${ac.gear} rigDeploy=${ac.rig?.gearDeploy.toFixed(2)} displayedVisible=${displayedGearVisible(ac)}`,
+        );
+        origin.unregisterBody(ac.body);
+        origin.unregisterVector(ac.pos);
+      }
+      for (const h of ac.colliderHandles()) owners.delete(h);
+      ac.dispose();
+    }
+  }
+
+  // --- PATCH-SPEC SIMULATION (fa18 only): prove the attachModel fix's
+  // mechanism end to end WITHOUT editing the read-only controller — it
+  // applies the patch's exact operations through public API (remove
+  // the orphan clone from ac.group, rebuild the rig on ac.model) and
+  // re-flies. When the real patch is applied, the restart section
+  // above already passes and there is no stale model here, so this
+  // block detects that and skips. It is a mechanism proof, not a
+  // substitute for the patch.
+  {
+    const spec = SPECS['fa18']!;
+    const ac = new Aircraft({
+      scene,
+      world,
+      spec,
+      isPlayer: true,
+      modelKey: spec.modelKey,
+      deck: deckProvider,
+    });
+    ac.terrainHeightAt = (x, z) => heightfieldHeightAt(heights, res, x, z);
+    for (const h of ac.colliderHandles()) owners.set(h, ac);
+    await ac.attachModel();
+    ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
+    ac.brake = true;
+    ac.thrTarget = 0;
+    stepFor(ac, 2);
+    await ac.attachModel(); // the live restart, as above
+    ac.gear = true;
+    ac.clearGearManual();
+    const stale = ac.group.children.find((c) => c !== ac.model) ?? null;
+    if (stale) {
+      // attachModel patch, verbatim in effect: drop the orphan clone,
+      // rebuild the rig on the displayed model.
+      ac.group.remove(stale);
+      ac.rig = new AircraftRigBindings(ac.model!, spec);
+      check(
+        'fa18-patch-sim: stale orphan removed and rig rebuilt on the displayed model',
+        ac.group.children.length === 1 && ac.rig.group === ac.model,
+        `group children=${ac.group.children.length} rig.group===model: ${ac.rig.group === ac.model}`,
+      );
+      ac.resetAt(alpha.x, alpha.elev + 2.25, alpha.z, alpha.hdg);
+      ac.brake = true;
+      ac.thrTarget = 0;
+      stepFor(ac, 2);
+      ac.brake = false;
+      ac.thrTarget = 1;
+      const startY = ac.pos.y;
+      let t = 0;
+      let pi = 0;
+      let climbed = false;
+      while (t < 40 && !climbed) {
+        const rawDt = DT_PATTERN[pi % DT_PATTERN.length]!;
+        pi++;
+        const sub = Math.ceil(rawDt / 0.05);
+        const dt = rawDt / sub;
+        for (let s = 0; s < sub; s++) substep(ac, dt);
+        t += rawDt;
+        if (ac.onSurface && ac.ias > 55) ac.pitchIn = -1;
+        else if (!ac.onSurface && ac.pos.y < startY + 15) ac.pitchIn = -0.3;
+        else if (!ac.onSurface && agl(ac) < 110) ac.pitchIn = -0.3;
+        else ac.pitchIn = 0;
+        if (!ac.onSurface && agl(ac) > 110) climbed = true;
+        if (!ac.alive) break;
+      }
+      ac.pitchIn = 0;
+      stepFor(ac, 3);
+      const displayedVisible = ((): boolean => {
+        let any = false;
+        ac.model!.traverse((o) => {
+          if (
+            (o.name === 'gear_front' || o.name === 'gear_L' || o.name === 'gear_R') &&
+            o.visible
+          )
+            any = true;
+        });
+        return any;
+      })();
+      check(
+        'fa18-patch-sim: gear STOWED on the displayed model after the patch operations + takeoff',
+        ac.alive && climbed && !ac.gear && !displayedVisible,
+        `gear=${ac.gear} displayedVisible=${displayedVisible} agl=${agl(ac).toFixed(1)}`,
+      );
+    } else {
+      console.log(
+        'INFO  fa18-patch-sim: no stale model (the attachModel patch is already applied) — skipped',
+      );
+    }
     for (const h of ac.colliderHandles()) owners.delete(h);
     ac.dispose();
   }

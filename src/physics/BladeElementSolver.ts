@@ -129,6 +129,19 @@ const CNR = -0.2; // yaw damping, per rad
  *  passes — drives the nose down far enough to kill the lift
  *  and dive. Kept for reference; the moment itself is unused. */
 const STALL_NOSE_DOWN_K = 0.03;
+/** Hands-off 1g auto-trim gain (pass 12): per radian of AoA error
+ *  above the 1g AoA, radians of elevator trim (nose-down when the
+ *  AoA is too high). See the trim block in solve(): the BET's
+ *  geometric trim AoA (~1-4 deg, set by the station layout) is
+ *  speed-blind, so at 780 kt it holds ~4 deg AoA and makes ~11 g —
+ *  a hands-off steep dive pulls itself out. A real fighter's FCS /
+ *  trim holds 1 g hands-off; this proportional trim does the same.
+ *  Gain 2.0: the elevator moves the trim AoA ~3.4 deg per degree
+ *  of deflection, so the closed-loop trim AoA lands within ~1 deg
+ *  of the 1g AoA; the deflection is capped at the scheduled
+ *  elevator authority, so the trim can never exceed what the
+ *  pilot's own stick commands. */
+const TRIM_K = 2.0;
 /** Dying nose-down moment coefficient (damage-model §6). Tried
  *  and found ineffective — the tail's moment in the flat spin
  *  overwhelms a 0.05·q·S·cbar moment, so dying is a rate bias
@@ -549,7 +562,69 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       ELEV_MIN_DEG * D2R,
       ELEV_MAX_DEG * D2R,
     );
-    const elevDeflect = pitchIn * elevMax * hydroPitch * auth.pitch;
+    let elevDeflect = pitchIn * elevMax * hydroPitch * auth.pitch;
+    // --- Hands-off 1g auto-trim (pass 12) ---
+    // The BET's geometric trim AoA (~1-4 deg, set by the station
+    // layout) is speed-blind: at 780 kt it holds ~4 deg AoA and
+    // makes ~11 g, so a hands-off steep dive pulls itself out
+    // (probe-crash-vfx D2: F-22 levelled off at 1527 m AGL,
+    // F-18 at 2.3 g). A real fighter's FCS trims to 1 g hands-off,
+    // so when the stick is neutral, the wings are level, the jet
+    // is unstalled and not dying and not in VTOL hover, add a
+    // proportional elevator trim driving the AoA toward the 1g
+    // AoA — the AoA at which CL = m·g/(q·S_lift), found by
+    // bisection on the CL curve and clamped to the peak AoA.
+    // At 150 kt the 1g AoA is ~11 deg (holds level); at 780 kt
+    // it is ~0.4 deg (the dive stays ballistic and hits the
+    // ground). Capped at the scheduled elevator authority, so
+    // the trim can never exceed what the stick commands, and
+    // degraded with the hydraulics. Off whenever the pilot is
+    // pulling (turns/stall tests own the elevator), the jet is
+    // banked (a turn needs >1 g), stalled (the nose-drop owns
+    // that regime), dying, or slow (AoA undefined below 30 m/s).
+    // And off ON THE GROUND (heightAboveGround <= 5 m — the
+    // gear rest height is 2.2 m): the trim's nose-up drive
+    // during the takeoff roll rotated the F-35A before Vr, it
+    // lifted off below flying speed, sank back at -12.4 m/s
+    // and crashed "hard landing" on the runway at t=2.8 s
+    // (probe-handsoff Alpha/f35a). A trim is a flight trim.
+    // And off with the GEAR DOWN (pass 12, coordinator): gear down
+    // is takeoff/landing configuration, where the pilot (or the
+    // landing autopilot) owns the elevator — on a carrier approach
+    // at 55 m/s the 1g AoA is ~15-20 deg, so the trim drove the
+    // nose up against the ~3 deg approach law and the jet floated
+    // 45 m long past the last wire (probe-deck-roll return3). In
+    // clean cruise (gear up) the trim still owns the dive regime.
+    if (
+      Math.abs(pitchIn) < 0.25 &&
+      Math.abs(new THREE.Euler().setFromQuaternion(quat, 'YXZ').z) < 20 * D2R &&
+      !this.stalled &&
+      !state.dying &&
+      state.vectorDeg < 70 &&
+      v > 30 &&
+      (state.heightAboveGround ?? 0) > 5 &&
+      !state.gearDown &&
+      state.archetype !== 'rotary'
+    ) {
+      const clReq = (m * G) / Math.max(q * S_lift, 1e-6);
+      // The 1g AoA by bisection on the CL curve over [-20, peak]:
+      // CL_0 is 0.15, so at high speed the 1g AoA is NEGATIVE
+      // (F-22 at 780 kt: ~-1.7 deg) — a [0, peak] search floors
+      // aoaReq at 0, where the wing still makes ~4.7 g and the
+      // dive pulls out anyway (D2 f22 pre-fix: AoA settled at
+      // 0.6 deg, 5.4 deg/s pull-out). At low speed clReq exceeds
+      // the peak and the search saturates at peakAoA (the stall
+      // gate then owns the regime).
+      let lo = -20;
+      let hi = curve.peakAoA;
+      for (let i = 0; i < 40; i++) {
+        const mid = 0.5 * (lo + hi);
+        if (clFromCurve(mid, (state.flapsDeg ?? 0) / 30, curve) < clReq) lo = mid;
+        else hi = mid;
+      }
+      const aoaReq = 0.5 * (lo + hi);
+      elevDeflect += clamp((aoaDeg - aoaReq) * D2R * TRIM_K, -elevMax, elevMax) * hydroPitch;
+    }
     const ailDeflect = rollIn * AIL_DEFLECT_DEG * D2R;
     const rudDeflect = -yawIn * RUD_DEFLECT_DEG * D2R;
     // F-22 TVC: the nozzle angle follows the pitch input (±20°).

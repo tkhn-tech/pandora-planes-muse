@@ -19,6 +19,16 @@ export interface HudGameState {
   /** True when the jet is below the min-release altitude for its dive
    *  (CCIP, 4 g pull-out) — the HUD shows PULL UP. */
   belowMinReleaseAlt?: boolean;
+  /** Carrier bearing/distance (pass 12): absolute + relative bearing
+   *  and distance to the primary carrier, its heading, and the
+   *  deck-relative heading while parked on the deck. */
+  carrier?: {
+    absDeg: number;
+    relDeg: number;
+    distM: number;
+    carrierHdgDeg: number;
+    deckRelHdgDeg: number | null;
+  };
 }
 
 export interface MinimapEntities {
@@ -32,6 +42,16 @@ export interface MinimapEntities {
 }
 
 const R2D = 180 / Math.PI;
+
+/** The ROTATE cue's text (verbatim from index.html). FlightHUD owns
+ *  the textContent now (pass 12): the cue used to keep its static
+ *  HTML text in the DOM while hidden (opacity 0), so a DOM read saw
+ *  "ROTATE — ..." in flight and while dead even though nothing was
+ *  visible — the v4.6.1 live check read it as present. update()
+ *  writes the text only while the cue is shown and clears it when
+ *  hidden, so the DOM and the pixels agree; clearTransient() clears
+ *  it too, and it is restored the next time the cue shows. */
+const ROTATE_CUE_TEXT = 'ROTATE — HOLD ↑ / PULL BACK';
 
 function fmtTime(s: number): string {
   const m = Math.floor(s / 60);
@@ -57,7 +77,7 @@ export class FlightHUD {
 
   constructor() {
     const ids = [
-      'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudAoA', 'hudBank', 'hudG',
+      'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudCarrier', 'hudAoA', 'hudBank', 'hudG',
       'hudFuel', 'hudWpn', 'hudScore', 'hudVec', 'vecPill', 'vecRow',
       'miniKills', 'miniTraps', 'miniTime', 'warn', 'lockInd', 'pipper',
       'ccip', 'rotateCue', 'toast', 'toastTitle', 'toastSub', 'debug',
@@ -79,6 +99,14 @@ export class FlightHUD {
     set('hudVsi', String(Math.round(ac.vsi * M2FT * 60)));
     const hdg = ((Math.atan2(ac.fwd().x, ac.fwd().z) * R2D) % 360 + 360) % 360;
     set('hudHdg', String(Math.round(hdg)).padStart(3, '0') + '°');
+    if (game.carrier) {
+      const c = game.carrier;
+      const rel = Math.round(c.relDeg);
+      const distTxt = c.distM >= 1000 ? `${(c.distM / 1000).toFixed(1)}km` : `${Math.round(c.distM)}m`;
+      let txt = `${rel >= 0 ? `+${rel}` : `${rel}`}° ${distTxt}`;
+      if (c.deckRelHdgDeg !== null) txt += ` · deck ${Math.round(c.deckRelHdgDeg)}°`;
+      set('hudCarrier', txt);
+    }
     set('hudAoA', Math.round(ac.aoa) + '°');
     // Bank indicator (Issue 1): the ACTUAL bank from the physics
     // quaternion (Euler YXZ z; positive = RIGHT bank — the right wing
@@ -111,7 +139,15 @@ export class FlightHUD {
     // true while airborne; putting the toggle first means a throw in
     // a later section can no longer freeze the cue ON either.
     const rc = this.el['rotateCue'];
-    if (rc) rc.classList.toggle('show', ac.alive && ac.rotateCue);
+    if (rc) {
+      const show = ac.alive && ac.rotateCue;
+      rc.classList.toggle('show', show);
+      // Pass 12: the text exists in the DOM only while the cue is
+      // shown — a hidden cue's static text used to linger in the DOM
+      // and read as present in flight / while dead (live finding 4's
+      // rule, same as #warn). Restored whenever the cue shows again.
+      rc.textContent = show ? ROTATE_CUE_TEXT : '';
+    }
     const fuelEl = this.el['hudFuel'];
     if (fuelEl?.parentElement) {
       fuelEl.parentElement.classList.toggle('warn', ac.fuel < 0.2);
@@ -385,10 +421,11 @@ export class FlightHUD {
     }
     const rc = this.el['rotateCue'];
     if (rc) {
-      // Hide only — do NOT clear textContent: the ROTATE cue's text
-      // is static HTML ("ROTATE — HOLD ↑ / PULL BACK"), not set by
-      // JS, so clearing it would wipe the cue permanently.
+      // Hide AND clear the text (pass 12): update() restores the
+      // text the next time the cue shows, so clearing it here cannot
+      // wipe the cue permanently.
       rc.classList.remove('show');
+      rc.textContent = '';
     }
     if (this.toastTimer) {
       clearTimeout(this.toastTimer);

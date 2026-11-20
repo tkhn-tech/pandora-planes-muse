@@ -124,13 +124,15 @@ const DEFAULT_CL_CURVE = {
 const PITCH_RATE_DEG = 55;
 const YAW_RATE_DEG = 22;
 const ENGINE_OUT_YAW_DEG = 5; // single-engine-out yaw, deg/s
-const STALL_NOSE_DROP = 18.0; // v2: pitchRate -= 0.5·dt·8 per step; raised
-// from 4.0 (pass 4): the stall-down mush held AoA ~35 deg and the jet
-// took >60 s to reach the ground (final y 185.2, 9 m short) — the
-// 4.0 bias is only 4.0/60 = 0.067 rad/s (3.8 deg/s). At 8.0 the jet
-// recovered (AoA 0) and landed gently instead of crashing. 18.0 gives
-// 0.3 rad/s, matching the BET stall nose-drop rate, so the jet dives
-// and crashes inside the probe's 60 s window.
+const STALL_NOSE_DROP_RATE = 0.3; // pass 12: nose-drop RATE, rad/s.
+// Was STALL_NOSE_DROP = 18.0 multiplied by dt at the use site:
+// at the fixed dt=1/60 that gave 18/60 = 0.3 rad/s (the value the
+// comment quoted), but at a live dt=0.05 s it gave 0.9 rad/s — 3x
+// stronger at low FPS. The BET stall nose-drop is a dt-independent
+// rate bias (BET_STALL_NOSE_DROP_RATE 0.3 in the controller); the
+// curve solver's must be too, so the stall break is identical at
+// fixed and live step sizes. The (1 + (aoaDeg - peak)/10) growth
+// past the peak is unchanged.
 const ASYM_ROLL = 0.9; // roll rate per unit wing damage, × qAuth
 const WING_DMG_ROLL_AUTHORITY = 0.5; // roll authority loss per unit damage
 const ENGINE_DMG_THRUST = 0.7; // thrust loss per unit engine damage
@@ -441,7 +443,7 @@ export class CurveAerodynamicsSolver implements IAerodynamicsSolver {
     // is flyable, the break is past the peak.
     if (this.stalled && aoaDeg > curve.peakAoA) {
       pitchRate +=
-        STALL_NOSE_DROP * dt * (1 + (aoaDeg - curve.peakAoA) / 10);
+        STALL_NOSE_DROP_RATE * (1 + (aoaDeg - curve.peakAoA) / 10);
     }
     // Spin (BET §2): a yaw-rate state, not a lateral drift. Builds
     // while stalled and yawed; NATOPS recovery (neutral controls, or

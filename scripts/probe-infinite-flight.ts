@@ -2,8 +2,8 @@
 // and procedurally generating.
 //
 // Drives TerrainStreamer DIRECTLY (not through main.ts): a kinematic
-// flyer goes 40 km east from Alpha at 150 m/s, y=500, then 18 km back
-// west and 18 km east again (76 km total), through origin shifts and
+// flyer goes 40 km east from Alpha at 150 m/s, y=500, then 21 km back
+// west and 21 km east again (82 km total), through origin shifts and
 // chunk boundaries, with the REAL FloatingOrigin (shift check at frame
 // start, exactly like main.ts animate()) and a REAL Rapier world
 // (raycasts prove the colliders are really under the jet).
@@ -17,7 +17,8 @@
 //     chunk owned by the generator), and a Rapier raycast down agrees
 //     with heightAt (collider == query surface).
 //  3. No crash / edge behaviour: no NaN, no missing chunk, no exception
-//     over 76 km; geometry count stays within the window.
+//     over 82 km; geometry count stays within the window
+//     ((2*STREAM_RADIUS+1)^2 chunks).
 //  4. The streamer agrees with the old world where they overlap:
 //     heightAt == PandoraWorldGenerator.heightfieldHeightAt inside the
 //     central 12 km block, and no cliff at the old map edge (seam).
@@ -89,7 +90,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import { PandoraWorldGenerator } from '../src/world/PandoraWorldGenerator';
-import { TerrainStreamer, STREAM_CHUNK_SIZE } from '../src/world/TerrainStreamer';
+import { TerrainStreamer, STREAM_CHUNK_SIZE, STREAM_RADIUS } from '../src/world/TerrainStreamer';
 import { generateChunkHeights, heightAt, RUNWAY_TABLE } from '../src/world/PandoraTerrainWorker';
 
 let failures = 0;
@@ -341,7 +342,7 @@ async function main(): Promise<void> {
       `created=${createdBeforeReturn} retired=${retiredBeforeReturn}`,
   );
 
-  flyLeg('WEST', -1, 18000); // chunk (12,-1) is 6 chunks behind -> evicted (evict radius 5)
+  flyLeg('WEST', -1, 21000); // chunk (12,-1) is 7 chunks behind -> evicted (evict radius STREAM_RADIUS+3 = 6). Pass 12: STREAM_RADIUS went 2 -> 3 to close the no-mesh band inside the 11 km fog far, so the west leg went 18 -> 21 km — at radius 2 the chunk was 6 behind (evict radius 5) and evicted; at radius 3 it is still 6 behind (evict radius 6) and NOT evicted.
   const westEndOrigX = pos.x + origin.cumulativeShift.x;
   const evicted = streamer.heightsAt(37000, -1800) === null;
   console.log(
@@ -349,7 +350,7 @@ async function main(): Promise<void> {
       `created=${streamer.createdChunks} retired=${streamer.retiredChunks}`,
   );
 
-  flyLeg('EAST-RETURN', +1, 18000); // re-enter chunk (12,-1): must regenerate
+  flyLeg('EAST-RETURN', +1, 21000); // re-enter chunk (12,-1): must regenerate
   const retEndOrigX = pos.x + origin.cumulativeShift.x;
   const regen = streamer.heightsAt(37000, -1800);
   let regenSame = false;
@@ -364,7 +365,7 @@ async function main(): Promise<void> {
   }
 
   console.log('--- flight summary ---');
-  console.log(`  distance flown: ${(totalDist / 1000).toFixed(1)} km (east 40 + west 18 + east-return 18)`);
+  console.log(`  distance flown: ${(totalDist / 1000).toFixed(1)} km (east 40 + west 21 + east-return 21)`);
   console.log(`  origin shifts crossed: ${shifts}`);
   console.log(`  chunk boundaries crossed: ${chunkCrossings}`);
   console.log(`  max per-step original-frame position delta: ${maxStepDelta.toFixed(3)} m (expected v*dt = ${stepLen.toFixed(3)} m)`);
@@ -372,7 +373,7 @@ async function main(): Promise<void> {
   console.log(`  terrain heightAt range: ${minH.toFixed(1)} .. ${maxH.toFixed(1)} m (analytic range is -25..750)`);
   console.log(`  max |raycast - heightAt|: ${maxRayDiff.toFixed(3)} m at ${worstRayAt}`);
   console.log(`  chunks created: ${streamer.createdChunks} (before return leg: ${createdBeforeReturn}), retired: ${streamer.retiredChunks} (before: ${retiredBeforeReturn})`);
-  console.log(`  max geometry chunks loaded at once: ${maxGeom} (window is 25, central block excluded)`);
+  console.log(`  max geometry chunks loaded at once: ${maxGeom} (window is ${(2 * STREAM_RADIUS + 1) ** 2}, central block excluded)`);
   console.log(`  collider handles: added=${added.length} removed=${removed.length} live=${streamer.terrainColliderHandles().length}`);
   console.log(`  return-leg end: origX=${retEndOrigX.toFixed(0)}`);
 
@@ -382,7 +383,11 @@ async function main(): Promise<void> {
   check('no holes: chunk under the player always has geometry (outside the central block)', holeCount === 0, `geometry holes=${holeCount}`);
   check('no void: Rapier raycast down hits terrain at every sample', voidRayCount === 0, `void raycasts=${voidRayCount}`);
   check('Rapier collider agrees with the height query everywhere', maxRayDiff < 0.5, `max |raycast - heightAt| = ${maxRayDiff.toFixed(3)} m at ${worstRayAt}`);
-  check('window bounded: never more than 25 geometry chunks loaded', maxGeom <= 25, `max=${maxGeom}`);
+  // Pass 12: the window bound is (2*STREAM_RADIUS+1)^2 — 25 at radius
+  // 2, 49 at radius 3. STREAM_RADIUS went 2 -> 3 to close the
+  // no-mesh band inside the 11 km fog far (Worker F: 41% of the
+  // ground disc within 11 km of the carrier had no mesh).
+  check('window bounded: never more than (2*STREAM_RADIUS+1)^2 geometry chunks loaded', maxGeom <= (2 * STREAM_RADIUS + 1) ** 2, `max=${maxGeom} window=${(2 * STREAM_RADIUS + 1) ** 2}`);
   check('collider lifecycle: every added handle is either live or removed', added.length === streamer.terrainColliderHandles().length + removed.length, `added=${added.length} live=${streamer.terrainColliderHandles().length} removed=${removed.length}`);
   check('chunk (12,-1) was evicted while flying away', evicted, `heights cached after west leg: ${!evicted}`);
   check('evicted chunk regenerates IDENTICALLY on re-entry (exact float equality)', regenSame, snapshot ? `${snapshot.length} samples compared` : 'no snapshot');

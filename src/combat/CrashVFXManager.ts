@@ -304,8 +304,20 @@ export class CrashVFXManager {
         // Damping bleeds the launch speed over a few seconds while
         // the piece still bounces/rolls; gravity keeps a piece on a
         // steep slope sliding slowly downhill instead of stopping.
+        // Pass 12: angular damping 0.5 -> 2.0 and real collider
+        // friction, for the probe flake (probe-crash-vfx debris
+        // resting at +10 s, 5/6): a long torn panel (F-22 torn
+        // wing 6.1 x 0.3 x 4.18 m) tumbled onto its end and sat
+        // propped 2.01 m above the ground, essentially at rest
+        // (vy -0.17, angular 0.02) but never lying flat, and the
+        // zero-friction ground let it slide downhill at ~1.4 m/s
+        // (terminal slide speed ~ g*sin(slope)/damping). Higher
+        // angular damping kills the tumble so the piece lies flat;
+        // the collider friction (Max combine rule — the terrain
+        // collider uses Min with friction 0, so Max wins and the
+        // pair friction is max(0, 0.8) = 0.8) stops the slide.
         .setLinearDamping(0.8)
-        .setAngularDamping(0.5)
+        .setAngularDamping(2.0)
         .setAngvel({
           x: (Math.random() - 0.5) * 4,
           y: (Math.random() - 0.5) * 4,
@@ -313,7 +325,12 @@ export class CrashVFXManager {
         }),
     );
     this.opts.origin?.registerBody(body);
-    world.createCollider(RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z), body);
+    world.createCollider(
+      RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z)
+        .setFriction(0.8)
+        .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max),
+      body,
+    );
     this.debris.push({ mesh, body, life: DEBRIS_LIFE, age: 0 });
     return body;
   }
@@ -381,7 +398,39 @@ export class CrashVFXManager {
         new THREE.Vector3(0, 0, 1),
         normal,
       );
-      decal.position.set(pos.x, gh, pos.z).addScaledVector(normal, 0.15);
+      // Pass 12: centre the decal on the terrain under its RIM, not
+      // just the centre. The tilt uses the gradient at the centre,
+      // but on a curved slope the rim can float (or bury) by ~1 m —
+      // the f22 A stall crash floated 0.86 m at one rim point, over
+      // the probe's 0.6 m limit. Sample the terrain at 8 rim points
+      // and set the offset along the normal so the rim-delta RANGE
+      // is centred in the probe's allowed band (+0.4 buried to −0.6
+      // floating, centre −0.1): a flat disc cannot follow curvature,
+      // so centring the range — not the mean — is what fits the
+      // band. On flat ground this is the old 0.15 m (range [0,0]
+      // → h ≈ 0.1). The factor is × normal.y, not ÷: shifting along
+      // the normal moves the rim across the slope as well as down,
+      // so a normal-shift of h changes the rim deltas by −h/|n| =
+      // −h·normal.y — dividing overshoots 3.5× on a 59° slope.
+      const q = decal.quaternion;
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+      const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+      let dMin = Infinity;
+      let dMax = -Infinity;
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2;
+        const rx =
+          pos.x + (right.x * Math.cos(a) + up2.x * Math.sin(a)) * radius;
+        const rz =
+          pos.z + (right.z * Math.cos(a) + up2.z * Math.sin(a)) * radius;
+        const ry =
+          gh + (right.y * Math.cos(a) + up2.y * Math.sin(a)) * radius;
+        const d0 = this.opts.groundHeight(rx, rz) - ry;
+        dMin = Math.min(dMin, d0);
+        dMax = Math.max(dMax, d0);
+      }
+      const h = ((dMax + dMin) / 2 + 0.1) * Math.max(normal.y, 0.2);
+      decal.position.set(pos.x, gh, pos.z).addScaledVector(normal, h);
     } else {
       decal.rotation.x = -Math.PI / 2;
       decal.position.set(pos.x, gh + 0.15, pos.z);
