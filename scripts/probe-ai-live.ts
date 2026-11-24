@@ -154,6 +154,10 @@ const ENEMY_COUNT = IS_CRUISE ? 1 : 4; // live default
 const PLAYER_KEY = IS_CRUISE ? 'f35a' : 'f22'; // live jet vs probe jet
 const spdIdx = argv.indexOf('--spd');
 const CRUISE_SPD = spdIdx >= 0 ? Number(argv[spdIdx + 1] ?? 200) : 200; // m/s, human cruise in the F-35A
+// Pass 14 diagnostic: --noflares sets every enemy's flare count to 0,
+// isolating whether the AI's flares (missile break 2.2/s while
+// flareCd > 0.4) are what defeats the player's missiles.
+const NO_FLARES = argv.includes('--noflares');
 const TAKEOFF_DELAY_S = SCENARIO === 'delayed1v1' ? 25 : 0;
 const LOCK_CONE_DEG = 15;
 const LOCK_RANGE = 2500;
@@ -313,6 +317,7 @@ async function main(): Promise<void> {
     e.gear = false;
     e.grounded = false;
     e.thrTarget = 0.8;
+    if (NO_FLARES) e.flares = 0;
     const ai = new AircraftAIController(e, 'veteran', 'enemy', {
       groundHeight: heightAtLive,
       originShift: origin.cumulativeShift,
@@ -365,6 +370,12 @@ async function main(): Promise<void> {
   let playerHpLostTotal = 0; // cumulative across lives
   let maxPlayerAlt = 0;
   let maxPlayerVsi = 0;
+  let maxEnemyG = 0;
+  let maxPlayerG = 0;
+  // Pass 14: rolling per-enemy context (last ~20 s at 1 s cadence) so a
+  // terrain/hard-landing death can be diagnosed from what the jet was
+  // doing, not just where it died.
+  const deathCtx: Record<number, string[]> = {};
   const enemyHpStart = enemies.map((e) => e.hp);
   let playerTarget: Aircraft | null = null; // sticky pursuit target
   let playerOmegaSm = 0; // smoothed turn rate for the two-loop heading (below)
@@ -528,13 +539,21 @@ async function main(): Promise<void> {
     // (16). The target is sticky (a human picks a bandit and stays
     // on it): re-acquiring the nearest enemy every frame made the
     // nose oscillate between bandits and never settle in the cone.
-    // Below 600 m hold east to finish the climb clear of terrain.
+    // Below 300 m hold east to finish the climb clear of terrain.
     // (The production-AI-controller player was tried and was worse:
     // it flew at 647 m and got shot down 3x — the AI's pursuit is
     // for closing, not for holding a 1.2 s lock.)
+    // Pass 14: the 600 m gate starved the lock — with the AI now
+    // lethal at low altitude the player is shot down ~3x per run
+    // while climbing out and never reaches 600 m, so it spends the
+    // run flying east as a fleeing target and never tracks (lock
+    // 0.05 s). A human who sees red diamonds behind him turns to
+    // face them at once; the gate is 300 m (clear of the terrain
+    // the player spawns over) and the climb is 15 deg so the
+    // player gets to fighting altitude faster.
     const pitchNow = new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x;
     let desHdg = (90 * Math.PI) / 180;
-    if (player.pos.y > 600) {
+    if (player.pos.y > 300) {
       if (!playerTarget || !playerTarget.alive || playerTarget.dying || playerTarget.pos.distanceTo(player.pos) > 4000) {
         // Most nearly AHEAD (pass 12, Worker E), not nearest: the
         // nearest enemy is usually BEHIND the player (it passed and
@@ -576,7 +595,7 @@ async function main(): Promise<void> {
     // before the lead pursuit). Without a target, climb to 950 m
     // and level as before.
     let pitchTarget: number;
-    if (playerTarget && player.pos.y > 600) {
+    if (playerTarget && player.pos.y > 300) {
       const dx = playerTarget.pos.x - player.pos.x;
       const dz = playerTarget.pos.z - player.pos.z;
       const elev = Math.atan2(
@@ -586,7 +605,7 @@ async function main(): Promise<void> {
       pitchTarget = clamp(-elev, (-15 * Math.PI) / 180, (15 * Math.PI) / 180); // +x = nose down
       if (player.pos.y < 300) pitchTarget = Math.min(pitchTarget, 0); // never dive into the terrain
     } else if (player.pos.y < 950) {
-      pitchTarget = (-10 * Math.PI) / 180; // climb at 10 deg nose-up
+      pitchTarget = (-15 * Math.PI) / 180; // climb at 15 deg nose-up (pass 14: faster climb-out)
     } else {
       pitchTarget = clamp((player.pos.y - ALT_TARGET) * 0.0004, (-3.5 * Math.PI) / 180, (3.5 * Math.PI) / 180); // above target -> nose down (+x), below -> nose up
     }
@@ -661,6 +680,16 @@ async function main(): Promise<void> {
         !firedForLock &&
         bd < 1500
       ) {
+        // Pass 14: log the shot geometry — the enemy dumps flares
+        // while the player is behind it (flareCd 1.5 s, missile
+        // break 2.2/s while flareCd > 0.4), so a tail-chase missile
+        // is almost always decoyed and only a head-on shot (where
+        // the enemy is not flaring) can hit. The log shows which
+        // geometry each shot was and whether the target was flaring.
+        const tgt = best as Aircraft & { flareCd: number };
+        console.log(
+          `  PLAYER MSL: t=${simT.toFixed(1)}s range=${bd.toFixed(0)}m target=${enemies.indexOf(best)} flareCd=${tgt.flareCd.toFixed(2)} targetHp=${best.hp.toFixed(0)}`,
+        );
         weapons.launchMissile(player, best);
         playerMslFired++;
         firedForLock = true;
@@ -689,6 +718,7 @@ async function main(): Promise<void> {
       if (player.alive && !player.dying) {
         maxPlayerAlt = Math.max(maxPlayerAlt, player.pos.y);
         maxPlayerVsi = Math.max(maxPlayerVsi, Math.abs(player.vsi));
+        maxPlayerG = Math.max(maxPlayerG, player.gload);
       }
       lockScan(dt);
       for (let j = 0; j < enemies.length; j++) {
@@ -721,6 +751,15 @@ async function main(): Promise<void> {
         }
         const d = e.pos.distanceTo(player.pos);
         minDist = Math.min(minDist, d);
+        maxEnemyG = Math.max(maxEnemyG, e.gload);
+        if (Math.abs(simT % 1) < dt) {
+          const ctx = deathCtx[j] ?? (deathCtx[j] = []);
+          const eul = new THREE.Euler().setFromQuaternion(e.quat, 'YXZ');
+          ctx.push(
+            `t=${simT.toFixed(0)} y=${e.pos.y.toFixed(0)} hf=${heightAtLive(e.pos.x, e.pos.z).toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt aoa=${e.aoaDeg.toFixed(1)} g=${e.gload.toFixed(1)} vsi=${e.vsi.toFixed(0)} pitch=${(-eul.x * R2D).toFixed(0)} bank=${(eul.z * R2D).toFixed(0)} pitchIn=${e.ai.lastPitchIn.toFixed(2)} rollIn=${e.ai.lastRollIn.toFixed(2)} vsDes=${e.ai.lastVsDes.toFixed(0)} terrTurn=${e.ai.lastTerrainTurn.toFixed(2)} state=${e.ai.state} stall=${e.stalled}`,
+          );
+          if (ctx.length > 25) ctx.shift();
+        }
         if (d < 2200) timeWithin2200 += dt;
         if (d < 900) timeWithin900 += dt;
         e.step(dt, ctrl, WIND, heightAtLive, null);
@@ -728,7 +767,8 @@ async function main(): Promise<void> {
         if (!e.alive && terrainDeathAt < 0 && (e.lastCrashReason === 'hard landing' || e.lastCrashReason === 'terrain')) terrainDeathAt = simT;
         if (!e.alive && enemyDeathReasons.length < 4) {
           enemyDeathReasons.push(
-            `e${j} t=${simT.toFixed(1)}s reason=${e.lastCrashReason ?? '-'} y=${e.pos.y.toFixed(0)} hf=${heightAtLive(e.pos.x, e.pos.z).toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt state=${ai.state}`,
+            `e${j} t=${simT.toFixed(1)}s reason=${e.lastCrashReason ?? '-'} y=${e.pos.y.toFixed(0)} hf=${heightAtLive(e.pos.x, e.pos.z).toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt state=${ai.state}` +
+              `\n    ${(deathCtx[j] ?? []).join('\n    ')}`,
           );
         }
       }
@@ -770,16 +810,17 @@ async function main(): Promise<void> {
     // reproduction evidence: state, distance, and the nose angle to
     // the player, so the break point (patrol drift / reversal /
     // disengage) is visible instead of inferred from the summary.
-    if (IS_CRUISE && simT - (lastTraceSim ?? -10) >= 10) {
+    if (IS_CRUISE && simT - (lastTraceSim ?? -10) >= 2) {
       lastTraceSim = simT;
       const e = enemies[0]!;
       const ai0 = ais[0]!;
       const noseAng = e.alive
         ? (e.fwd().angleTo(e.pos.clone().sub(player.pos).normalize().negate()) * R2D).toFixed(0)
         : '-';
+      const eEuler = new THREE.Euler().setFromQuaternion(e.quat, 'YXZ');
       const pitchDbg = (new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x * R2D).toFixed(1);
       console.log(
-        `  [trace t=${simT.toFixed(0)}s] e0 ${e.alive ? ai0.state : 'DEAD'} d=${e.pos.distanceTo(player.pos).toFixed(0)}m noseToPlayer=${noseAng}deg y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt playerFromAlpha=${Math.hypot(player.pos.x + origin.cumulativeShift.x - alpha.x, player.pos.z + origin.cumulativeShift.z - alpha.z).toFixed(0)}m playerY=${player.pos.y.toFixed(0)} pitch=${pitchDbg} pitchIn=${player.pitchIn.toFixed(2)} thr=${player.thrTarget.toFixed(2)} vsi=${player.vsi.toFixed(0)}`,
+        `  [trace t=${simT.toFixed(0)}s] e0 ${e.alive ? ai0.state : 'DEAD'} d=${e.pos.distanceTo(player.pos).toFixed(0)}m noseToPlayer=${noseAng}deg y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt ePitch=${(eEuler.x * R2D).toFixed(1)} eBank=${(eEuler.z * R2D).toFixed(0)} eAoA=${e.aoaDeg.toFixed(1)} eVsi=${e.vsi.toFixed(0)} eThr=${e.thrTarget.toFixed(2)} pitchIn=${ai0.lastPitchIn.toFixed(2)} rollIn=${ai0.lastRollIn.toFixed(2)} vsDes=${ai0.lastVsDes.toFixed(0)} spin=${e.spin.toFixed(2)} stall=${e.stalled} beta=${e.betaDeg.toFixed(1)} g=${e.gload.toFixed(1)} playerFromAlpha=${Math.hypot(player.pos.x + origin.cumulativeShift.x - alpha.x, player.pos.z + origin.cumulativeShift.z - alpha.z).toFixed(0)}m playerY=${player.pos.y.toFixed(0)} pitch=${pitchDbg} pitchIn=${player.pitchIn.toFixed(2)} thr=${player.thrTarget.toFixed(2)} vsi=${player.vsi.toFixed(0)}`,
       );
     }
   }
@@ -789,7 +830,7 @@ async function main(): Promise<void> {
     0,
   );
   console.log(
-    `  summary: simT=${simT.toFixed(1)}s airborneAt=${airborneAt >= 0 ? airborneAt.toFixed(1) + 's' : 'never'} maxAlt=${maxPlayerAlt.toFixed(0)}m max|vsi|=${maxPlayerVsi.toFixed(0)}m/s ` +
+    `  summary: simT=${simT.toFixed(1)}s airborneAt=${airborneAt >= 0 ? airborneAt.toFixed(1) + 's' : 'never'} maxAlt=${maxPlayerAlt.toFixed(0)}m max|vsi|=${maxPlayerVsi.toFixed(0)}m/s maxEnemyG=${maxEnemyG.toFixed(1)} maxPlayerG=${maxPlayerG.toFixed(1)} ` +
       `firstEngageAt=${firstEngageAt >= 0 ? firstEngageAt.toFixed(1) + 's' : 'never'} engageSeconds=${engageSeconds.toFixed(1)}s ` +
       `firstFireAt=${firstFireAt >= 0 ? firstFireAt.toFixed(1) + 's' : 'never'} aiGunShots=${aiGunShots} aiMslLaunched=${aiMslLaunched} aiBombs=${aiBombsDropped} ` +
       `minDist=${minDist.toFixed(0)}m within2200=${timeWithin2200.toFixed(1)}s within900=${timeWithin900.toFixed(1)}s ` +

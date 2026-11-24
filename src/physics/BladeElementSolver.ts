@@ -1012,7 +1012,21 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       if (state.archetype !== 'rotary' && liftVecBody.lengthSq() > 1) {
         liftDir = liftVecBody.clone().normalize().applyQuaternion(quat);
       }
-      liftVec.addScaledVector(liftDir, lift);
+      // Pass 14: the magnitude must be UNSIGNED. liftVecBody is the
+      // SIGNED summed station vector (it points belly-ward at
+      // negative AoA) and `lift` is the SIGNED scalar (negative at
+      // negative AoA, clFromCurve's negative branch floors at -0.8)
+      // — scaling the signed direction by the signed scalar
+      // double-counts the sign, so at AoA < 0 the lift force was
+      // applied UPWARD: a jet commanding full nose-down at 200+ m/s
+      // climbed at +10..+150 m/s for minutes while the loop
+      // saturated nose-down (probe-ai-live cruise1v1, AoA -15..-26,
+      // pitchIn +0.60 for 180 s, y 3.4 -> 7.1 km; the pass-12
+      // player's 20 km zoom-climb at AoA -41 is the same bug). The
+      // direction already carries the sign, so the magnitude must
+      // not. `lift` itself stays signed (gLoad below, the VTOL
+      // vector floor, and the HUD all read the true signed value).
+      liftVec.addScaledVector(liftDir, Math.abs(lift));
       dragVec.addScaledVector(vAir.clone().normalize(), -drag);
     }
     // Thrust (world frame): the body-frame thrust direction rotated

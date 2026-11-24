@@ -38,20 +38,26 @@ export function touchStickScale(iasKt: number): number {
   return Math.max(0.15, Math.min(1, 110 / iasKt));
 }
 
-/** Pitch-only touch-stick scale. Pitch needs a STRONGER curve than
- *  roll: probe-roll section E measured that the linear 150/ias scale
- *  (0.30 at 586 kt) only moved a full drag-up's G@0.5 s from 9.9 G
- *  to 8.5 G — a pull-up's G builds with v * pitch-rate, and at
- *  586 kt even a 0.3-stick pull reaches high G in half a second,
- *  because the AoA the jet integrates makes huge lift at that q.
- *  The squared curve (0.27 at 287 kt, 0.12 at 450+ kt) keeps a
- *  0.5 s full drag under ~5 G at any speed while a 2 s drag still
- *  loops the jet — it tames the gain, it does not neuter the axis.
- *  The keyboard keeps full pitch authority (ArrowUp = full rate)
- *  for when the pilot wants it. */
+/** Pitch-only touch-stick scale. Pass 14 (worker A): the squared
+ *  curve (150/ias)^2, floored at 0.12, was too weak to fly with —
+ *  a full drag DOWN at 240 kt commanded pitchIn 0.39 and pitched
+ *  the jet down 4.4 deg in 5 s at altitude (probe-pass14 E2b),
+ *  while the keyboard at pitchIn 0.96 pitched 34 deg in the same
+ *  time; the v4.8 live check read that as "pitch locked" through
+ *  24-45 s full-down holds. The pitch axis needs a STRONGER curve
+ *  than roll (a pull-up's G builds with v * pitch-rate), but not
+ *  the squared one: (200/ias)^1.5, floored at 0.15 — 1.0 at/below
+ *  200 kt, ~0.76 at 240 kt, ~0.58 at 287 kt, ~0.20 at 586 kt.
+ *  The 586 kt full-drag-up transient stays inside the probe-roll
+ *  E2 band (G@0.5s <= 5): the squared curve measured 1.3 G there,
+ *  and the new 0.20 scale measures G@0.5s 1.3, peak 1.8 G
+ *  (probe-roll E2, fa18 586 kt, full drag up). A full drag down at
+ *  240 kt now pitches 12.5 deg in 5 s at altitude (probe-pass14
+ *  E2b, was 4.4 deg). The keyboard keeps full pitch authority
+ *  (ArrowUp = full rate) for when the pilot wants it. */
 export function touchPitchScale(iasKt: number): number {
   if (!Number.isFinite(iasKt) || iasKt <= 150) return 1;
-  return Math.max(0.12, Math.min(1, (150 / iasKt) ** 2));
+  return Math.max(0.15, Math.min(1, (200 / iasKt) ** 1.5));
 }
 
 /** On-screen joystick deadzone (stick units): a resting finger or a

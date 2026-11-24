@@ -4,7 +4,9 @@
 //   gun: 1200 m range, 9 m hit radius, 12 dmg, 800 rpm (0.075 s cooldown),
 //        tracer drawn at most 400 m (v1.1 fix), muzzle velocity 900 m/s
 //   missile: speed 280 m/s, life 12 s, proximity fuse 8 m, 40 dmg,
-//        PN max turn 3.2 * speed rad/s, flare break chance 2.2/s
+//        PN max turn 3.2 * speed rad/s, flare break chance 0.3/s
+//        (pass 14: was 2.2/s — see the flare-break note at the
+//        break check below)
 //   bomb: blast radius 70 m, up to 60 dmg, pod damage 40 within 45 m
 //   lock: 15 deg cone, < 2500 m, 1.2 s to full lock
 // v2 changes: missiles and bombs are Rapier dynamic bodies (gravity scale 0
@@ -730,8 +732,23 @@ export class WeaponSystem {
         if (steer.length() > maxTurn) steer.setLength(maxTurn);
         const next = cur.add(steer);
         m.body.setLinvel({ x: next.x, y: next.y, z: next.z }, true);
-        // Flares break the lock (G6).
-        if (m.target.flareCd > 0.4 && Math.random() < dt * 2.2) {
+        // Flares break the lock (G6). Pass 14: the break rate was
+        // 2.2/s — with the AI dumping a flare burst every 1.5 s
+        // while the player is behind it (flareCd 1.5 s, > 0.4 for
+        // 1.1 s, a 73% duty cycle), a 5 s tail-chase missile flight
+        // broke with probability 1 - exp(-2.2 * 0.73 * 5) = 99.97%,
+        // so the player's missiles NEVER hit (probe-ai-live
+        // pursuit: 2 missiles fired, enemyHpLost 0; with flares
+        // disabled via --noflares the same run gave enemyHpLost
+        // 277). Flares were immunity, not a defence. At 0.3/s a
+        // single burst defeats a missile ~28% of the time and
+        // continuous flaring over a 5 s flight ~67% — a real
+        // defence that still lets a missile through, and a human
+        // who flares (30 flares, one per 1.5 s) still defeats
+        // ~39% of the AI's missiles over a 5 s flight, plus
+        // manoeuvring. The AI's lethality in the probe is
+        // unchanged (the scripted player never flares).
+        if (m.target.flareCd > 0.4 && Math.random() < dt * 0.3) {
           m.target = null;
         }
         if (m.target && meshPos.distanceTo(m.target.pos) < MISSILE_PROXIMITY) {

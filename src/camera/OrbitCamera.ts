@@ -122,6 +122,38 @@ export function deckChaseCameraPosition(
   return want;
 }
 
+/** Chase-camera want position (pass 14, worker D): the single source
+ *  of truth for the chase camera's target position — the deck-aware
+ *  chase (deckChaseCameraPosition) plus the terrain floor (ground
+ *  under the camera +6 m, under the midpoint +8 m, target +2 m) and
+ *  the deck ceiling. updateCamera's chase branch converges toward
+ *  this position by lerp; snapCameraToChase (main.ts) puts the camera
+ *  exactly here on restart/respawn, so the first frame after a spawn
+ *  is already the correct chase view instead of a ~1 s lerp from
+ *  wherever the camera was (the v4.8 live finding: a side-on,
+ *  below-ground view after every Apply & Restart — the lerp path
+ *  runs straight through terrain from the old position, and at
+ *  1 fps during a restart the lerp takes 4-9 s to converge). */
+export function chaseCameraPosition(
+  jetPos: THREE.Vector3,
+  fwd: THREE.Vector3,
+  up: THREE.Vector3,
+  dist: number,
+  groundHeightAt: (x: number, z: number) => number,
+  deckTopY: number | null,
+): THREE.Vector3 {
+  const want = deckChaseCameraPosition(jetPos, fwd, up, dist, deckTopY);
+  const mid = jetPos.clone().addScaledVector(fwd, -dist * 0.5);
+  const floor = Math.max(
+    groundHeightAt(want.x, want.z) + 6,
+    groundHeightAt(mid.x, mid.z) + 8,
+    jetPos.y + 2,
+  );
+  if (want.y < floor) want.y = floor;
+  if (deckTopY !== null) applyDeckCeiling(want, deckTopY);
+  return want;
+}
+
 /** Default free-orbit yaw for a deck spawn: the camera sits ASTERN of
  *  the jet on the deck centreline (carrier yaw + π), looking forward
  *  along the deck. The generic default (yaw 0, world-south) puts the

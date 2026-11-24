@@ -170,14 +170,33 @@ const BOOM_MAX_SCALE = 40;
  *  "brief orange glow faded ~15 s" and then an intact-looking
  *  wreck. A wreck fire burns for the debris lifetime (30 s), so
  *  the crash site reads as a burning wreck for as long as the
- *  wreckage is there; respawn still clears it. */
-const ATTACHED_PLUME_LIFE = 30;
+ *  wreckage is there; respawn still clears it.
+ *  Pass 14 (worker D): 30 s is still too short — the v4.8 live
+ *  check found the fire glow burned out by +75 s after the crash.
+ *  Lifetimes are SIM seconds, and at the live 4-9 fps the sim runs
+ *  at 0.4-0.9x real time, so 30 sim-s expires at ~33-75 REAL
+ *  seconds — exactly when the player is watching the wreck. A
+ *  wreck fire now burns 90 s, as long as the debris (DEBRIS_LIFE)
+ *  and the scorch (SCORCH_LIFE 90) — the whole crash site reads
+ *  as a burning wreck for as long as any of it is there. */
+const ATTACHED_PLUME_LIFE = 90;
+/** Attached-plume fade-out (s): the fire holds full brightness
+ *  until its last PLUME_FADE_S seconds, then fades (pass 14,
+ *  worker D — the old linear fade had it at half brightness by
+ *  mid-life). Free plumes fade linearly over their whole life. */
+const PLUME_FADE_S = 15;
 /** Debris lifetime (s). Pass 11: was 10 s AND pieces were deleted
  *  the moment they touched the ground, so by the time the player
  *  looked at the wreck (seconds after impact) the debris field was
  *  already gone — the live "no debris" finding. Debris now RESTS
- *  on the ground until it expires (30 s). */
-const DEBRIS_LIFE = 30;
+ *  on the ground until it expires (30 s).
+ *  Pass 14 (worker D): 30 s is too short for the same sim-vs-real
+ *  reason as the fire (see ATTACHED_PLUME_LIFE): at 4 fps the
+ *  field expires ~75 real seconds after the crash, so the v4.8
+ *  live check found no debris field at +75 s. Debris now rests
+ *  90 s — as long as the scorch mark — so the wreck site still
+ *  reads as scattered wreckage whenever the player looks at it. */
+const DEBRIS_LIFE = 90;
 
 export class CrashVFXManager {
   private readonly scene: THREE.Scene;
@@ -258,7 +277,7 @@ export class CrashVFXManager {
    *  Template: 5 sprites trailing behind/below, colour 0x555555 smoke
    *  or 0xff7722 fire. Returns the group so the caller can remove it.
    *  Pass 11: an attached plume is a WRECK fire — it burns for
-   *  ATTACHED_PLUME_LIFE (12 s), and a fire-coloured plume is
+   *  ATTACHED_PLUME_LIFE (90 s), and a fire-coloured plume is
    *  brighter and larger than smoke (the old 0.55-opacity 6 m
    *  sprites read as faint haze at the 42 m spectate distance, not
    *  fire). */
@@ -322,7 +341,7 @@ export class CrashVFXManager {
    *  hand-integrated a box). The segment is removed from its parent and
    *  added to the scene. Returns the Rapier body so the caller can track
    *  or remove it. Falls back to a 4 x 0.5 x 2.5 m box when no segment is
-   *  supplied. Life DEBRIS_LIFE (30 s): the piece RESTS on the ground
+   *  supplied. Life DEBRIS_LIFE (90 s): the piece RESTS on the ground
    *  until it expires (pass 11 — the old rule deleted a piece the
    *  moment it touched the ground, so the debris field was gone
    *  before the player ever looked at the wreck). Spawned 0.5 m above
@@ -359,9 +378,13 @@ export class CrashVFXManager {
       // slabs scattered near every crash site"). Each piece gets a
       // random size (2.5-5 m long, 0.3-0.9 m thick) and a random
       // charred colour, so the field reads as torn wreckage.
-      const len = 2.5 + Math.random() * 2.5;
-      const thick = 0.3 + Math.random() * 0.6;
-      const wid = 1.2 + Math.random() * 1.6;
+      // Pass 14 (worker D): two shapes — torn skin panels (wide,
+      // thin) and chunky fragments — so the field does not read as
+      // four same-sized boxes.
+      const panel = Math.random() < 0.5;
+      const len = panel ? 3 + Math.random() * 2.5 : 2.5 + Math.random() * 2.5;
+      const thick = panel ? 0.12 + Math.random() * 0.2 : 0.3 + Math.random() * 0.6;
+      const wid = panel ? 1.8 + Math.random() * 1.6 : 1.2 + Math.random() * 1.6;
       mesh = new THREE.Mesh(
         new THREE.BoxGeometry(wid, thick, len),
         new THREE.MeshLambertMaterial({
@@ -580,7 +603,15 @@ export class CrashVFXManager {
       const p = this.plumes[i];
       p.life -= dt;
       if (!p.parent) p.group.position.y += dt * 1.5;
-      const fade = Math.max(0, p.life / p.maxLife);
+      // Pass 14 (worker D): an attached (wreck-fire) plume holds
+      // full brightness until its last PLUME_FADE_S seconds, then
+      // fades — a wreck fire burns, it does not thin out linearly
+      // from birth (the old linear fade had the fire at half
+      // brightness by mid-life and gone by +30 s). Free plumes
+      // keep the linear fade over their whole (short) life.
+      const fade = p.parent
+        ? Math.min(1, Math.max(0, p.life / PLUME_FADE_S))
+        : Math.max(0, p.life / p.maxLife);
       for (const child of p.group.children) {
         const spr = child as THREE.Sprite;
         spr.material.opacity = p.baseOpacity * fade;

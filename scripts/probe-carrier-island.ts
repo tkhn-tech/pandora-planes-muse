@@ -92,10 +92,12 @@ if (typeof (globalThis as unknown as { document?: unknown }).document === 'undef
 
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
-import { PandoraWorldGenerator } from '../src/world/PandoraWorldGenerator';
+import { PandoraWorldGenerator, ISLAND_LOOP_CLEARANCE_M } from '../src/world/PandoraWorldGenerator';
 import {
   HelicarrierController,
   carrierLoop,
+  CARRIER_START_POS,
+  CARRIER_WAYPOINTS,
 } from '../src/entities/HelicarrierController';
 import { HELICARRIER_GLB } from '../src/assets/models/helicarrier';
 import {
@@ -272,6 +274,73 @@ async function main(): Promise<void> {
     }
   }
   console.log(`  nearest island to any carrier slot start: ${globalBest.toFixed(0)} m (${globalWhat})`);
+
+  // ---- 5. Pass 14 (worker F, item 11): every island clears the
+  // carrier LOOP, not just the slot starts. The carrier flies the
+  // polyline start -> W0 -> ... -> W5 -> W0 (entry leg + hexagon);
+  // an island centre must be at least ISLAND_LOOP_CLEARANCE_M from
+  // every segment, and its nearest surface (centre minus the main
+  // cone radius) at least 800 m out. Before the fix island-3 was
+  // 270 m (centre) from the W0->W1 leg, so this section FAILS on
+  // the old build and PASSES after the relocation.
+  const loopPts = [CARRIER_START_POS, ...CARRIER_WAYPOINTS];
+  const loopSegs: Array<[THREE.Vector3, THREE.Vector3]> = [];
+  for (let s = 0; s < loopPts.length - 1; s++) loopSegs.push([loopPts[s]!, loopPts[s + 1]!]);
+  loopSegs.push([loopPts[loopPts.length - 1]!, loopPts[1]!]);
+  const segDist = (x: number, z: number): { d: number; seg: number } => {
+    let best = Infinity;
+    let bestSeg = -1;
+    loopSegs.forEach(([a, b], i) => {
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const len2 = dx * dx + dz * dz;
+      const t =
+        len2 === 0
+          ? 0
+          : Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / len2));
+      const d = Math.hypot(x - (a.x + t * dx), z - (a.z + t * dz));
+      if (d < best) {
+        best = d;
+        bestSeg = i;
+      }
+    });
+    return { d: best, seg: bestSeg };
+  };
+  let minCentre = Infinity;
+  let minEdge = Infinity;
+  let minCentreWhat = '';
+  for (const g of islands) {
+    let R = 0;
+    g.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh && (m.geometry as THREE.BufferGeometry)?.type === 'ConeGeometry') {
+        const params = (m.geometry as THREE.ConeGeometry).parameters;
+        if (params && params.radius > R) R = params.radius;
+      }
+    });
+    const { d, seg } = segDist(g.position.x, g.position.z);
+    console.log(
+      `  ${g.name} at (${g.position.x.toFixed(0)}, ${g.position.z.toFixed(0)}) R=${R.toFixed(0)}m: nearest loop segment ${seg} at ${d.toFixed(0)} m centre (${(d - R).toFixed(0)} m to cone edge)`,
+    );
+    if (d < minCentre) {
+      minCentre = d;
+      minCentreWhat = `${g.name} to segment ${seg}`;
+    }
+    if (d - R < minEdge) minEdge = d - R;
+  }
+  console.log(
+    `  nearest island centre to the carrier loop: ${minCentre.toFixed(0)} m (${minCentreWhat}); nearest cone edge: ${minEdge.toFixed(0)} m`,
+  );
+  check(
+    'islands clear the carrier loop (centre >= 1000 m from every flown segment)',
+    minCentre >= ISLAND_LOOP_CLEARANCE_M,
+    `min centre=${minCentre.toFixed(0)} m (${minCentreWhat})`,
+  );
+  check(
+    'islands clear the carrier loop (cone edge >= 800 m)',
+    minEdge >= 800,
+    `min edge=${minEdge.toFixed(0)} m`,
+  );
 
   console.log(failures === 0 ? 'ALL CARRIER-ISLAND CHECKS PASSED' : `${failures} CARRIER-ISLAND CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

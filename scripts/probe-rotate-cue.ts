@@ -407,6 +407,11 @@ async function main(): Promise<void> {
         fuel: 1,
         alive: over.alive,
         rotateCue: over.rotateCue,
+        // Pass 14 coordinator: FlightHUD.update now calls
+        // pullUpTimeBased, which reads ac.terrainHeightAt — the
+        // real controller carries it (default () => 0, assigned by
+        // main); this stub must too or update() throws.
+        terrainHeightAt: (_x: number, _z: number) => 0,
         msl: 6,
         flares: 30,
         bombs: 4,

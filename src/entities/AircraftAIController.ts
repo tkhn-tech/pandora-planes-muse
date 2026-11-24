@@ -76,6 +76,11 @@ export class AircraftAIController {
   fireMissile = false;
   /** Set by update(): bomb release this frame — caller drops it. */
   dropBomb = false;
+  /** Last steering outputs, for probes / debugging (read-only). */
+  lastPitchIn = 0;
+  lastRollIn = 0;
+  lastVsDes = 0;
+  lastTerrainTurn = 0;
 
   private decideT = 0;
   /** Gun cooldown (s); the missile has its own (below). Pass 12:
@@ -93,6 +98,13 @@ export class AircraftAIController {
   /** Smoothed turn rate (rad/s) for the HF two-loop bank command — the
    *  6/s turn-rate smoothing. */
   private omegaSm = 0;
+  /** Pass 14: previous frame's AoA (deg) and smoothed AoA rate
+   *  (deg/s) for the AoA-rate damper. */
+  private prevAoA = 0;
+  private aoaRateSm = 0;
+  /** Pass 14: latched terrain-avoidance turn side (+0.6 left,
+   *  -0.6 right, 0 none) — see the turn block for why it latches. */
+  private terrainTurnLatch = 0;
   /** RTB landing (straight-in approach + 3.5 deg glide slope + rollout).
    *  HISTORY: this was a full HF pattern (entry -> downwind -> base ->
    *  final -> rollout), but the point-to-point steering never converged
@@ -154,6 +166,20 @@ export class AircraftAIController {
       this.navTarget
         .copy(ref.pos)
         .add(this.tmpA.set((this.rng() - 0.5) * 600, 150 + this.rng() * 300, (this.rng() - 0.5) * 600));
+      // Pass 14: terrain floor on the patrol point. The point is
+      // ref.y + 150-450 m, so when the player is low (50-200 m)
+      // the point sits at 200-500 m — but the hills rise to ~550 m,
+      // so the jet descends to a point BELOW a ridge and then
+      // cannot climb out when the ridge rises (e2 pursuit t=41-48:
+      // descending -4..-10 m/s to a ~480 m patrol point over a
+      // 365 m ridge, dead at 54.6 s). Keep the point at least
+      // 200 m above the terrain at its (x, z) so the patrol leg
+      // itself is terrain-safe; the intercept/engage still dive to
+      // the player, so the fight is unaffected.
+      this.navTarget.y = Math.max(
+        this.navTarget.y,
+        this.groundHeight(this.navTarget.x, this.navTarget.z) + 200,
+      );
     }
   }
 
@@ -369,7 +395,16 @@ export class AircraftAIController {
       const lead = this.skill.lead * clamp(distToP / 2000, 0, 1);
       const tGo = distToP / 280;
       goal = this.tmpB.copy(player.pos).addScaledVector(player.vel, lead * tGo);
-      speedWant = clamp(player.ias + 60, 200, 280);
+      // Pass 14: the 280 m/s cap is far below the airframes (level
+      // max from the solver drag, CD0 0.028: MiG-29 ~458 m/s at
+      // 163 kN, Su-34 ~497 m/s at 264 kN) and below a fast player —
+      // the live F-22 cruised at ~360 m/s (700 kt), so a 280 m/s
+      // interceptor could never close a tail chase even flying
+      // perfectly. The cap is now 380 m/s: above the fastest
+      // player's cruise with margin to close, inside the airframe
+      // envelope, and the corner-speed rule below still slows the
+      // jet for a hard turn.
+      speedWant = clamp(player.ias + 60, 200, 380);
       vsCap = 30;
       const desHdgHere = Math.atan2(goal.x - ac.pos.x, goal.z - ac.pos.z);
       let hdgErrHere = desHdgHere - curHdg;
@@ -403,7 +438,12 @@ export class AircraftAIController {
       // tail chase, so the AI only ever closed head-on. 280 m/s lets
       // it match and close on a fast player; the want is still only
       // player speed + 25 m/s, so it does not overshoot a slow one.
-      speedWant = clamp(player.ias + 25, 90, 280);
+      // Pass 14: 380 m/s cap, as in the intercept branch above — a
+      // 280 m/s AI cannot close on a 360 m/s player in a tail chase
+      // even in pure pursuit (player.ias + 25 was capped below the
+      // player's speed, so the gap grew in engage and the AI
+      // disengaged at 6000 m mid-turn).
+      speedWant = clamp(player.ias + 25, 90, 380);
       // Pass 12 (Worker E): corner speed. A 70 deg bank at 175 m/s
       // turns at ~9 deg/s, barely above the line-of-sight rate of a
       // crossing player at 1300 m (~7 deg/s) — the AI circled the
@@ -478,6 +518,154 @@ export class AircraftAIController {
     const dist = toGoal.length();
     if (dist < 120 && this.state === 'patrol') this.pickNav(player);
 
+    // Pass 14: TERRAIN CLIMB DEMAND as a vsDes floor + AVOIDANCE
+    // TURN, computed here (before the steering) so the turn bias
+    // can feed desHdg. The lookahead pull-up used to write pitchIn
+    // directly (-0.3..-1.0 nose-up for as long as the terrain ahead
+    // was within 120 m) — crossing hilly terrain at 200-300 m that
+    // held full nose-up for 5-10 s and zoomed the jet to pitch
+    // -81.7 deg, AoA -94.6 (tailslide), 413 -> 77 kt, right after
+    // the head-on pass (probe-ai-live cruise1v1). A climb-RATE
+    // demand instead lets the pitch loop relax the nose-up command
+    // as the climb is achieved, so the jet clears the hill and
+    // levels instead of zooming. The hard floor (ground + 60 m)
+    // demands a +20 m/s climb; the lookahead demand scales with
+    // the shortfall (0 at 120 m clearance, +20 at zero). RTB
+    // final/rollout skips terrain entirely, as before (the jet is
+    // committed to the flat runway).
+    // MULTI-POINT lookahead: the single point at lookAhead (up to
+    // 875 m at 350 kt, ~5 s of flight) is blind to a hill closer
+    // than that — the crest 300 m ahead kills the jet while the
+    // point 875 m out sits past it in a valley. Sample at
+    // 0.25/0.5/0.75/1.0 of the lookahead distance and take the
+    // MINIMUM clearance, so the nearest hill drives the demand.
+    // AVOIDANCE TURN: a climb alone cannot clear a steep ridge —
+    // the terrain rises 36-105 m/s at 350 kt while the climb caps
+    // at +20 (e1 pursuit t=21: climbing +20 m/s while the hill
+    // rose 36 m/s, dead at 12 m clearance). When the terrain ahead
+    // is seriously blocked (clearAhead < 60 m) and one side at
+    // +/-45 deg is much clearer, bias the desired heading 0.6 rad
+    // (~34 deg) toward the clearer side. Heading INCREASES on a
+    // left turn, so the left side gets +0.6 and the right -0.6.
+    // The +5 m margin (any meaningful improvement over a blocked
+    // centre) replaces an earlier +40 m margin that never fired,
+    // because the hills around Alpha are high in every direction.
+    const landingFinal =
+      this.state === 'rtb' && this.rtbPhase !== 'approach';
+    let terrainClimb = 0;
+    let belowFloor = false;
+    let terrainTurn = 0;
+    if (!landingFinal) {
+      // Pass 14: lookahead follows the VELOCITY (direction of
+      // travel), not the nose. In a banked turn the nose leads the
+      // velocity by the turn lag, so a nose-based lookahead samples
+      // a safe direction while the velocity carries the jet into
+      // the ridge (e2 pursuit t=48: descending -10 m/s in patrol,
+      // vsDes -12, no terrain demand, while the ridge 500 m ahead
+      // on its path rose to 427 m). The travel heading is the
+      // horizontal velocity direction, falling back to the nose
+      // heading below 10 m/s horizontal speed.
+      const velH = Math.hypot(ac.vel.x, ac.vel.z);
+      const travelHdg =
+        velH > 10 ? Math.atan2(ac.vel.x, ac.vel.z) : curHdg;
+      const travelX = Math.sin(travelHdg);
+      const travelZ = Math.cos(travelHdg);
+      const lookAhead = Math.max(260, ac.ias * 5);
+      let clearAhead = Infinity;
+      // (Pass 14: eight sample points were tried and reverted — they
+      // fired the avoidance on smaller hills, pulling the jets out
+      // of the fight (pursuit engage 197 -> 164 s, player lock
+      // seconds 9.3 -> 5.2) without fixing e2's ridge death. Four
+      // points stand.)
+      for (const frac of [0.25, 0.5, 0.75, 1.0]) {
+        clearAhead = Math.min(
+          clearAhead,
+          ac.pos.y -
+            this.groundHeight(
+              ac.pos.x + travelX * lookAhead * frac,
+              ac.pos.z + travelZ * lookAhead * frac,
+            ),
+        );
+      }
+      if (clearAhead < 120) {
+        terrainClimb = Math.max(
+          terrainClimb,
+          clamp((120 - clearAhead) * 0.25, 0, 20),
+        );
+      }
+      if (clearAhead < 60) {
+        // Sides sampled NEAR only (0.25/0.5 of lookAhead): the turn
+        // commits the jet to the terrain 200-400 m to the side, and
+        // the far points (875 m) are hills it will never reach on
+        // this heading — including them in the min made both sides
+        // read blocked and the turn never fired (byte-identical
+        // pursuit run with the turn in place).
+        let clearL = Infinity;
+        let clearR = Infinity;
+        for (const frac of [0.25, 0.5]) {
+          const dL = lookAhead * frac;
+          clearL = Math.min(
+            clearL,
+            ac.pos.y -
+              this.groundHeight(
+                ac.pos.x + Math.sin(travelHdg + Math.PI / 4) * dL,
+                ac.pos.z + Math.cos(travelHdg + Math.PI / 4) * dL,
+              ),
+          );
+          clearR = Math.min(
+            clearR,
+            ac.pos.y -
+              this.groundHeight(
+                ac.pos.x + Math.sin(travelHdg - Math.PI / 4) * dL,
+                ac.pos.z + Math.cos(travelHdg - Math.PI / 4) * dL,
+              ),
+          );
+        }
+        const best = Math.max(clearL, clearR);
+        // LATCH the avoidance side: on a wide ridge the two sides
+        // are nearly equal, so the "better side" flips every frame
+        // and the bank swings +/-60 deg at ~1 Hz, destroying the
+        // climb (e2 pursuit t=49-55: terrTurn -0.60 -> +0.60, bank
+        // -1 -> +60 -> -65 deg, climb +15 m/s vs ridge +32 m/s,
+        // dead at 10 m clearance). Once a side is chosen, keep it
+        // until the centre is clear. There is NO flip condition:
+        // the side samples are heading-relative, so as the jet turns
+        // they rotate with it and the "other side" can read 50 m
+        // better purely because the jet turned — flipping on that
+        // re-reads the same ridge from a new angle and reverses the
+        // bank mid-manoeuvre (the latch still flipped at t=53 in
+        // the run with a 50 m flip margin). The side was chosen
+        // from the geometry at the moment the ridge blocked the
+        // centre; turning toward it is the way out, and the latch
+        // clears only when the centre is clear again.
+        if (this.terrainTurnLatch !== 0) {
+          terrainTurn = this.terrainTurnLatch;
+        } else if (best > clearAhead + 5) {
+          this.terrainTurnLatch = clearL >= clearR ? 0.6 : -0.6;
+          terrainTurn = this.terrainTurnLatch;
+        }
+        if (terrainTurn !== 0) {
+          // Slow for the avoidance turn: at 350 kt a 45 deg bank
+          // turns at 3.2 deg/s and the ridge closes in ~2 s; at
+          // corner speed (120 m/s) the same bank turns at 4.7 deg/s
+          // and the terrain closes half as fast. The throttle
+          // section below cuts to idle + airbrake on this want.
+          speedWant = Math.min(speedWant, 120);
+        }
+      } else if (clearAhead >= 120) {
+        this.terrainTurnLatch = 0;
+      }
+      const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
+      const floorY = Math.max(
+        this.groundHeight(ac.pos.x, ac.pos.z) + 60,
+        deckY > -Infinity ? deckY + 60 : -Infinity,
+      );
+      if (ac.pos.y < floorY) {
+        belowFloor = true;
+        terrainClimb = Math.max(terrainClimb, 20);
+      }
+    }
+
     // ---- HF two-loop steering (bank from turn rate) ----
     // Loop 1: desired turn rate from the heading error, capped at the
     // sustained-turn envelope — the SAME sustainedTurnRate the curve
@@ -497,7 +685,7 @@ export class AircraftAIController {
     // phi is a right bank — both backwards; the code was right and
     // the comment was the trap. (fwd / curHdg are computed above the
     // goal section — the engage corner-speed rule uses them too.)
-    const desHdg = Math.atan2(toGoal.x, toGoal.z);
+    const desHdg = Math.atan2(toGoal.x, toGoal.z) + terrainTurn;
     let hdgErr = desHdg - curHdg;
     while (hdgErr > Math.PI) hdgErr -= 2 * Math.PI;
     while (hdgErr < -Math.PI) hdgErr += 2 * Math.PI;
@@ -712,8 +900,54 @@ export class AircraftAIController {
     // IS the loiter, and cutting its bank on every sink defeats it.
     // The low-energy unload (below 1.5x stall) still fires, and the
     // AoA limiter + hard floor still guard the departure.
+    // (Pass 14: a low-clearance loitering unload — firing when the
+    // jet is low and sinking — was tried and reverted: it fixed the
+    // delayed1v1 patrol sink (the jet recovered from 27 m to 250 m)
+    // but cost the pursuit (engage 197 -> 143 s, player missile
+    // damage 349 -> 0), because loitering enemies level their wings
+    // whenever low instead of holding the orbit, and the engagement
+    // geometry changes. The pursuit is the primary scenario, so
+    // the exemption stands as pass 13 left it.)
     const inCombat = this.state === 'engage' || this.state === 'evade' || intercepting || loitering;
     if (ac.vsi < vsDesHere - 5 && (!inCombat || lowEnergy)) phiDes *= 0.3;
+    // Pass 14: TERRAIN AVOIDANCE BANK. The heading bias alone
+    // (terrainTurn on desHdg) cannot turn the jet away from a ridge
+    // — the bank is capped at 45 deg at long range, which turns at
+    // only ~3.2 deg/s at 350 kt, so the jet turned 22 deg in the 7 s
+    // of warning and still flew into the hill (e1 pursuit t=14-21,
+    // bank stuck at 45-46 deg while terrTurn was -0.60). The
+    // avoidance turn overrides the bank cap to 60 deg (5.7 deg/s)
+    // while the terrain is blocked. It does NOT fire when low on
+    // energy (a slow jet cannot hold a 60 deg bank), and it is
+    // occasional (only when the terrain ahead is blocked), so it
+    // does not raise the everyday long-range bank the way a general
+    // 60 deg cap would (that broke the pursuit lock in pass 13).
+    // GATED ON AoA HEADROOM (reverted — see below): a 60 deg bank
+    // tilts the lift sideways, so at the AoA limit the climb
+    // collapses — but gating the avoidance bank to 45 deg when
+    // AoA >= 8 deg was NET WORSE (pursuit engage 284 -> 155 s,
+    // terrain death back to 23.7 s): the 45 deg turn is too slow to
+    // clear the ridge e1 hits at t=14-21, and the 60 deg bank is
+    // what saved it. The e0 death (60 deg bank at the AoA limit)
+    // is the rarer failure (1 death at 90.6 s vs e1's 21.9 s), so
+    // the 60 deg avoidance bank stands ungated.
+    // (Pass 14: speed-gating the 60 deg bank was tried at 150 m/s
+    // and 120 m/s and reverted both times — the pursuit enemies fly
+    // at 120-150 m/s when the avoidance fires (after the slowdown
+    // to corner speed), so any threshold near there flickers the
+    // bank on/off and collapses the engagement (197 -> 108-173 s)
+    // without fixing the deaths. The 60 deg bank stands ungated
+    // except for lowEnergy, as in the best pursuit run.)
+    if (terrainTurn !== 0 && !lowEnergy) {
+      phiDes = ((terrainTurn < 0 ? 1 : -1) * 60 * Math.PI) / 180;
+    }
+    // (Pass 14: a CLIMB UNLOAD here — levelling the wings when the
+    // terrain climb was failing during an avoidance turn — was tried
+    // and reverted: it fired through most low-level flying (the
+    // terrain is blocked often and the jet is rarely climbing at
+    // the demanded +20 while manoeuvring), breaking the engagement
+    // (pursuit engage 281 -> 107-114 s, player lock 5.29 -> 0.03 s)
+    // without fixing the death. The avoidance bank stands as is.)
     const phiNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
     let rollIn = clamp((phiDes - phiNow) * 2.0, -1, 1);
     // v2 evade weave: sin(performance.now() * 0.004); time here is seconds,
@@ -760,7 +994,11 @@ export class AircraftAIController {
       this.state === 'rtb' && this.rtbPhase === 'final'
         ? ac.ias * Math.tan((3.5 * Math.PI) / 180)
         : 0;
-    const vsDes = clamp((goal.y - ac.pos.y) * vsGain - slopeSink, -vsCap, vsCap);
+    // (Terrain climb demand + avoidance turn are computed above the
+    // steering section — the turn bias feeds desHdg there, and
+    // terrainClimb feeds vsDes here.)
+    let vsDes = clamp((goal.y - ac.pos.y) * vsGain - slopeSink, -vsCap, vsCap);
+    if (terrainClimb > 0) vsDes = Math.max(vsDes, terrainClimb);
     const pitchLim = Math.min(pitchCap, 0.6);
     // Pitch gain, speed-scheduled (pass 12, Worker E): a fixed 0.06
     // saturates on any vs error over ~10 m/s, and at combat speeds
@@ -817,9 +1055,31 @@ export class AircraftAIController {
     // and looped the jet over into a -70 m/s dive. Symmetric to the
     // stall recovery above (nose-down out of a positive stall);
     // this pulls nose-up out of a negative one.
-    if (ac.aoaDeg < -10) {
-      pitchIn = Math.min(pitchIn, clamp((ac.aoaDeg + 10) * 0.03, -0.4, 0));
-    }
+    // Pass 14: AoA-RATE DAMPER. The e2 pursuit death (t=65-67) was
+    // a pitch oscillation, not a bad command: in a 45 deg banked
+    // turn at 300 kt the AoA swung +12.9/+10.8/+2.4/-0.8/+7.0/-15.1
+    // deg at ~1 Hz while pitchIn sat near zero (-0.11..+0.09) —
+    // the vsi P-loop's phase lag (the lift needs ~1 s to bend the
+    // velocity) lets the AoA swing freely, and near AoA 0 the lift
+    // vanishes so the velocity stops following the nose and the
+    // swing amplifies past the tail's negative peak (-16 deg),
+    // where the vsi loop's full nose-down (+0.60 at vsi +78) drives
+    // the AoA to -75 deg and the jet tumbles. A D-term on the AoA
+    // opposes the swing itself: pitchIn += aoaRate * 0.01, so a
+    // 15 deg/s AoA swing meets a 0.15 counter-command. It is a pure
+    // damper (no trim bias — a steady AoA contributes nothing), so
+    // a normal pull (AoA rising ~5 deg/s) costs only ~0.05 of
+    // command. Applied after the limiters, before the throttle.
+    const aoaRateRaw =
+      dt > 0 ? (ac.aoaDeg - this.prevAoA) / dt : 0;
+    this.prevAoA = ac.aoaDeg;
+    // Low-pass the rate (10/s): the substep AoA jitters ~0.5 deg
+    // per 0.016 s substep, which is 30 deg/s of raw noise — the
+    // unfiltered rate would inject +/-0.3 of noise into pitchIn.
+    // The 0.1 s time constant keeps the 1 Hz oscillation (the
+    // departure mode) while rejecting the substep jitter.
+    this.aoaRateSm += (aoaRateRaw - this.aoaRateSm) * Math.min(1, dt * 10);
+    pitchIn = clamp(pitchIn + this.aoaRateSm * 0.01, -pitchLim, pitchLim);
 
     // Throttle: speed management (Ace dives to regain energy — v2).
     const want = speedWant + (this.state === 'engage' && ac.ias < 90 ? 40 : 0);
@@ -891,34 +1151,11 @@ export class AircraftAIController {
     // plateau is flat, so there is no terrain to avoid on final.
     // In RTB approach (manoeuvring to the fix over rough terrain) and
     // in every other state the avoidance still applies.
-    const landingFinal =
-      this.state === 'rtb' && this.rtbPhase !== 'approach';
-    if (!landingFinal) {
-      // Pass 13: PROPORTIONAL terrain pull-up (was bang-bang
-      // pitchIn = -1). A boundary graze (clearance 60-120 m) used to
-      // command full nose-up, zooming the jet 2000+ m and bleeding it
-      // to near-stall (delayed1v1: 199 m -> 2584 m, 121 kt -> 62 kt,
-      // then a climb/dive porpoise that never closed on the player).
-      // The pull is now proportional to the shortfall: -0.3 at the
-      // boundary, ramping to -1.0 only when the clearance is gone (a
-      // genuine emergency). The thresholds are unchanged — only the
-      // command softens — and a stronger existing nose-up command is
-      // preserved (Math.min keeps the more nose-up of the two).
-      const lookAhead = Math.max(260, ac.ias * 5);
-      const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), lookAhead);
-      const clearAhead = ac.pos.y - this.groundHeight(ahead.x, ahead.z);
-      if (clearAhead < 120) {
-        pitchIn = Math.min(pitchIn, -clamp(0.3 + (120 - clearAhead) / 120, 0.3, 1));
-      }
-      const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
-      const floorY = Math.max(
-        this.groundHeight(ac.pos.x, ac.pos.z) + 60,
-        deckY > -Infinity ? deckY + 60 : -Infinity,
-      );
-      if (ac.pos.y < floorY) {
-        pitchIn = Math.min(pitchIn, -clamp(0.3 + (floorY - ac.pos.y) / 45, 0.3, 1));
-        this.thrTarget = Math.max(this.thrTarget, 0.8);
-      }
+    // Pass 14: the terrain climb itself is now a vsDes floor (see
+    // the pitch section above) — this block only keeps the hard-floor
+    // throttle boost, so a jet climbing out of the floor has power.
+    if (!landingFinal && belowFloor) {
+      this.thrTarget = Math.max(this.thrTarget, 0.8);
     }
 
     // Firing intent (v2 G6 block): gun in cone + range, missile when locked
@@ -996,6 +1233,10 @@ export class AircraftAIController {
     // controller only applies the brake when grounded, so setting it
     // in rollout is safe in the air.
     const brake = this.state === 'rtb' && this.rtbPhase === 'rollout';
+    this.lastPitchIn = pitchIn;
+    this.lastRollIn = rollIn;
+    this.lastVsDes = vsDes;
+    this.lastTerrainTurn = terrainTurn;
     return {
       pitchIn,
       rollIn,
