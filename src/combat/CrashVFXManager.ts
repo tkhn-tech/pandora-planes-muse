@@ -83,8 +83,64 @@ const SMOKE_STOPS: [number, string][] = [
   [1, 'rgba(255,255,255,0)'],
 ];
 
-/** Max ground scorch decals kept (oldest removed first — see
- *  scorchDecal). */
+/** Irregular scorch blotch texture (pass 13): a perfect dark circle
+ *  reads as a shadow or a disc on the grass — the live "dark shadow
+ *  beneath it". A real scorch is an irregular blotch, darkest in
+ *  the middle, feathered and lumpy at the edge. Drawn once and
+ *  cached; the material colour stays white so the texture carries
+ *  the colour. */
+let scorchTex: THREE.CanvasTexture | null = null;
+function irregularScorchTexture(): THREE.CanvasTexture {
+  if (scorchTex) return scorchTex;
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d')!;
+  const cx = 128;
+  const cy = 128;
+  // Lumpy silhouette: radius modulated by a few sine harmonics.
+  g.beginPath();
+  for (let i = 0; i <= 64; i++) {
+    const a = (i / 64) * Math.PI * 2;
+    const r =
+      118 *
+      (0.82 + 0.1 * Math.sin(a * 3 + 1.7) + 0.08 * Math.sin(a * 7 + 0.4));
+    const x = cx + Math.cos(a) * r;
+    const y = cy + Math.sin(a) * r;
+    if (i === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  }
+  g.closePath();
+  const grd = g.createRadialGradient(cx, cy, 8, cx, cy, 118);
+  grd.addColorStop(0, 'rgba(12,9,7,0.95)');
+  grd.addColorStop(0.55, 'rgba(42,36,30,0.85)');
+  grd.addColorStop(0.85, 'rgba(58,50,42,0.45)');
+  grd.addColorStop(1, 'rgba(58,50,42,0)');
+  g.fillStyle = grd;
+  g.fill();
+  // Mottled darker blotches inside, so the mark is not flat.
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const d = Math.random() * 60;
+    const bx = cx + Math.cos(a) * d;
+    const by = cy + Math.sin(a) * d;
+    const br = 12 + Math.random() * 22;
+    const bg = g.createRadialGradient(bx, by, 1, bx, by, br);
+    bg.addColorStop(0, 'rgba(10,8,6,0.5)');
+    bg.addColorStop(1, 'rgba(10,8,6,0)');
+    g.fillStyle = bg;
+    g.beginPath();
+    g.arc(bx, by, br, 0, Math.PI * 2);
+    g.fill();
+  }
+  scorchTex = new THREE.CanvasTexture(c);
+  return scorchTex;
+}
+
+/** Charred wreckage colours (pass 13): the old generic debris was a
+ *  light grey (0x8a97a3) that read on grass as "grey rectangular
+ *  slabs". Wreckage is near-black charred metal with brown/grey
+ *  variation — one piece per spawn, picked at random. */
+const CHARRED_COLORS = [0x17171a, 0x23211e, 0x2e2a24, 0x1c1c20, 0x201d1a];
 const MAX_SCORCH = 12;
 /** Scorch decal lifetime (s): fades out over the last 30 s. */
 const SCORCH_LIFE = 90;
@@ -109,8 +165,13 @@ const BOOM_MAX_SCALE = 40;
  *  finished, so the wreck read as not burning. A wreck fire burns
  *  for 12 s (respawnPlayer clears attached plumes on the next life,
  *  so it cannot leak into a fresh jet). Free (trail) plumes stay
- *  at 6 s. */
-const ATTACHED_PLUME_LIFE = 12;
+ *  at 6 s.
+ *  Pass 13: 12 s is still too short — the live crash report reads
+ *  "brief orange glow faded ~15 s" and then an intact-looking
+ *  wreck. A wreck fire burns for the debris lifetime (30 s), so
+ *  the crash site reads as a burning wreck for as long as the
+ *  wreckage is there; respawn still clears it. */
+const ATTACHED_PLUME_LIFE = 30;
 /** Debris lifetime (s). Pass 11: was 10 s AND pieces were deleted
  *  the moment they touched the ground, so by the time the player
  *  looked at the wreck (seconds after impact) the debris field was
@@ -140,6 +201,10 @@ export class CrashVFXManager {
     this.boomTex = radialTexture(BOOM_STOPS);
     this.smokeTex = radialTexture(SMOKE_STOPS);
     scene.add(this.flash);
+    // Pass 13: the flash is a scene object at the crash site — shift
+    // it with the world like every other VFX object (see
+    // spawnExplosion for the boom sprite).
+    this.opts.origin?.registerObject(this.flash);
   }
 
   /** Pooled explosion sprite burst + light flash + camera-shake hook.
@@ -161,6 +226,13 @@ export class CrashVFXManager {
       );
       sprite.visible = false;
       this.scene.add(sprite);
+      // Pass 13: the boom was the one VFX object never registered
+      // with the floating origin — a shift during its 2.5 s life
+      // left the fireball 2 km behind at the pre-shift coordinates
+      // (probe-crash-vfx E: boom 2773 m from the wreck after a
+      // mid-life shift). Register it at creation (idempotent, and
+      // pooled reuse repositions it anyway).
+      this.opts.origin?.registerObject(sprite);
       b = { sprite, t: 0, scale: 1 };
       this.booms.push(b);
     }
@@ -282,11 +354,23 @@ export class CrashVFXManager {
       holder.add(mesh);
       mesh = holder;
     } else {
+      // Pass 13: charred, irregular wreckage — NOT four identical
+      // light-grey 4 x 0.5 x 2.5 m slabs (the live "grey rectangular
+      // slabs scattered near every crash site"). Each piece gets a
+      // random size (2.5-5 m long, 0.3-0.9 m thick) and a random
+      // charred colour, so the field reads as torn wreckage.
+      const len = 2.5 + Math.random() * 2.5;
+      const thick = 0.3 + Math.random() * 0.6;
+      const wid = 1.2 + Math.random() * 1.6;
       mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(4, 0.5, 2.5),
-        new THREE.MeshLambertMaterial({ color: 0x8a97a3 }),
+        new THREE.BoxGeometry(wid, thick, len),
+        new THREE.MeshLambertMaterial({
+          color: CHARRED_COLORS[
+            Math.floor(Math.random() * CHARRED_COLORS.length)
+          ]!,
+        }),
       );
-      half = new THREE.Vector3(2, 0.25, 1.25);
+      half = new THREE.Vector3(wid / 2, thick / 2, len / 2);
     }
     mesh.position.copy(pos);
     mesh.position.y += 0.5;
@@ -357,17 +441,10 @@ export class CrashVFXManager {
     const decal = new THREE.Mesh(
       new THREE.CircleGeometry(radius, 24),
       new THREE.MeshBasicMaterial({
-        // Pass 5 (item 2): was 0x0a0a0a at 0.55 — a pure-black disc
-        // on the ground, which read as one of the "black discs" (a
-        // 430+ px black ellipse straddling a runway in the v4
-        // play-test, left by the sink crashes). A scorch is a darkened
-        // patch, not a black hole: dark brown-grey, less opaque.
-        // Pass 6: 0.45 was still reading black from a chase cam, so
-        // 0.35 now, and the radius is smaller (see above).
-        // Pass 11: 0.40 — a hard impact needs a mark that reads at
-        // the 42 m spectate distance; the slope conform below is
-        // what stops it reading as a disc, not the faintness.
-        color: 0x2a241e,
+        // Pass 13: the colour lives in the irregular blotch texture
+        // now (see irregularScorchTexture) — a flat dark circle
+        // read as a shadow/disc on the grass.
+        map: irregularScorchTexture(),
         transparent: true,
         opacity: 0.4,
         depthWrite: false,
@@ -431,6 +508,31 @@ export class CrashVFXManager {
       }
       const h = ((dMax + dMin) / 2 + 0.1) * Math.max(normal.y, 0.2);
       decal.position.set(pos.x, gh, pos.z).addScaledVector(normal, h);
+      // Pass 13: SNAP the decal's vertices to the terrain. The tilt
+      // + rim-centering above only fits a FLAT disc to a curved
+      // slope — on the f22 A cliff crash the rim range was 1.03 m
+      // wide, wider than the 1.0 m band it is centred in, so one
+      // rim point floated 0.68 m no matter how the disc was placed
+      // (the probe only passed there before because leftover debris
+      // from an earlier scenario had perturbed the crash site).
+      // Bake the tilt into the geometry and drop every vertex
+      // vertically onto the terrain (+0.12 m), so the mark drapes
+      // over the slope instead of floating above it or burying
+      // under it. The mesh quaternion is identity afterwards and
+      // the vertices are relative to the mesh position.
+      const geo = decal.geometry as THREE.CircleGeometry;
+      const centre = decal.position.clone();
+      const p = geo.getAttribute('position') as THREE.BufferAttribute;
+      const v = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.set(p.getX(i), p.getY(i), p.getZ(i)).applyQuaternion(q);
+        const wx = centre.x + v.x;
+        const wz = centre.z + v.z;
+        v.y = this.opts.groundHeight(wx, wz) + 0.12 - centre.y;
+        p.setXYZ(i, v.x, v.y, v.z);
+      }
+      p.needsUpdate = true;
+      decal.quaternion.identity();
     } else {
       decal.rotation.x = -Math.PI / 2;
       decal.position.set(pos.x, gh + 0.15, pos.z);

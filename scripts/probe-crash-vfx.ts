@@ -67,7 +67,7 @@ if (typeof (globalThis as unknown as { document?: unknown }).document === 'undef
   (globalThis as unknown as { document?: unknown }).document = {
     createElement: (tag: string) => {
       if (tag === 'canvas') {
-        return { width: 128, height: 128, getContext: () => ({ createRadialGradient: () => ({ addColorStop: () => {} }), fillRect: () => {}, set fillStyle(_v: unknown) {} }) };
+        return { width: 128, height: 128, getContext: () => ({ createRadialGradient: () => ({ addColorStop: () => {} }), fillRect: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, closePath: () => {}, fill: () => {}, arc: () => {}, set fillStyle(_v: unknown) {} }) };
       }
       return {};
     },
@@ -316,6 +316,45 @@ async function main(): Promise<void> {
     return { player, drain, detachEvents, attachedPlumes, handleDeaths };
   }
 
+  /** Remove one scenario's VFX residue (debris bodies, scorches,
+   *  plumes, booms) from the shared world/scene/origin so later
+   *  scenarios fly a clean world. Each scenario builds a fresh
+   *  CrashVFXManager, but the old manager's debris BODIES stay in
+   *  the Rapier world (nothing ever removes them) — a later jet can
+   *  clip a leftover box and crash somewhere else entirely (the
+   *  f22 A scorch flake: fa18's D3/E debris moved the crash site
+   *  after the probe grew more crash scenarios). Called at the end
+   *  of every scenario, after the player is disposed. */
+  function cleanupVfx(vfx: CrashVFXManager): void {
+    const V = vfx as unknown as { booms: BoomRec[]; plumes: PlumeRec[]; debris: DebrisRec[]; scorches: ScorchRec[] };
+    for (const d of V.debris) {
+      scene.remove(d.mesh);
+      origin.unregisterBody(d.body);
+      world.removeRigidBody(d.body);
+    }
+    V.debris.length = 0;
+    for (const s of V.scorches) {
+      scene.remove(s.mesh);
+      origin.unregisterObject(s.mesh);
+      s.mesh.geometry.dispose();
+      (s.mesh.material as THREE.Material).dispose();
+    }
+    V.scorches.length = 0;
+    for (const p of V.plumes) {
+      if (p.parent) p.parent.remove(p.group);
+      else {
+        scene.remove(p.group);
+        origin.unregisterObject(p.group);
+      }
+    }
+    V.plumes.length = 0;
+    for (const b of V.booms) {
+      scene.remove(b.sprite);
+      origin.unregisterObject(b.sprite);
+    }
+    V.booms.length = 0;
+  }
+
   /** Sample the VFX state at time t after impact. */
   function sample(vfx: CrashVFXManager, player: Aircraft, attachedPlumes: THREE.Group[], t: number): VfxSample {
     const V = vfx as unknown as { booms: BoomRec[]; plumes: PlumeRec[]; debris: DebrisRec[]; scorches: ScorchRec[] };
@@ -376,18 +415,17 @@ async function main(): Promise<void> {
     let rimMin = Infinity;
     for (const s of V.scorches) {
       scorchOpacity = Math.max(scorchOpacity, (s.mesh.material as THREE.MeshBasicMaterial).opacity);
-      // Rim points in the decal's own plane (it is tilted to the
-      // slope since pass 11): centre + right*cos + up*sin, r = 5.
-      const q = s.mesh.quaternion;
-      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
-      const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
-      const c = s.mesh.position;
-      for (let k = 0; k < 8; k++) {
-        const a = (k / 8) * Math.PI * 2;
-        const rx = c.x + (right.x * Math.cos(a) + up2.x * Math.sin(a)) * 5;
-        const rz = c.z + (right.z * Math.cos(a) + up2.z * Math.sin(a)) * 5;
-        const ry = c.y + (right.y * Math.cos(a) + up2.y * Math.sin(a)) * 5;
-        const delta = heightAt(rx, rz) - ry;
+      // Pass 13: the decal's vertices are baked + terrain-snapped
+      // (mesh quaternion identity), so read the actual vertex
+      // heights instead of reconstructing a tilted disc from the
+      // quaternion — the old reconstruction assumed a rigid flat
+      // disc and could not see the snap.
+      const posAttr = s.mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+      for (let vi = 0; vi < posAttr.count; vi++) {
+        const wx = s.mesh.position.x + posAttr.getX(vi);
+        const wy = s.mesh.position.y + posAttr.getY(vi);
+        const wz = s.mesh.position.z + posAttr.getZ(vi);
+        const delta = heightAt(wx, wz) - wy;
         rimMax = Math.max(rimMax, delta);
         rimMin = Math.min(rimMin, delta);
       }
@@ -515,6 +553,7 @@ async function main(): Promise<void> {
       verify(key, 'A stall', player, detachEvents, samples, false);
       origin.unregisterBody(player.body);
       player.dispose();
+      cleanupVfx(vfx);
     }
 
     // ---------- Scenario B: fast hard impact, staged conditions ----------
@@ -553,6 +592,7 @@ async function main(): Promise<void> {
       verify(key, 'B fast', player, detachEvents, samples, true);
       origin.unregisterBody(player.body);
       player.dispose();
+      cleanupVfx(vfx);
     }
 
     // ---------- Scenario C: stall impact through the LIVE path ----------
@@ -652,6 +692,7 @@ async function main(): Promise<void> {
       verify(key, 'C stall-live', player, detachEvents, samples, false);
       origin.unregisterBody(player.body);
       player.dispose();
+      cleanupVfx(vfx);
     }
 
     // ---------- Scenario C2: fast hard impact, LIVE path, flat ground ----------
@@ -724,6 +765,7 @@ async function main(): Promise<void> {
       verify(key, c2tag, player, detachEvents, samples, true);
       origin.unregisterBody(player.body);
       player.dispose();
+      cleanupVfx(vfx);
     }
 
     // ---------- Scenario D: steep dive must crash, not auto-recover ----------
@@ -739,6 +781,19 @@ async function main(): Promise<void> {
     for (const dive of [
       { tag: 'D1 low', agl: 84, speed: 227, pitchDownDeg: 37, thr: 0.6, maxT: 5, expectT: 3 },
       { tag: 'D2 high', agl: 3000, speed: 384, pitchDownDeg: 62, thr: 1.0, maxT: 30, expectT: 25 },
+      // Pass 13 D3: SHALLOW dives — the pass-12 trim (TRIM_K=2.0)
+      // holds the steep/fast dives (D1/D2) but the F-22 pulls out
+      // of every 30-deg dive (measured: 2-3 g at AoA ~0 deg, vy
+      // decaying to 0 over 14-22 s) and the F-18 pulls out of a
+      // 45-deg dive given altitude (from 10,000 m: level at 54 s,
+      // min AGL 1924 m) — the live F-18 case (-34,286 fpm at
+      // ~7,000 ft to +8,419 fpm) dove from ~35,842 ft, so the slow
+      // pull-out had the time to complete. A hard fast dive into
+      // the ground must crash at ANY dive angle and altitude.
+      { tag: 'D3a shallow-150', agl: 2100, speed: 150, pitchDownDeg: 30, thr: 0.6, maxT: 30, expectT: 25 },
+      { tag: 'D3b shallow-250', agl: 2100, speed: 250, pitchDownDeg: 30, thr: 0.6, maxT: 30, expectT: 25 },
+      { tag: 'D3c shallow-350', agl: 2100, speed: 350, pitchDownDeg: 30, thr: 0.6, maxT: 30, expectT: 25 },
+      { tag: 'D3d high-alt', agl: 10000, speed: 250, pitchDownDeg: 45, thr: 0.6, maxT: 60, expectT: 58 },
     ] as const) {
       origin.reset();
       const vfx = new CrashVFXManager(scene, { groundHeight: heightAt, origin });
@@ -819,6 +874,161 @@ async function main(): Promise<void> {
       check(`${key} ${dive.tag}: no hands-off level-off at altitude`, !levelledOff, `levelledOff=${levelledOff}`);
       origin.unregisterBody(player.body);
       player.dispose();
+      cleanupVfx(vfx);
+    }
+
+    // ---------- Scenario E: the wreck must READ as a wreck, persistently ----------
+    // Pass 13 (task 1): the crash lines prove crash() + handleDeaths
+    // run live (the vs values ARE the debug log), and the v4.3 live
+    // note records a "brief orange glow faded ~15 s" — so the
+    // explosion and the fire DO fire; what fails live is the
+    // PERSISTENT state. By the time anyone looks at the wreck the
+    // 2.5 s explosion and the 12 s fire are gone, and what remains
+    // does not read as a crash: the donor GLB is a single-mesh
+    // airframe (fa18 'ground', f22 'F-22-airframe') that sits level
+    // and factory-clean, the 4 debris boxes are identical light-grey
+    // 4 x 0.5 x 2.5 m slabs (0x8a97a3), and the scorch is a perfect
+    // dark circle that reads as a shadow. The live report — "sat
+    // whole on the grass with only a dark shadow beneath it" plus
+    // "grey rectangular slabs near every crash site" — is exactly
+    // that state. E stages a fast hard impact through the live
+    // path, then asserts the PERSISTENT wreck state at +15/+20 s:
+    // charred airframe, missiles off the rails, wreck tilted onto
+    // a wingtip, fire still burning, charred irregular debris, an
+    // irregular scorch — and that the explosion sprite survives a
+    // mid-life origin shift at the wreck (it was the one VFX object
+    // never registered with the origin).
+    {
+      origin.reset();
+      const vfx = new CrashVFXManager(scene, { groundHeight: heightAt, origin });
+      const { player, drain, handleDeaths } = makeRun(key, vfx, true);
+      await player.attachModel();
+      console.log(`\n=== ${key} E (persistent wreck state) ===`);
+      const by = heightAt(baseX, baseZ) + 10;
+      player.resetAt(baseX, by, baseZ, fhdg);
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler((8 * Math.PI) / 180, (fhdg * Math.PI) / 180, 0, 'YXZ'));
+      player.body.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+      const f = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      player.body.setLinvel({ x: f.x * 85, y: -16, z: f.z * 85 }, true);
+      player.vel.set(f.x * 85, -16, f.z * 85);
+      player.gear = true;
+      player.grounded = false;
+      player.thrTarget = 0.6;
+      player.throttle = 0.6;
+      player.pitchIn = 0;
+      let simT = 0;
+      let crashedAt = -1;
+      let shiftedAt: number | null = null;
+      let boomDistAfterShift = Infinity;
+      // Sample the persistent wreck state at +3/+15/+20 s.
+      interface ESample { attached: number; plumeOp: number; }
+      const eSamples = new Map<number, ESample>();
+      const takeE = (t: number): void => {
+        const V = vfx as unknown as { plumes: PlumeRec[] };
+        let attached = 0;
+        let plumeOp = 0;
+        for (const p of V.plumes) {
+          if (p.parent) {
+            attached++;
+            for (const c of p.group.children) plumeOp = Math.max(plumeOp, (c as THREE.Sprite).material.opacity);
+          }
+        }
+        eSamples.set(t, { attached, plumeOp });
+      };
+      while (simT < 30) {
+        liveFrame((dt) => {
+          simT += dt;
+          world.timestep = dt;
+          world.step(eventQueue);
+          drain();
+          if (player.alive) player.step(dt, WIND, null);
+          vfx.update(dt);
+          handleDeaths([player]);
+          if (!player.alive && crashedAt < 0) crashedAt = simT;
+          if (crashedAt >= 0) {
+            const since = simT - crashedAt;
+            // Mid-boom-life origin shift (+1.0 s): the explosion
+            // sprite must move with the world, not stay behind.
+            if (shiftedAt === null && since >= 1.0) {
+              shiftedAt = simT;
+              origin.applyShift(new THREE.Vector3(2500, 0, -1200));
+              const V = vfx as unknown as { booms: BoomRec[] };
+              const bt = player.body.translation();
+              if (V.booms.length) {
+                boomDistAfterShift = V.booms[0]!.sprite.position.distanceTo(new THREE.Vector3(bt.x, bt.y, bt.z));
+              }
+            }
+            for (const st of [3, 15, 20]) {
+              if (!eSamples.has(st) && since >= st) takeE(st);
+            }
+          }
+        });
+        if (crashedAt >= 0 && simT - crashedAt >= 20.5) break;
+      }
+      check(`${key} E: fast hard impact crashes through the LIVE path`, crashedAt >= 0 && player.lastCrashReason === 'hard landing', `crashedAt=${crashedAt < 0 ? 'never' : crashedAt.toFixed(2) + 's'} reason=${player.lastCrashReason} vs=${player.lastCrashVs.toFixed(1)}m/s`);
+      // Wreck char: the largest mesh of the model is the airframe
+      // (fa18 'ground' 18.79 m, f22 'F-22-airframe' 19.00 m); its
+      // material colour starts at #ffffff and must be charred dark.
+      {
+        const model = (player as unknown as { model: THREE.Object3D | null }).model;
+        let biggest: THREE.Mesh | null = null;
+        let biggestLen = 0;
+        model?.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh) {
+            const box = new THREE.Box3().setFromObject(o);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const len = Math.max(size.x, size.y, size.z);
+            if (len > biggestLen) { biggestLen = len; biggest = o as THREE.Mesh; }
+          }
+        });
+        let maxChan = 1;
+        if (biggest) {
+          const mats = Array.isArray(biggest.material) ? biggest.material : [biggest.material];
+          for (const m of mats) {
+            const c = (m as THREE.MeshStandardMaterial).color;
+            if (c) maxChan = Math.min(maxChan, Math.max(c.r, c.g, c.b));
+          }
+        }
+        check(`${key} E: wreck airframe is charred (largest mesh material dark, not factory #ffffff)`, biggest !== null && maxChan <= 0.35, `mesh=${biggest?.name ?? 'none'} len=${biggestLen.toFixed(1)}m maxChan=${maxChan.toFixed(2)}`);
+        if (key === 'fa18') {
+          const pack = model?.getObjectByName('Weapon_pack');
+          check(`${key} E: missiles off the rails (Weapon_pack hidden on the wreck)`, pack !== undefined && pack.visible === false, `Weapon_pack visible=${pack?.visible}`);
+        }
+        const rollDeg = Math.abs(new THREE.Euler().setFromQuaternion(player.group.quaternion, 'YXZ').z) * 180 / Math.PI;
+        check(`${key} E: wreck rests tilted on a wingtip (roll 8-30 deg, not level like a parked jet)`, rollDeg >= 8 && rollDeg <= 30, `roll=${rollDeg.toFixed(1)}deg`);
+      }
+      {
+        const s15 = eSamples.get(15)!;
+        const s20 = eSamples.get(20)!;
+        check(`${key} E: wreck fire still burning at +15 s (old 12 s plumes were gone)`, s15.attached >= 1 && s15.plumeOp >= 0.3, `attached=${s15.attached} maxOp=${s15.plumeOp.toFixed(2)}`);
+        check(`${key} E: wreck fire still present at +20 s`, s20.attached >= 1, `attached=${s20.attached}`);
+      }
+      {
+        // Generic debris boxes: the 4 null-segment pieces are plain
+        // Meshes (torn wing/tail arrive as Groups holding the
+        // segment). They must be charred dark, not light grey, and
+        // not all the same slab size.
+        const V = vfx as unknown as { debris: DebrisRec[]; scorches: ScorchRec[] };
+        const boxes = V.debris.filter((d) => d.mesh instanceof THREE.Mesh);
+        let maxChan = 0;
+        const sizes = new Set<string>();
+        for (const d of boxes) {
+          const m = d.mesh as THREE.Mesh;
+          const mat = m.material as THREE.MeshLambertMaterial;
+          if (mat.color) maxChan = Math.max(maxChan, Math.max(mat.color.r, mat.color.g, mat.color.b));
+          const g = m.geometry as THREE.BoxGeometry;
+          if (g.parameters) sizes.add(`${g.parameters.width.toFixed(1)}x${g.parameters.height.toFixed(1)}x${g.parameters.depth.toFixed(1)}`);
+        }
+        check(`${key} E: debris boxes are charred wreckage, not light-grey slabs`, boxes.length >= 4 && maxChan < 0.35, `boxes=${boxes.length} maxChan=${maxChan.toFixed(2)} (old 0x8a97a3 = 0.64)`);
+        check(`${key} E: debris boxes vary in size (not 4 identical slabs)`, sizes.size >= 2, `distinctSizes=${sizes.size} [${[...sizes].join(', ')}]`);
+        const scorch = V.scorches[0];
+        check(`${key} E: scorch is an irregular blotch, not a perfect disc (textured, not a flat circle)`, scorch !== undefined && (scorch.mesh.material as THREE.MeshBasicMaterial).map !== null, `map=${(scorch?.mesh.material as THREE.MeshBasicMaterial)?.map ? 'yes' : 'none'}`);
+      }
+      check(`${key} E: explosion sprite stays at the wreck across a mid-life origin shift (< 5 m from the wreck body)`, boomDistAfterShift < 5, `boomDist=${boomDistAfterShift === Infinity ? 'no-boom' : boomDistAfterShift.toFixed(1) + 'm'} shift=${origin.cumulativeShift.x.toFixed(0)},${origin.cumulativeShift.z.toFixed(0)}`);
+      origin.unregisterBody(player.body);
+      player.dispose();
+      cleanupVfx(vfx);
     }
   }
 

@@ -5,7 +5,7 @@
 // min clearance 302.7 m. This probe adds the live elements it
 // misses: the frame-1 origin shift (driven by a parked Alpha player),
 // the live variable-dt pattern (16–250 ms frames), and ALL THREE
-// loop scales (1.0 / 0.75 / 1.25 with start indexes 0 / 2 / 4,
+// loop slots 0 / 1 / 2 (shared loop, phase-offset ~1/3 lap,
 // exactly as main.ts builds them). It logs per-carrier pos.y vs
 // groundY vs groundAhead(2500) every 10 s and the minimum clearance
 // per carrier, and reports any terrain-net death with the carrier
@@ -30,8 +30,6 @@ import {
   TERRAIN_SEGMENTS,
 } from '../src/world/PandoraTerrainWorker';
 
-const SCALES = [1.0, 0.75, 1.25];
-const START_INDEXES = [0, 2, 4];
 let failures = 0;
 function check(name: string, ok: boolean, detail = ''): void {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
@@ -65,14 +63,14 @@ async function main(): Promise<void> {
   // otherwise shiftIfNeeded would fire the same shift every frame.
   origin.registerVector(playerPos);
   for (let i = 0; i < 3; i++) {
-    const loop = carrierLoop(SCALES[i]!);
+    const loop = carrierLoop(i);
     const c = new HelicarrierController(scene, world, {
       heightAt: heightAtLive,
       waypoints: loop.waypoints,
-      startIndex: START_INDEXES[i]!,
+      startIndex: loop.startIndex,
       onCarrierDown: () => {
         deaths.push(
-          `carrier ${i} (scale ${SCALES[i]}) died: pos=(${c.pos.x.toFixed(0)}, ${c.pos.y.toFixed(0)}, ${c.pos.z.toFixed(0)}) ground=${heightAtLive(c.pos.x, c.pos.z).toFixed(0)} groundAhead(2500)=${c.lookAheadGround.toFixed(0)}`,
+          `carrier ${i} (slot ${i}) died: pos=(${c.pos.x.toFixed(0)}, ${c.pos.y.toFixed(0)}, ${c.pos.z.toFixed(0)}) ground=${heightAtLive(c.pos.x, c.pos.z).toFixed(0)} groundAhead(2500)=${c.lookAheadGround.toFixed(0)}`,
         );
       },
     });
@@ -80,7 +78,7 @@ async function main(): Promise<void> {
     // with the origin exactly as main.ts does, then the per-round reset.
     await c.build();
     c.registerWithFloatingOrigin(origin);
-    const wp0 = loop.waypoints[START_INDEXES[i]!]!;
+    const wp0 = loop.waypoints[loop.startIndex]!;
     c.reset(
       loop.startPos.clone(),
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -123,7 +121,7 @@ async function main(): Promise<void> {
     if (deaths.length > 0) break;
   }
   for (let i = 0; i < 3; i++) {
-    console.log(`  carrier ${i} (scale ${SCALES[i]}): min clearance ${minClear[i]!.toFixed(1)} m at ${minClearAt[i]}`);
+    console.log(`  carrier ${i} (slot ${i}): min clearance ${minClear[i]!.toFixed(1)} m at ${minClearAt[i]}`);
   }
   for (const d of deaths) console.log(`  DEATH: ${d}`);
   check('no carrier dies in 180 s (all 3 loops, live dt + origin shift)', deaths.length === 0, deaths.join('; '));

@@ -217,7 +217,15 @@ export class AircraftAIController {
         }
       }
       if (this.state === 'patrol' || this.state === 'rtb') {
-        if (this.rng() < 0.3) this.pickNav(player);
+        // Pass 13: the timer re-pick is traffic-only now. For an
+        // enemy it made the patrol goal jump +/-300 m around the
+        // player every ~0.33 s, so the jet chased a jumping goal and
+        // wandered away from the player instead of orbiting him (the
+        // delayed1v1 drift: 479 m -> 3,690 m during a 25 s ground
+        // hold). An enemy re-picks on ARRIVAL (the dist < 120 rule
+        // below) or not at all — in intercept it does not use
+        // navTarget anyway.
+        if (this.role === 'traffic' && this.rng() < 0.3) this.pickNav(player);
       }
       // Pass 12 (Worker E): a Su-34 in patrol entered a bombing run
       // on a 25% roll per ~0.1 s decide tick — i.e. within ~0.5 s of
@@ -232,11 +240,17 @@ export class AircraftAIController {
       const distToPlayer = ac.pos.distanceTo(player.pos);
       const slowTgt = player.ias < 50;
       const engageR = slowTgt ? 3500 : 2600;
+      // Pass 13: an intercepting enemy (patrol + fair player) does
+      // not leave the fight to bomb — see the header note. A bomb run
+      // from 10 km out is the same "enemy never fights" failure.
+      const interceptingNow =
+        this.role === 'enemy' && this.state === 'patrol' && pFair;
       if (
         this.role === 'enemy' &&
         ac.bombs > 0 &&
         this.state === 'patrol' &&
         pFair &&
+        !interceptingNow &&
         distToPlayer > engageR &&
         this.rng() < 0.05
       ) {
@@ -269,22 +283,57 @@ export class AircraftAIController {
     // Steering goal + wanted speed per state. RTB flies the landing
     // pattern (rtbGoal), the bomb run flies its phases (bombGoal);
     // engage/evade/patrol keep the v2 goals.
-    // Pass 8 (item 2): patrol at 100 m/s, not 130 — at 130 m/s
-    // (250 kt) the AI's runway-to-runway patrol circuits run 10-23 km
-    // from the player (probe-ai-live: e0/e1 at 17-23 km), far outside
-    // the 12 km map and out of engagement for a whole 2.5 min round.
-    // 100 m/s keeps the patrol inside the map and near the action.
-    // Pass 12 (Worker E): 130 m/s, not 100 — a patrol at 100 m/s
-    // cannot re-close on a player cruising at 150 m/s: after a
-    // disengage the gap only grows, so the AI never re-enters the
-    // 2600 m engage range. 130 m/s still keeps the patrol circuits
-    // near the player (the navTarget is re-picked around the player
-    // every ~0.3 s) while letting the AI gain on a cruising player
-    // when the geometry favours it.
+    // Pass 13 (Worker D): the live 1v1 failure — patrol is a dead end.
+//
+// Measured in probe-ai-live --scenario cruise1v1 / delayed1v1 (F-35A,
+// 1 MiG-29, human cruise, live wind/variable dt/origin shift): the
+// enemy NEVER fights. The chain, all measured:
+//  1. While the player is on the ground the enemy patrols AWAY: its
+//     navTarget is re-picked around the player every ~0.33 s with
+//     +/-300 m jitter at 130 m/s, so it wanders off instead of
+//     orbiting — in delayed1v1 it goes from 479 m to 3,690 m away
+//     during a 25 s ground hold, nose 157 deg away from the player.
+//     By takeoff it is beyond the 2600 m engage range.
+//  2. Patrol can never re-close: patrol speedWant is 130 m/s vs a
+//     150-200 m/s cruising player. The enemy's nose sat 2-10 deg on
+//     the player for 240 s straight and the gap STILL grew ~65 m/s
+//     to 21-29 km. The player sees NO LOCK for the whole round
+//     (maxLockT 0.00 s over 300 s — the live 4:49 symptom exactly).
+//  3. The one head-on pass is wasted (min dist 124 m, 0 shots: the
+//     pass is over in ~1 s with the nose already 166 deg off) and the
+//     engage reversal is too slow to matter (45 deg bank cap beyond
+//     1200 m turns at ~4 deg/s; the gap grows to 5.2 km and the AI
+//     disengages at 6 km).
+// The fix: an enemy in patrol with a fair (airborne) player flies an
+// INTERCEPT — lead pursuit at closing speed — instead of a navTarget
+// transit; an enemy whose player is not fair yet LOITERS near the
+// player at 100 m/s instead of transiting away; and the engage bank
+// cap opens to 70 deg for a big heading error (a reversal) at any
+// range. Firing stays engage-gated, so patrol still never shoots.
+// Side effect, stated plainly: the Su-34 bomb entry is now gated on
+// NOT intercepting, and an intercepting enemy is by definition in
+// patrol with a fair player — so while the player is airborne a
+// Su-34 no longer leaves the fight to bomb Alpha. The bomb run was
+// already gated to ~11 s of 960 enemy-seconds by pass 12's abort
+// rule; the intercept takes precedence over the remaining sliver,
+// because a jet 10 km out that bombs instead of closing is the same
+// "enemy never fights" failure from the player's side.
+
     // Heading now (used by the engage corner-speed rule below and
     // by the steering section; computed once).
     const fwd = ac.fwd();
     const curHdg = Math.atan2(fwd.x, fwd.z);
+    // Pass 13: fair-player test (same as pFair in the decide block)
+    // and the intercept flag. An enemy in patrol with a fair player
+    // is INTERCEPTING — it flies to the player, not to a navTarget.
+    const fairPlayer =
+      player.alive && !player.dying && !player.grounded && player.spawnProt <= 0;
+    const intercepting =
+      this.state === 'patrol' && this.role === 'enemy' && fairPlayer;
+    // Pass 13: loitering (see the orbit block below) — an enemy in
+    // patrol whose player is not fair yet.
+    const loitering =
+      this.state === 'patrol' && this.role === 'enemy' && !fairPlayer;
     let goal: THREE.Vector3 = this.navTarget;
     let speedWant = 130;
     let gearDown = false;
@@ -302,6 +351,36 @@ export class AircraftAIController {
       goal = rg.goal;
       speedWant = rg.speed;
       gearDown = rg.gear;
+    } else if (intercepting) {
+      // Pass 13: INTERCEPT transit. Lead pursuit of the player at
+      // closing speed (player speed + 60, floor 200, cap 280 — a
+      // real intercept, full throttle while far), with the engage
+      // corner-speed rule (slow to 120 m/s in a hard turn, where the
+      // 70 deg bank below turns at ~22 deg/s instead of ~2 deg/s at
+      // 280 m/s). Climb/dive authority matches engage (vsCap 30) so
+      // a climbing player cannot out-climb the interceptor. The
+      // engage state still triggers at 2600 m and takes over with
+      // player speed + 25 from there; firing stays engage-gated, so
+      // this transit never shoots — it only delivers the jet to the
+      // fight. Without it, a patrolling enemy astern of a cruising
+      // player at 130 m/s never closes (probe-ai-live cruise1v1:
+      // nose 2-10 deg on the player for 240 s, gap +65 m/s to 21 km).
+      const distToP = ac.pos.distanceTo(player.pos);
+      const lead = this.skill.lead * clamp(distToP / 2000, 0, 1);
+      const tGo = distToP / 280;
+      goal = this.tmpB.copy(player.pos).addScaledVector(player.vel, lead * tGo);
+      speedWant = clamp(player.ias + 60, 200, 280);
+      vsCap = 30;
+      const desHdgHere = Math.atan2(goal.x - ac.pos.x, goal.z - ac.pos.z);
+      let hdgErrHere = desHdgHere - curHdg;
+      while (hdgErrHere > Math.PI) hdgErrHere -= 2 * Math.PI;
+      while (hdgErrHere < -Math.PI) hdgErrHere += 2 * Math.PI;
+      // Pass 13: range-dependent corner-speed cap (see the engage
+      // branch — a flat 120 pinned the interceptor at 120 m/s for a
+      // whole tail chase against a faster player).
+      if (Math.abs(hdgErrHere) > (30 * Math.PI) / 180) {
+        speedWant = Math.min(speedWant, 120 + distToP * 0.03);
+      }
     } else if (this.state === 'engage' && player.alive && !player.dying) {
       const distToP = ac.pos.distanceTo(player.pos);
       // Pass 12 (Worker E): the steering lead blends out at close
@@ -342,8 +421,18 @@ export class AircraftAIController {
       // 175 m/s, so it spent 20-30 s per pass circling with its nose
       // 30-70 deg off (probe-ai-live PASS trace). Corner speed
       // applies for most of the approach, not just the reversal.
+      // Pass 13 (Worker D): the cap is RANGE-dependent (was a flat
+      // 120). A flat 120 pinned the jet at 120 m/s for the whole tail
+      // chase against a 200 m/s player — the heading error never
+      // drops below 30 deg while chasing a faster target from behind,
+      // so the gap grew even in engage and the nose never closed
+      // (cruise1v1: 102 s in engage, 0 shots, enemy out-climbed to
+      // 7284 m). The turn rate the cap buys matters at CLOSE range,
+      // where the bearing rate is high; far away a modest turn rate
+      // suffices and the jet must keep its speed to close. 120 m/s at
+      // the merge, rising 30 m/s per km of range.
       if (Math.abs(hdgErrHere) > (30 * Math.PI) / 180) {
-        speedWant = Math.min(speedWant, 120);
+        speedWant = Math.min(speedWant, 120 + distToP * 0.03);
       }
       // Pass 12 (Worker E): climb/dive authority in a dogfight.
       // vsCap 15 m/s let a player climbing at 20-40 m/s (routine for
@@ -360,6 +449,30 @@ export class AircraftAIController {
         .addScaledVector(this.tmpA.copy(player.pos).sub(ac.pos), -1)
         .add(new THREE.Vector3(0, 120, 0));
       speedWant = 230;
+    }
+    // Pass 13: LOITER (orbit). An enemy whose player is not a fair
+    // target yet (on the ground, spawn-protected, dying) ORBITS the
+    // player — a point 800 m out, circling at 0.08 rad/s, 500 m above
+    // him — instead of flying to a fixed navTarget. The fixed-point
+    // version failed in delayed1v1: the goal sat near the enemy's own
+    // spawn, BEHIND its westbound heading, and at the 30 deg patrol
+    // bank cap the 180 deg reversal takes ~55 s — the jet flew 3.7 km
+    // west into the rim mountains, terrain-avoidance zoom-climbed it
+    // to 1842 m, and it stalled to 56 m/s (108 kt). An orbit point
+    // moves smoothly, so the jet never needs a reversal: it stays
+    // within ~1 km of the player, inside the 2600 m engage range the
+    // moment he goes airborne, co-altitude, already turning. Speed
+    // 100 m/s (just above 1.5x the MiG-29's stall, so the low-energy
+    // bank cap does not fight the orbit turn) and a 55 deg loiter
+    // bank cap below (the orbit needs ~39 deg at 100 m/s).
+    if (this.state === 'patrol' && this.role === 'enemy' && !fairPlayer) {
+      const orbitA = time * 0.08;
+      goal = this.tmpB.set(
+        player.pos.x + Math.cos(orbitA) * 800,
+        player.pos.y + 500,
+        player.pos.z + Math.sin(orbitA) * 800,
+      );
+      speedWant = 100;
     }
     const toGoal = this.tmpA.copy(goal).sub(ac.pos);
     const dist = toGoal.length();
@@ -473,12 +586,47 @@ export class AircraftAIController {
     // still guard the departure the old 60 deg cap was protecting
     // against. Patrol/traffic stay gentle (30 deg); RTB/bomb keep
     // 45 deg.
+    // Pass 13: the combat bank cap (70 deg) now also applies in the
+    // intercept transit, and in engage/evade it opens for a BIG
+    // heading error at any range — a reversal after a head-on pass at
+    // 45 deg bank turns at ~4 deg/s and takes ~45 s, during which a
+    // cruising player extends 6-10 km and the AI disengages. At 70 deg
+    // and corner speed (120 m/s) the same reversal takes ~8 s. The
+    // 45 deg long-range cap stays for small errors, where the pitch
+    // must stay free to descend.
+    const combatBank =
+      this.state === 'engage' || this.state === 'evade' || intercepting;
     const bankCap =
-      this.state === 'patrol' || this.role === 'traffic'
+      this.role === 'traffic'
         ? (30 * Math.PI) / 180
-        : this.state === 'engage' || this.state === 'evade'
-          ? ((ac.pos.distanceTo(goal) > 1200 ? 45 : 70) * Math.PI) / 180
-          : (45 * Math.PI) / 180;
+        : loitering
+          ? // Pass 13: the orbit needs ~39 deg of bank at 100 m/s
+            // (atan(V*omega/g) for omega 0.08 rad/s); 30 deg cannot
+            // hold the circle and the jet cuts across it.
+            (55 * Math.PI) / 180
+          : combatBank
+            ? // Pass 13 A/B (2nd round, REVERTED): 60 deg for a big
+              // heading error at any range was tried to fix the slow
+              // reversal (45 deg at 200 m/s turns at ~2.8 deg/s, so
+              // the 180 deg reversal after a head-on pass takes ~64 s
+              // and the 200 m/s player flies 12.8 km away before the
+              // enemy can turn back — cruise1v1 was one head-on pass
+              // in 300 s, firstFire never). 60 deg DID let the enemy
+              // fight (cruise1v1 firstFire 36.8 s, player shot down
+              // 51.9 s) — but it broke the pursuit lock AGAIN
+              // (maxLockT 0.03 s, gun 24), the same as 70 deg. The
+              // pursuit lock is the binding constraint: any bank above
+              // 45 deg at long range lets the AI turn/climb out of
+              // the scripted player's 15 deg lock cone faster than it
+              // can track, while the AI's 30 deg gun cone still
+              // tracks the player fine. So the reversal stays slow
+              // (the 1v1 cruise fight after a head-on pass is the
+              // known remaining limitation, reported honestly) and
+              // the range-gated 45/70 caps — which pass the pursuit
+              // probe — are restored.
+              ((ac.pos.distanceTo(goal) <= 1200 ? 70 : 45) * Math.PI) /
+              180
+            : (45 * Math.PI) / 180;
     // (pass 12, Worker E: the combat bank cap is range-gated. In a
     // 70 deg bank the pitch input rotates the nose in the roll plane,
     // so the jet cannot descend — it stays 500-2700 m above the
@@ -560,7 +708,11 @@ export class AircraftAIController {
     // fire in combat, so the turn rate (probe-ai-live) is untouched.
     // (lowEnergy is defined above, at the bank cap — 1.5x stall
     // speed, so it fires early in the bleed, not after the stall.)
-    const inCombat = this.state === 'engage' || this.state === 'evade';
+    // Pass 13: loitering joins the combat exemption — the orbit turn
+    // IS the loiter, and cutting its bank on every sink defeats it.
+    // The low-energy unload (below 1.5x stall) still fires, and the
+    // AoA limiter + hard floor still guard the departure.
+    const inCombat = this.state === 'engage' || this.state === 'evade' || intercepting || loitering;
     if (ac.vsi < vsDesHere - 5 && (!inCombat || lowEnergy)) phiDes *= 0.3;
     const phiNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
     let rollIn = clamp((phiDes - phiNow) * 2.0, -1, 1);
@@ -742,23 +894,29 @@ export class AircraftAIController {
     const landingFinal =
       this.state === 'rtb' && this.rtbPhase !== 'approach';
     if (!landingFinal) {
-      // Pass 8 (item 2): the look-ahead scales with speed — 260 m is
-      // under 2 s of flight at the AI's 130-150 m/s, so a jet chasing
-      // a low player into a rising range front cannot climb out in
-      // time (probe-ai-live, low-altitude run: e0 dead at 35.3 s,
-      // e1 at ~100 s). Five seconds of flight plus a 120 m trigger
-      // margin gives the pull-up room to work. The hard floor stays
-      // at ground + 60 m so the Su-34's bomb dive (which must go low)
-      // is not interrupted.
+      // Pass 13: PROPORTIONAL terrain pull-up (was bang-bang
+      // pitchIn = -1). A boundary graze (clearance 60-120 m) used to
+      // command full nose-up, zooming the jet 2000+ m and bleeding it
+      // to near-stall (delayed1v1: 199 m -> 2584 m, 121 kt -> 62 kt,
+      // then a climb/dive porpoise that never closed on the player).
+      // The pull is now proportional to the shortfall: -0.3 at the
+      // boundary, ramping to -1.0 only when the clearance is gone (a
+      // genuine emergency). The thresholds are unchanged — only the
+      // command softens — and a stronger existing nose-up command is
+      // preserved (Math.min keeps the more nose-up of the two).
       const lookAhead = Math.max(260, ac.ias * 5);
       const ahead = this.tmpB.copy(ac.pos).addScaledVector(ac.fwd(), lookAhead);
-      if (this.groundHeight(ahead.x, ahead.z) > ac.pos.y - 120) pitchIn = -1;
+      const clearAhead = ac.pos.y - this.groundHeight(ahead.x, ahead.z);
+      if (clearAhead < 120) {
+        pitchIn = Math.min(pitchIn, -clamp(0.3 + (120 - clearAhead) / 120, 0.3, 1));
+      }
       const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
-      if (
-        ac.pos.y < this.groundHeight(ac.pos.x, ac.pos.z) + 60 ||
-        (deckY > -Infinity && ac.pos.y < deckY + 60)
-      ) {
-        pitchIn = -1;
+      const floorY = Math.max(
+        this.groundHeight(ac.pos.x, ac.pos.z) + 60,
+        deckY > -Infinity ? deckY + 60 : -Infinity,
+      );
+      if (ac.pos.y < floorY) {
+        pitchIn = Math.min(pitchIn, -clamp(0.3 + (floorY - ac.pos.y) / 45, 0.3, 1));
         this.thrTarget = Math.max(this.thrTarget, 0.8);
       }
     }

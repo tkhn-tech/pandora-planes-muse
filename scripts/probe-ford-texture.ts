@@ -422,6 +422,123 @@ async function main(): Promise<void> {
       ? markingPlaneMats.map((m) => `mapShared=${!!fordDeckMat && m.map === fordDeckMat.map} factor=${m.polygonOffsetFactor}`).join('; ')
       : 'no deck_markings planes found',
   );
+  // Pass 13 (worker E), Ford seam: the v4.7 live check saw a seam
+  // between the deck sections. Root cause, measured here: the
+  // marking planes' UVs were normalised PER RECTANGLE (u over that
+  // rect's own z-range, v over its own x-range), so each rect mapped
+  // the WHOLE Ford strip onto itself — the strip appeared twice, and
+  // at the shared edge (z = 2.0) the stern plane ended at u = 1.0
+  // while the bow plane started at u = 0.0, with a 15% longitudinal
+  // and 49% lateral scale step. The fix shares ONE UV space across
+  // all rects (global deck bounds), so u/v are continuous functions
+  // of world (x, z): the strip flows across the junction at one
+  // scale. These checks FAIL on the per-rect mapping and PASS on
+  // the shared mapping.
+  {
+    const planes: THREE.Mesh[] = [];
+    carrier.group.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && o.name === 'deck_markings') {
+        planes.push(o as THREE.Mesh);
+      }
+    });
+    const stats = planes.map((plane, pi) => {
+      const posA = plane.geometry.attributes.position as THREE.BufferAttribute;
+      const uvA = plane.geometry.attributes.uv as THREE.BufferAttribute;
+      let uMin = Infinity;
+      let uMax = -Infinity;
+      let vMin = Infinity;
+      let vMax = -Infinity;
+      let zMin = Infinity;
+      let zMax = -Infinity;
+      let xMin = Infinity;
+      let xMax = -Infinity;
+      for (let i = 0; i < posA.count; i++) {
+        const wx = posA.getX(i) + plane.position.x;
+        const wz = posA.getZ(i) + plane.position.z;
+        const u = uvA.getX(i);
+        const v = uvA.getY(i);
+        uMin = Math.min(uMin, u);
+        uMax = Math.max(uMax, u);
+        vMin = Math.min(vMin, v);
+        vMax = Math.max(vMax, v);
+        zMin = Math.min(zMin, wz);
+        zMax = Math.max(zMax, wz);
+        xMin = Math.min(xMin, wx);
+        xMax = Math.max(xMax, wx);
+      }
+      // u at the shared edge: the edge of THIS plane nearest the
+      // OTHER plane's centre (the rects meet at z = 2.0: the stern
+      // plane's forward edge, the bow plane's aft edge).
+      const other = planes[1 - pi]!;
+      const otherCentreZ = other.position.z;
+      const edgeZ =
+        Math.abs(zMax - otherCentreZ) < Math.abs(zMin - otherCentreZ)
+          ? zMax
+          : zMin;
+      let edgeU = 0;
+      let edgeN = 0;
+      for (let i = 0; i < posA.count; i++) {
+        const wz = posA.getZ(i) + plane.position.z;
+        if (Math.abs(wz - edgeZ) < 0.01) {
+          edgeU += uvA.getX(i);
+          edgeN++;
+        }
+      }
+      edgeU = edgeN > 0 ? edgeU / edgeN : NaN;
+      return {
+        zMin,
+        zMax,
+        xMin,
+        xMax,
+        uMin,
+        uMax,
+        vMin,
+        vMax,
+        duDz: (uMax - uMin) / (zMax - zMin),
+        dvDx: (vMax - vMin) / (xMax - xMin),
+        edgeZ,
+        edgeU,
+      };
+    });
+    for (const [i, s] of stats.entries()) {
+      console.log(
+        `  markings plane ${i}: x[${s.xMin.toFixed(1)},${s.xMax.toFixed(1)}] z[${s.zMin.toFixed(1)},${s.zMax.toFixed(1)}] u[${s.uMin.toFixed(3)},${s.uMax.toFixed(3)}] v[${s.vMin.toFixed(3)},${s.vMax.toFixed(3)}] du/dz=${s.duDz.toFixed(5)}/m dv/dx=${s.dvDx.toFixed(5)}/m edgeU@${s.edgeZ.toFixed(1)}=${s.edgeU.toFixed(3)}`,
+      );
+    }
+    check(
+      'pass 13: marking-plane UVs are continuous across the deck-section junction (same u at the shared edge)',
+      stats.length === 2 &&
+        Math.abs(stats[0]!.edgeU - stats[1]!.edgeU) < 0.01,
+      stats.length === 2
+        ? `stern edge u=${stats[0]!.edgeU.toFixed(3)} bow edge u=${stats[1]!.edgeU.toFixed(3)} (was 1.000 vs 0.000)`
+        : `planes=${stats.length}`,
+    );
+    check(
+      'pass 13: longitudinal UV scale du/dz is identical on both planes (one strip, one scale)',
+      stats.length === 2 &&
+        Math.abs(stats[0]!.duDz - stats[1]!.duDz) / stats[0]!.duDz < 0.01,
+      stats.length === 2
+        ? `stern ${stats[0]!.duDz.toFixed(5)}/m bow ${stats[1]!.duDz.toFixed(5)}/m (was 1/130.8 vs 1/150.5, a 15% step)`
+        : `planes=${stats.length}`,
+    );
+    check(
+      'pass 13: lateral UV scale dv/dx is identical on both planes',
+      stats.length === 2 &&
+        Math.abs(stats[0]!.dvDx - stats[1]!.dvDx) / stats[0]!.dvDx < 0.01,
+      stats.length === 2
+        ? `stern ${stats[0]!.dvDx.toFixed(5)}/m bow ${stats[1]!.dvDx.toFixed(5)}/m (was 1/71.7 vs 1/48.1, a 49% step)`
+        : `planes=${stats.length}`,
+    );
+    check(
+      'pass 13: marking-plane UVs stay inside [0,1] (no clamp/repeat at the edges)',
+      stats.every(
+        (s) =>
+          s.uMin >= -0.001 && s.uMax <= 1.001 && s.vMin >= -0.001 && s.vMax <= 1.001,
+      ),
+      stats.map((s) => `u[${s.uMin.toFixed(2)},${s.uMax.toFixed(2)}] v[${s.vMin.toFixed(2)},${s.vMax.toFixed(2)}]`).join(' '),
+    );
+  }
+
   carrier.group.updateMatrixWorld(true);
   const ray = new THREE.Raycaster();
   const downDir = new THREE.Vector3(0, -1, 0);

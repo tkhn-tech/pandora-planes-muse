@@ -1787,6 +1787,21 @@ export class Aircraft {
     // stays — this override is the controller's ground truth.
     if (this.grounded) this.gload = 1;
 
+    // AoA on the ground is 0, for the same reason (pass 13, worker E):
+    // a parked jet's air velocity is an artefact of being CARRIED, not
+    // of flying. On the deck the carrier's own motion gives the jet
+    // ~40 m/s forward and up to ±15 m/s vertical from terrain
+    // following, so the solver reads AoA −20.6° on a climb and +13°
+    // on a descent while the jet sits level on the deck (probe-aoa-g
+    // §4: AoA range [−20.7, +14.2] deg, deck Vy [−10, +15] m/s — the
+    // v4.7 live deck drift, −9.8° to −20°). The wing is not flying,
+    // so the HUD AoA is 0 — exactly as G is 1.0 and the stall flag is
+    // cleared on contact. The solver's own AoA is untouched (forces
+    // already computed); only the reported value is overridden, and
+    // only while grounded — the moment the jet rotates, grounded
+    // clears and the real AoA reads again.
+    if (this.grounded) this.aoaDeg = 0;
+
     // G-load + structural limit (v2): over-G damages the airframe.
     if (this.gload > S.maxG + OVER_G_MARGIN && this.ias > OVER_G_MIN_SPEED) {
       this.applyDamage(OVER_G_DPS * dt, 'fuselage', false);
@@ -2051,27 +2066,53 @@ export class Aircraft {
     // < 0.1 gate let the auto-level fight the bank-hold and drop
     // the turn rate below its band (probe-bet: fa18 13.0, mig29
     // 13.6 deg/s). A released stick / centred stick reads exactly
-    // 0, so hands-off still gets the auto-level. Also gated on
-    // |bank| < 45 deg: it must not fight a deliberate steep bank
-    // (the 80 deg bank-hold) even in the instants the feedback
-    // rollIn reads exactly 0 — the spring only returns moderate
-    // banks to level, and the spiral is slow enough below 45 deg
-    // that the spring catches it before it gets there.
+    // 0, so hands-off still gets the auto-level.
+    // Pass 13 (worker B): the |bank| < 45 deg gate is REMOVED. It
+    // made the auto-level a cliff: hands-off from 30 deg levelled
+    // in ~1 s, but from 60 deg the bank sat at 59 deg after 1 s
+    // and 57 deg after 5 s, and from 111 deg it sat at 105 deg
+    // after 5 s (measured, probe-roll section F) — the v4.7 live
+    // "bank sticks with no auto-levelling" is exactly this gate,
+    // because the oversensitive tap had already banked the jet
+    // past 45 deg before the pilot released. The exact-0 rollIn
+    // gate alone protects the 80 deg bank-hold: the hold's PD
+    // output is exactly 0 only on transient frames (bank == target
+    // to float precision), so the spring disturbs it by a fraction
+    // of a degree per frame at most — verified by the 80 deg hold
+    // check in probe-roll section F. The spring cap rises 0.25 ->
+    // 0.40 rad/s (~23 deg/s) so a steep bank returns in seconds,
+    // not never; at moderate banks the rate is unchanged in
+    // practice (the 30 deg hands-off still levels in ~1 s).
+    // Pass 13 (worker E): the spring is ALSO gated off near the
+    // vertical (|Euler pitch| > 60 deg). Near-vertical the Euler YXZ
+    // bank (z) is a gimbal artefact, not a bank: a straight full
+    // pull from 400 kt reads bank 172° at the loop top, and the
+    // spring then commands a max-rate (−0.4 rad/s) roll about the
+    // nose axis — which, nose-vertical, is a WORLD yaw that slices
+    // the nose sideways (probe-aoa-g §2: beta 0 → +35° in 0.5 s,
+    // AoA +33° → −17°, G +5.3 → −3.2 — the v4.7 live steep-climb
+    // AoA −41°..−54° / G −1.2..−3.0 signature; with the spring off,
+    // §2f, the same pull holds beta 0.0°, AoA +28°..+35°, G
+    // +2.9..+8.7). The curve solver never departs (§2e: beta 0.0°).
+    // "Wings level" is undefined nose-vertical anyway, so the pilot
+    // owns the roll there; the spring still covers every bank in
+    // level flight (the pass-13 worker-B |bank| < 45° removal is
+    // untouched — a 111° bank at pitch ~0° still levels).
     if (
       !onSurface &&
       typeof this.solver.syncRates === 'function' &&
       rollIn === 0 &&
       !this.dying &&
       !this.stalled &&
-      this.vectorDeg < 70
+      this.vectorDeg < 70 &&
+      Math.abs(new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x) <
+        60 * D2R
     ) {
       const bankNow = new THREE.Euler().setFromQuaternion(
         this.quat,
         'YXZ',
       ).z;
-      if (Math.abs(bankNow) < (45 * Math.PI) / 180) {
-        rates.rollRate += clamp(-bankNow * 2, -0.25, 0.25);
-      }
+      rates.rollRate += clamp(-bankNow * 2, -0.4, 0.4);
     }
     this.solver.syncRates?.(rates);
     // BET stall / dying nose-drop (rate biases, AFTER the sync).
@@ -2458,7 +2499,9 @@ export class Aircraft {
       const wing = new THREE.Mesh(
         new THREE.BoxGeometry(span * 0.45, 0.3, this.spec.length * 0.22),
         new THREE.MeshLambertMaterial({
-          color: new THREE.Color(this.spec.tint).multiplyScalar(0.45),
+          // Pass 13: charred darker (was 0.45) so the torn panel
+          // reads as burnt wreckage, not a painted spare part.
+          color: new THREE.Color(this.spec.tint).multiplyScalar(0.3),
         }),
       );
       wing.name = 'torn_wing';
@@ -2485,7 +2528,8 @@ export class Aircraft {
       const tail = new THREE.Mesh(
         new THREE.BoxGeometry(span * 0.35, 0.3, this.spec.length * 0.15),
         new THREE.MeshLambertMaterial({
-          color: new THREE.Color(this.spec.tint).multiplyScalar(0.45),
+          // Pass 13: charred darker (was 0.45) — see detachWing.
+          color: new THREE.Color(this.spec.tint).multiplyScalar(0.3),
         }),
       );
       tail.name = 'torn_tail';
@@ -2554,6 +2598,91 @@ export class Aircraft {
     this.events.onDying?.(this, reason);
   }
 
+  /** True once wreckModel() has charred/tilted the model for this
+   *  life (pass 13) — a public read so probes (and the HUD) can tell
+   *  a wreck from a parked jet. Cleared by respawn(). */
+  wrecked = false;
+  private modelWrecked = false;
+  private wreckHidden: THREE.Object3D[] = [];
+
+  /** Wreck the model for this life (pass 13): the donor GLBs are
+   *  single-mesh airframes — fa18 'ground' (13.14 x 4.65 x 18.79 m),
+   *  f22 'F-22-airframe', f35a/f15e likewise — so the wing and tail
+   *  cannot be hidden without a model rebake (measured with a GLB
+   *  mesh-tree probe, 2026-11-20). What CAN be done without a
+   *  rebake: char the whole airframe (materials are cloned per
+   *  aircraft in attachModel, so this is safe and restorable),
+   *  hide the F-18 Weapon_pack (clean missiles on the rails read
+   *  as an intact jet), and rest the wreck tilted on a wingtip so
+   *  it never sits level like a parked jet. The tilt is visual
+   *  only — it multiplies the GROUP quaternion after the physics
+   *  pose copy, never the physics quat — and the low wingtip digs
+   *  into the grass, which reads as a wreck that plowed in. The
+   *  next life restores everything (restoreModel, called from
+   *  respawn()). Idempotent: a second crash in the same life must
+   *  not re-darken the already-charred materials. */
+  private wreckModel(): void {
+    if (!this.model || this.modelWrecked) return;
+    this.modelWrecked = true;
+    this.wrecked = true;
+    this.model.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      for (const mat of mats) {
+        const sm = mat as THREE.MeshStandardMaterial;
+        if (!sm.color) continue;
+        if (sm.userData.__origColor === undefined) {
+          sm.userData.__origColor = sm.color.getHex();
+          if (typeof sm.roughness === 'number') {
+            sm.userData.__origRoughness = sm.roughness;
+          }
+        }
+        sm.color.multiplyScalar(0.22);
+        if (typeof sm.roughness === 'number') sm.roughness = 1;
+      }
+    });
+    const pack = this.model.getObjectByName('Weapon_pack');
+    if (pack) {
+      pack.visible = false;
+      this.wreckHidden.push(pack);
+    }
+    const tilt =
+      (10 + Math.random() * 15) * (Math.random() < 0.5 ? -1 : 1) * D2R;
+    const qTilt = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 0, 1),
+      tilt,
+    );
+    this.group.quaternion.multiply(qTilt);
+  }
+
+  /** Restore the model for a fresh life (pass 13): original colours
+   *  and roughness back, hidden meshes visible again. The rest tilt
+   *  needs no restore — respawn() re-syncs the group from the body. */
+  private restoreModel(): void {
+    if (!this.model || !this.modelWrecked) return;
+    this.modelWrecked = false;
+    this.wrecked = false;
+    this.model.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      for (const mat of mats) {
+        const sm = mat as THREE.MeshStandardMaterial;
+        if (sm.userData.__origColor !== undefined) {
+          sm.color.setHex(sm.userData.__origColor as number);
+          delete sm.userData.__origColor;
+        }
+        if (sm.userData.__origRoughness !== undefined) {
+          sm.roughness = sm.userData.__origRoughness as number;
+          delete sm.userData.__origRoughness;
+        }
+      }
+    });
+    for (const o of this.wreckHidden) o.visible = true;
+    this.wreckHidden = [];
+  }
+
   /** Ground impact after a dying fall (damage-model §6 step 5). The
    *  explosion is scaled by the remaining fuel (a wreck with fuel
    *  left fireballs; without fuel it crumples), debris scatters, and
@@ -2583,6 +2712,7 @@ export class Aircraft {
     }
     this.group.position.copy(this.pos);
     this.group.quaternion.copy(this.quat);
+    this.wreckModel();
     this.body.setEnabled(false);
     this.events.onCrash?.(this, this.dyingReason ?? 'crashed');
   }
@@ -2632,6 +2762,7 @@ export class Aircraft {
     // on the ground instead of vanishing.
     this.group.position.copy(this.pos);
     this.group.quaternion.copy(this.quat);
+    this.wreckModel();
     this.body.setEnabled(false);
     if (this.ai) this.ai.state = 'dead';
     this.events.onCrash?.(this, reason);
@@ -2743,6 +2874,9 @@ export class Aircraft {
     this.lockT = 0;
     this.lockTarget = null;
     this.group.visible = true;
+    // Pass 13: a fresh life is a fresh jet — restore the charred /
+    // tilted / unloaded wreck model (see wreckModel).
+    this.restoreModel();
     this.body.setEnabled(true);
     this.body.setTranslation(
       { x: this.pos.x, y: this.pos.y, z: this.pos.z },

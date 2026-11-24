@@ -72,7 +72,7 @@ import { RUNWAY_TABLE } from './world/PandoraTerrainWorker';
 import { HelicarrierController, CARRIER_START_POS, CARRIER_WAYPOINTS, carrierLoop } from './entities/HelicarrierController';
 import { WeaponSystem } from './combat/WeaponSystem';
 import { CrashVFXManager } from './combat/CrashVFXManager';
-import { FlightHUD, MS2KT } from './ui/FlightHUD';
+import { FlightHUD, MS2KT, gameToTrueHdg } from './ui/FlightHUD';
 import { SandboxMenu } from './ui/SandboxMenu';
 import type { SandboxConfig } from './ui/SandboxMenu';
 import { PCFlightInput } from './input/PCFlightInput';
@@ -80,7 +80,7 @@ import { MobileFlightInput, touchStickScale, touchPitchScale, touchDeadzone } fr
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.7 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.8 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -331,10 +331,11 @@ runwayPlacer.setOriginShift(floatingOrigin.cumulativeShift);
 // Helicarriers (issue 5 — count 0–3, default 1). Up to three SHIELD
 // carriers are built once (each loads the GLB) and the chosen count
 // is activated per round; the rest are deactivated (hidden, deck
-// disabled). Each flies its own loop — a scaled hexagon, so the loops
-// are concentric and never overlap — with its own start index, so the
-// carriers are spread around their circuits instead of stacked.
-const CARRIER_LOOP_SCALES = [1.0, 0.75, 1.25];
+// disabled). All three fly the SAME loop (carrierLoop slot 0/1/2),
+// phase-offset by ~1/3 lap, so the loops never overlap — with their
+// own start index, so the carriers are spread around the circuit
+// instead of stacked.
+const CARRIER_SLOTS = [0, 1, 2];
 /** Deck-spawn offset (m aft of the carrier group origin). The aft
  *  deck rect reaches local z = -128.8 (deck_top meshes), so 85 m aft
  *  is 16 m inside the stern with ~265 m of deck ahead. The old 120 m
@@ -342,10 +343,9 @@ const CARRIER_LOOP_SCALES = [1.0, 0.75, 1.25];
  *  the stern to the terrain under the carrier and slid at the
  *  carrier's 78 kt (pass 9, item 4). */
 const DECK_SPAWN_AFT_M = 85;
-const CARRIER_START_INDEXES = [0, 2, 4];
-const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
-  (scale, i) => {
-    const loop = carrierLoop(scale);
+const carriers: HelicarrierController[] = CARRIER_SLOTS.map(
+  (slot, i) => {
+    const loop = carrierLoop(slot);
     return new HelicarrierController(scene, rapierWorld, {
       modelGlbUri: HELICARRIER_GLB,
       deckTopSourceY: 29.78,
@@ -356,7 +356,7 @@ const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
       // surface it would actually hit.
       heightAt: (x, z) => worldGen.heightfieldHeightAt(x, z),
       waypoints: loop.waypoints,
-      startIndex: CARRIER_START_INDEXES[i]!,
+      startIndex: loop.startIndex,
       onPodDestroyed: (_index, worldPos) => {
         vfx.spawnExplosion(worldPos.clone(), 1);
         sfx('boom');
@@ -389,7 +389,7 @@ const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
         // tell which of the three carriers was lost.
         hud.toast(
           `CARRIER ${i + 1} IMPACT`,
-          `Helicarrier ${i + 1} (loop ×${scale}) hit the ground.`,
+          `Helicarrier ${i + 1} (slot ${slot + 1}) hit the ground.`,
         );
       },
       onCarrierDown: () => {
@@ -399,7 +399,7 @@ const carriers: HelicarrierController[] = CARRIER_LOOP_SCALES.map(
         // HP at the time, so a live test can say which carrier and why.
         hud.toast(
           `CARRIER ${i + 1} DOWN`,
-          `Helicarrier ${i + 1} (loop ×${scale}) is lost.`,
+          `Helicarrier ${i + 1} (slot ${slot + 1}) is lost.`,
         );
       },
     });
@@ -1358,19 +1358,20 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.spec.vtol ? 'vtol' : 'fixed-wing',
   );
 
-  // Carriers — activate the chosen count (issue 5), each on its own
-  // loop (a scaled hexagon + its own start index). The primary is dead
-  // ahead of Alpha (900 m east on the takeoff heading), so it is in
-  // the portrait-phone view at round start. Reset BEFORE the player
-  // spawns: a deck spawn needs the carrier's current position /
-  // heading / cruise velocity. Carriers beyond the count are
-  // deactivated (hidden, deck disabled).
+  // Carriers — activate the chosen count (issue 5), each on the
+  // shared loop at its own slot (phase-offset ~1/3 lap). The primary
+  // starts 1800 m east of Alpha, 600 m north of its centreline, so
+  // it is 18° off the takeoff heading at round start — visible, but
+  // never over the runway. Reset BEFORE the player spawns: a deck
+  // spawn needs the carrier's current position / heading / cruise
+  // velocity. Carriers beyond the count are deactivated (hidden,
+  // deck disabled).
   const heliCount = clamp(Math.round(cfg.helicarriers ?? 1), 0, 3);
   heliCountActive = heliCount;
   carriers.forEach((c, i) => {
     if (i < heliCount) {
-      const loop = carrierLoop(CARRIER_LOOP_SCALES[i]!);
-      const wp0 = loop.waypoints[CARRIER_START_INDEXES[i]!]!;
+      const loop = carrierLoop(i);
+      const wp0 = loop.waypoints[loop.startIndex]!;
       c.reset(
         loop.startPos.clone(),
         Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -1685,7 +1686,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.7 · Vite + Rapier).
+// Footer version string (v4.8 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1950,18 +1951,26 @@ function playerInput(dt: number): void {
     return;
   }
   // Merge: touch stick, then PC (gamepad > mouse-yoke > keyboard, merged
-  // inside PCFlightInput), then tilt adds. An active PC stick replaces the
-  // touch stick; keyboard arrows already add on top inside PCFlightInput.
+  // inside PCFlightInput), then tilt adds.
+  // Pass 13 (worker B): an ACTIVE touch stick wins over the PC stick.
+  // The old rule was "PC wins when nonzero" — but the PC stick is
+  // nonzero for ~0.4 s after ANY arrow tap (the kbRoll return tail),
+  // and a mouse yoke can sit a hair off zero, so a touch drag in
+  // that window was silently ignored: the v4.8 live check saw a
+  // left drag do nothing at all while the bank kept rising the
+  // wrong way (measured in probe-roll section F: rollIn stayed
+  // +0.36..+0.08 for ~0.45 s after a tap while the stick dragged
+  // left). The stick under the pilot's finger is the live input;
+  // a stale PC tail is not. Keyboard arrows still win the moment
+  // the finger lifts (joy.active false).
+  pcInput.setAirspeedKt(p.ias * MS2KT);
   const pc = pcInput.getControls();
   const tilt = tiltInput.getControls();
   let px: number;
   let rx: number;
   const pcPitch = pc.pitch ?? 0;
   const pcRoll = pc.roll ?? 0;
-  if (pcPitch !== 0 || pcRoll !== 0) {
-    px = pcPitch;
-    rx = pcRoll;
-  } else {
+  if (joy.active || (pcPitch === 0 && pcRoll === 0)) {
     // Touch stick, direct (pass 12, worker D): drag UP (joy.y < 0)
     // = nose up (px < 0), so the touch stick agrees with the
     // keyboard (ArrowUp = nose up) and the mouse yoke (drag up =
@@ -1971,9 +1980,14 @@ function playerInput(dt: number): void {
     // run through the deadzone and the speed scales (roll linear,
     // pitch squared — probe-roll section E), so a full drag at
     // 586 kt no longer yanks the jet to ~10 G in half a second.
+    // When the stick is at rest this branch reads 0 through the
+    // deadzone, so the PC-zero case needs no separate branch.
     const iasKt = p.ias * MS2KT;
     px = touchDeadzone(joy.y) * touchPitchScale(iasKt);
     rx = touchDeadzone(joy.x) * touchStickScale(iasKt);
+  } else {
+    px = pcPitch;
+    rx = pcRoll;
   }
   px += tilt.pitch ?? 0;
   rx += tilt.roll ?? 0;
@@ -2291,8 +2305,29 @@ function animate(): void {
   applyFailure(elapsed);
   updateSky(rawDt);
   const turb = cfg.weather.turbulence;
-  const sub = Math.max(1, Math.ceil(rawDt / 0.05));
-  const dt = rawDt / sub;
+  // Pass 13 (Worker F — substep spiral breaker): cap the SIM time
+  // advanced per frame at 0.10 s, i.e. at most 2 substeps of <= 0.05 s.
+  // The v1.1 rule (sub = ceil(rawDt / 0.05), rawDt clamped to 0.25 s)
+  // ran up to 5 substeps/frame at 4-6 fps, so once the renderer dipped
+  // below 20 fps the physics bill grew 2-5x per frame and locked the
+  // frame rate down — a spiral of death (Glenn Fiedler's term). The
+  // probe measured the live-path substep at ~1 ms for 5 jets on the
+  // probe VM, so the spiral is an amplifier, not the whole 4-6 fps
+  // story (the rest is render-side — see the pass-13 report), but it
+  // is real and it is free to remove: at 4 fps the physics bill falls
+  // 4.85 -> 1.94 ms/frame on the probe VM (2.5x), at 5 fps 3.88 ->
+  // 1.94 ms/frame. Above 10 fps nothing changes (rawDt <= 0.10 s, so
+  // sub is identical to the old code). Below 10 fps the sim runs
+  // slower than real time instead (0.4x at 4 fps) — slow motion, not
+  // a locked frame rate — and recovers to full speed as soon as the
+  // frame time drops under 0.10 s. The <= 0.05 s substep invariant
+  // (physics stability) is preserved: dt = simDt / sub <= 0.05 s.
+  // `elapsed` above still advances on rawDt (real time), so failure
+  // timers and the clock keep real time; only the physics advances
+  // less on a slow frame.
+  const simDt = Math.min(rawDt, 0.1);
+  const sub = Math.max(1, Math.ceil(simDt / 0.05));
+  const dt = simDt / sub;
   for (let s = 0; s < sub; s++) {
     const turbAcc = turb
       ? new THREE.Vector3(
@@ -2469,24 +2504,37 @@ function animate(): void {
     if (player) {
       // CCIP (bomb impact point) is computed before the HUD update so
       // the below-min-release-alt flag feeds the warn priority.
+      // Pass 13 (worker C): the CCIP PIPPER itself is GONE — it was
+      // the yellow/amber ⊕ crosshair at screen centre in the v4.7
+      // live check (F-18 776 kt, F-15E 666 kt, cockpit + chase;
+      // never on the F-22/F-35A, which carry no bombs). Nicholas
+      // asked for the reticle to be gone from all jets. The
+      // computation stays ONLY for the PULL UP warning; nothing
+      // displays it any more.
       const ccip = weapons.computeCcip(
         player,
         heightfieldGroundHeight(player.pos.x, player.pos.z),
         camera,
       );
-      if (ccip) hud.showCcip(ccip.x, ccip.y, ccip.belowMinAlt);
-      else hud.hideCcip();
       // Carrier bearing/distance (pass 12, worker F): the v4.6.1 live
       // check's "carrier cannot be found" was a HUD gap — the player
       // had no bearing or distance to fly back on. Formula verified
       // in probe-deck-roll §F (rel 0.00°/85.0 m at deck spawn,
       // rel 180.00°/3000.0 m at 3 km east heading east).
+      // Pass 13 (worker E): all three headings are converted to TRUE
+      // (compass) headings for display (gameToTrueHdg: true =
+      // 180 − game, north = −Z). The relative bearing is recomputed
+      // in true space — its sign FLIPS vs the old mirrored value,
+      // which is the fix: the old relDeg pointed the player the
+      // wrong way round the compass. Internal headings (AI, spawn,
+      // carrier yaw) are untouched; only these displayed numbers
+      // convert.
       const cdx = carrier.pos.x - player.pos.x;
       const cdz = carrier.pos.z - player.pos.z;
-      const carrierAbsDeg = ((Math.atan2(cdx, cdz) * 180) / Math.PI + 360) % 360;
-      const playerHdgDeg = ((Math.atan2(player.fwd().x, player.fwd().z) * 180) / Math.PI + 360) % 360;
+      const carrierAbsDeg = gameToTrueHdg(((Math.atan2(cdx, cdz) * 180) / Math.PI + 360) % 360);
+      const playerHdgDeg = gameToTrueHdg(((Math.atan2(player.fwd().x, player.fwd().z) * 180) / Math.PI + 360) % 360);
       const carrierRelDeg = ((carrierAbsDeg - playerHdgDeg + 540) % 360) - 180;
-      const carrierHdgDeg = ((carrier.yaw * 180) / Math.PI + 360) % 360;
+      const carrierHdgDeg = gameToTrueHdg(((carrier.yaw * 180) / Math.PI + 360) % 360);
       hud.update(player, {
         score,
         kills,
@@ -2557,7 +2605,7 @@ function updateDebugPanel(): void {
     ...carriers.map((c, i) => {
       const g = heightfieldGroundHeight(c.pos.x, c.pos.z);
       const pods = c.pods.map((p) => `${p.hp}`).join('/');
-      return `carrier ${i + 1} (×${CARRIER_LOOP_SCALES[i]}): y=${c.pos.y.toFixed(0)} gnd=${g.toFixed(0)} ahead2500=${c.lookAheadGround.toFixed(0)} clr=${(c.pos.y - g).toFixed(0)} ${c.active ? (c.alive ? (c.dying ? 'DYING' : 'flying') : 'DEAD') : 'inactive'} pods=[${pods}]`;
+      return `carrier ${i + 1} (slot ${i + 1}): y=${c.pos.y.toFixed(0)} gnd=${g.toFixed(0)} ahead2500=${c.lookAheadGround.toFixed(0)} clr=${(c.pos.y - g).toFixed(0)} ${c.active ? (c.alive ? (c.dying ? 'DYING' : 'flying') : 'DEAD') : 'inactive'} pods=[${pods}]`;
     }),
     // Pass 8 (item 1): the spawn trace — first 3 s after the spawn.
     spawnTrace.length

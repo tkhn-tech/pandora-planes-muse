@@ -59,26 +59,58 @@ const DEFAULT_SHAPING: StickShaping = {
 
 /** Keyboard stick slew, units/s — the arrow-key stick ramps to its
  *  target instead of jumping, so it moves like a real stick. */
-/** Keyboard ROLL slew rates (per second), pass 12 worker D. The old
- *  single 5/s rate is why the v4.6.1 live check saw NO roll from
- *  taps: a 100 ms Right-Arrow tap only slewed kbRoll to 0.50 and
- *  decayed in 0.1 s, so the roll impulse was ~0.05 s of full
- *  deflection — about 2 deg of bank, which the airborne auto-level
- *  erased before the pilot could see it (probe-roll section D:
- *  peak bank 1.9 deg, bank@+0.5 s -0.5 deg), while ArrowUp/Down DID
- *  pitch because pitch has no auto-level spring to erase it.
- *  Roll now rises FAST (12/s: a 100 ms tap reaches full deflection,
- *  like a real stick snapping over) and returns SLOW (2.5/s: the
- *  deflection lingers ~0.4 s after release, so the impulse is
- *  ~0.25 s of full deflection and the bank is ~10-15 deg and still
- *  visible 0.5 s later). Pitch keeps its own slower 3/s slew (a
- *  fast pitch slew over-rotates — live finding 8) and is symmetric:
- *  only roll gets the slow return, because only roll is erased by
- *  the auto-level. A 1 s hold still banks ~54 deg (F-18, 287 kt),
- *  unchanged from before — the fix is in the tap response, not the
- *  hold authority. */
-const ROLL_SLEW_UP = 12;
-const ROLL_SLEW_DOWN = 2.5;
+/** Keyboard ROLL slew rates (per second), pass 13 worker B. The pass-12
+ *  asymmetric slew (UP 12/s, DOWN 2.5/s) is far too strong LIVE at high
+ *  speed / variable dt: getControls() runs once per substep but its dt
+ *  comes from the wall clock, so the FIRST substep of a 250 ms frame
+ *  slews by 12 * 0.1 (dt clamped) = 1.2 — the stick snaps to FULL
+ *  deflection on a single 100 ms tap — and the slow 2.5/s return then
+ *  holds ~0.4 s of near-full deflection. At 776 kt the BET roll rate
+ *  at full deflection is ~150 deg/s (measured: bank@1 s = 144 deg at
+ *  rollIn 1), so one tap banked 62 deg live-style (111 deg in the
+ *  v4.7 live check) and a 1 s hold rolled the jet inverted (178 deg).
+ *  Three changes, all measured in probe-roll section F:
+ *  (a) UP 7/s — full travel in ~0.14 s, still snappy for a hold;
+ *  (b) a per-call step cap of 0.40 — one low-FPS frame can move the
+ *  stick at most 0.40, so the tap impulse no longer depends on how
+ *  many frames the tap happened to span (60 fps tap: kbRoll ~0.8;
+ *  4 fps tap: kbRoll 0.40 — the impulse differs by ~25%, not 5x);
+ *  (c) speed-scaled keyboard roll authority (kbRollScale, below):
+ *  the keyboard is bang-bang — full deflection or nothing — so at
+ *  high speed the stick itself must command less, the way the touch
+ *  stick already does (touchStickScale). The mouse yoke and gamepad
+ *  are proportional devices the pilot can feather, so they keep
+ *  full authority; only the keyboard stick is scaled.
+ *  The return is 3/s (pass 12 used 2.5/s): the long tail was pass
+ *  12's way to make a tap visible, but with the speed scale the
+ *  tail no longer needs to linger — the bank a tap creates (~5-8
+ *  deg) persists through the roll-inertia overshoot, and the
+ *  auto-level now genuinely returns the wings — and a shorter tail
+ *  also shortens the window in which a stale PC deflection vetoes
+ *  the touch stick in the main.ts merge. */
+const ROLL_SLEW_UP = 7;
+const ROLL_SLEW_DOWN = 3;
+/** Max keyboard-stick movement in one getControls() call (stick
+ *  units). Bounds the tap impulse at low FPS: without it a 250 ms
+ *  frame slews 8 * 0.1 = 0.8 in one call. */
+const ROLL_SLEW_STEP_MAX = 0.4;
+/** Keyboard roll authority vs indicated airspeed, pass 13 worker B.
+ *  1.0 at/below 200 kt, falling as 200/ias above it, floored at 0.15.
+ *  The 200 kt reference (not 150) is deliberate: the tap impulse is
+ *  the same stick travel at every speed, so the scale must make
+ *  scale x roll-rate roughly constant — the BET roll rate grows
+ *  ~linearly with speed (bank@1 s at full deflection: 25 deg at
+ *  150 kt, 58 at 287, 131 at 586, 144 at 776), and 200/ias tracks
+ *  it: a 100 ms tap banks ~6-8 deg at 287, 586 AND 776 kt, and a
+ *  1 s hold banks ~35-50 deg at any of them. (150/ias made the tap
+ *  ~3 deg at 287 kt — barely visible — while 776 kt was no better.)
+ *  Set from main.ts playerInput via setAirspeedKt(); 0 / unset
+ *  means "unknown", scale 1 (the old behaviour — probes that never
+ *  set it are unaffected). */
+export function kbRollScale(iasKt: number): number {
+  if (!Number.isFinite(iasKt) || iasKt <= 200) return 1;
+  return Math.max(0.15, Math.min(1, 200 / iasKt));
+}
 /** Keyboard PITCH slew rate (per second) — slower than roll (live
  *  finding 8): one ArrowUp tap at 5/s swung the vertical speed by
  *  5,000-13,000 fpm and the pitch persisted (enough to loop/stall),
@@ -115,6 +147,9 @@ export class PCFlightInput implements IFlightInputProvider {
   /** Slewed keyboard stick (ramps toward the arrow-key target). */
   private kbPitch = 0;
   private kbRoll = 0;
+  /** Indicated airspeed (kt) for the keyboard roll scale — set by
+   *  main.ts playerInput each frame; 0 = unknown, scale 1. */
+  private iasKt = 0;
   /** Flaps repeat timers (live finding 8): holding [ or ] steps the
    *  flaps every 0.25 s. consumeEvents reports the flag only when the
    *  interval has elapsed since the last report, so a held key
@@ -192,10 +227,14 @@ export class PCFlightInput implements IFlightInputProvider {
     // Pass 8 (item 1): a calibration is a fresh neutral state — clear
     // the yoke engagement as well as the deflection, so a yoke stuck
     // active from a previous life cannot carry a frozen deflection
-    // into the new one.
+    // into the new one. Pass 13: the slewed keyboard stick too — a
+    // kbRoll tail from the previous life would otherwise keep rolling
+    // the fresh jet (and veto the touch stick in the merge) for 0.4 s.
     this.yoke.active = false;
     this.yoke.dx = 0;
     this.yoke.dy = 0;
+    this.kbPitch = 0;
+    this.kbRoll = 0;
   }
 
   get gamepadName(): string {
@@ -257,25 +296,32 @@ export class PCFlightInput implements IFlightInputProvider {
       (held('KeyD') ? 1 : 0) -
       (held('KeyA') ? 1 : 0);
     const slew = (cur: number, target: number, rate: number): number => {
-      const step = rate * dt;
+      const step = Math.min(rate * dt, ROLL_SLEW_STEP_MAX);
       if (cur < target) return Math.min(target, cur + step);
       if (cur > target) return Math.max(target, cur - step);
       return cur;
     };
     // Roll slews asymmetrically (pass 12): fast toward the held key,
-    // slow back to centre — see ROLL_SLEW_UP / ROLL_SLEW_DOWN.
+    // slow back to centre — see ROLL_SLEW_UP / ROLL_SLEW_DOWN. The
+    // step cap (ROLL_SLEW_STEP_MAX) bounds the per-call movement so
+    // a low-FPS frame cannot snap the stick to full deflection.
     const slewRoll = (cur: number, target: number): number => {
       const rising = Math.abs(target) > Math.abs(cur);
       return slew(cur, target, rising ? ROLL_SLEW_UP : ROLL_SLEW_DOWN);
     };
     this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1), PITCH_SLEW);
     this.kbRoll = slewRoll(this.kbRoll, clamp(kbRollTarget, -1, 1));
+    // Speed-scaled keyboard roll (pass 13): the slewed stick is
+    // multiplied by kbRollScale(ias) BEFORE shaping, so at high
+    // speed a tap or a hold commands a fraction of full deflection.
+    // The mouse yoke / gamepad above are unscaled (proportional).
+    const kbRollScaled = this.kbRoll * kbRollScale(this.iasKt);
     const shape = (v: number, gamma: number, invert: boolean): number => {
       const s = invert ? -v : v;
       return Math.sign(s) * Math.pow(Math.abs(s), gamma);
     };
     px += shape(this.kbPitch, this.shaping.pitchSens, this.shaping.invertPitch);
-    rx += shape(this.kbRoll, this.shaping.rollSens, this.shaping.invertRoll);
+    rx += shape(kbRollScaled, this.shaping.rollSens, this.shaping.invertRoll);
 
     // Rudder: Q = left, E = right. BOTH solvers map yawIn > 0 to nose
     // LEFT (BET fin moment; curve solver +yawRate term — positive
@@ -384,6 +430,12 @@ export class PCFlightInput implements IFlightInputProvider {
    *  it, or on respawn) so W/S slews from the right value. */
   setThrottle(value01: number): void {
     this.throttle = clamp(value01, 0, 1);
+  }
+
+  /** Indicated airspeed for the keyboard roll scale (pass 13). Called
+   *  by main.ts playerInput every frame, before getControls(). */
+  setAirspeedKt(iasKt: number): void {
+    this.iasKt = Number.isFinite(iasKt) ? Math.max(0, iasKt) : 0;
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {

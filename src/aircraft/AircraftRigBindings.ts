@@ -484,7 +484,22 @@ export class AircraftRigBindings {
         bb.expandByObject(m);
         any = true;
       });
-      this.bellyY = any ? bb.min.y : new THREE.Box3().setFromObject(group).min.y;
+      // Pass 13 (worker C): expandByObject measures in WORLD space,
+      // but bellyY is consumed in MODEL units (strut tops, the
+      // bellyY + 3.0 cap). The rig is built inside attachModel,
+      // which startRound calls on a REUSED player whose group still
+      // sits at the previous spawn's altitude (e.g. y 600) — so
+      // bellyY came out ~599 and every procedural leg was built with
+      // strutTop ~599.5: a ~600 m spike from the nose gear up
+      // through the jet (visible whenever the gear is down, and it
+      // crossed the F-35A's cockpit sightline at 0.53 m). Convert
+      // the world bbox back into the model's own frame before
+      // reading it.
+      const inv = group.matrixWorld.clone().invert();
+      bb.applyMatrix4(inv);
+      this.bellyY = any
+        ? bb.min.y
+        : new THREE.Box3().setFromObject(group).applyMatrix4(inv).min.y;
     }
     // The model group may carry a normalize scale (uniform): a leg
     // built in spec-metre units and parented under it would be

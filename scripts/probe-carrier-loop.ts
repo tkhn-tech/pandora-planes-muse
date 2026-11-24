@@ -16,6 +16,16 @@
 //      basin (max terrain 48 m) and would pass without it.
 //   4. The death check uses the exact surface: a carrier forced to
 //      y = ground + 5 m dies; one at ground + 50 m does not.
+//   5. (Pass 13, worker E) Runway clearance: the loop must keep
+//      clear of all three runway strips, plus a margin — analytic
+//      (every loop leg, including the slot-0 entry leg, vs every
+//      strip segment, >= 500 m) and FLOWN (each carrier's actual
+//      path over 30 sim-minutes, sampled every second, >= 500 m
+//      from every strip — corner-cutting must not eat the margin).
+//      The old hexagon failed this: worst leg 163 m from Bravo
+//      (waypoint 1 sat 224 m from Bravo's centre, the z = 2600 leg
+//      crossed the strip) and its first leg ran ON Alpha's extended
+//      centreline, so every Alpha takeoff flew under the ship.
 //
 // Usage: node_modules/.bin/esbuild scripts/probe-carrier-loop.ts
 //   --bundle --platform=node --format=esm
@@ -80,6 +90,7 @@ import { HELICARRIER_GLB } from '../src/assets/models/helicarrier';
 import {
   generateHeights,
   heightfieldHeightAt,
+  RUNWAY_TABLE,
   WORLD_SIZE,
   TERRAIN_SEGMENTS,
 } from '../src/world/PandoraTerrainWorker';
@@ -143,9 +154,9 @@ async function main(): Promise<void> {
 
   // ---- 1. Primary loop, 30 sim-minutes ----
   {
-    const loop = carrierLoop(1.0);
-    const c = await makeCarrier(loop.waypoints, loop.startPos, 0);
-    const wp0 = loop.waypoints[0]!;
+    const loop = carrierLoop(0);
+    const c = await makeCarrier(loop.waypoints, loop.startPos, loop.startIndex);
+    const wp0 = loop.waypoints[loop.startIndex]!;
     c.reset(
       loop.startPos.clone(),
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -159,17 +170,17 @@ async function main(): Promise<void> {
   }
 
   // ---- 2. All three count loops, 30 sim-minutes each ----
-  for (const [i, scale] of [0.75, 1.0, 1.25].entries()) {
-    const loop = carrierLoop(scale);
-    const c = await makeCarrier(loop.waypoints, loop.startPos, [0, 2, 4][i]!);
-    const wp0 = loop.waypoints[[0, 2, 4][i]!]!;
+  for (const slot of [0, 1, 2]) {
+    const loop = carrierLoop(slot);
+    const c = await makeCarrier(loop.waypoints, loop.startPos, loop.startIndex);
+    const wp0 = loop.waypoints[loop.startIndex]!;
     c.reset(
       loop.startPos.clone(),
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
     );
     const r = fly(c, 1800);
     check(
-      `count loop scale ${scale}: 30 sim-minutes, never dies, stays above ground + 100 m`,
+      `count loop slot ${slot}: 30 sim-minutes, never dies, stays above ground + 100 m`,
       r.alive && r.minClear > 100,
       `alive=${r.alive} minClear=${r.minClear.toFixed(1)} m maxY=${r.maxY.toFixed(1)} m`,
     );
@@ -216,9 +227,9 @@ async function main(): Promise<void> {
 
   // ---- 4. The death check uses the exact surface ----
   {
-    const loop = carrierLoop(1.0);
-    const c = await makeCarrier(loop.waypoints, loop.startPos, 0);
-    const wp0 = loop.waypoints[0]!;
+    const loop = carrierLoop(0);
+    const c = await makeCarrier(loop.waypoints, loop.startPos, loop.startIndex);
+    const wp0 = loop.waypoints[loop.startIndex]!;
     c.reset(
       loop.startPos.clone(),
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -249,6 +260,118 @@ async function main(): Promise<void> {
       diedLow && aliveHigh,
       `diedAt+5m=${diedLow} aliveAt+50m=${aliveHigh}`,
     );
+  }
+
+  // ---- 5. Runway clearance (pass 13, worker E) ----
+  // Analytic: every loop leg (plus the slot-0 entry leg) vs every
+  // runway strip segment, >= 500 m. Flown: each slot's carrier over
+  // 30 sim-minutes, sampled every second, >= 500 m from every strip
+  // (corner-cutting must not eat the margin — the carrier turns at
+  // 0.12 rad/s, so it rounds each waypoint inside the polygon).
+  {
+    const D2R = Math.PI / 180;
+    const strips = RUNWAY_TABLE.map((r) => {
+      const dx = Math.sin(r.hdg * D2R);
+      const dz = Math.cos(r.hdg * D2R);
+      return {
+        name: r.name,
+        a: { x: r.x - dx * r.len / 2, z: r.z - dz * r.len / 2 },
+        b: { x: r.x + dx * r.len / 2, z: r.z + dz * r.len / 2 },
+      };
+    });
+    const ptSeg = (
+      p: { x: number; z: number },
+      a: { x: number; z: number },
+      b: { x: number; z: number },
+    ): number => {
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const L = dx * dx + dz * dz;
+      const t =
+        L === 0
+          ? 0
+          : Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.z - a.z) * dz) / L));
+      return Math.hypot(p.x - (a.x + t * dx), p.z - (a.z + t * dz));
+    };
+    const segSeg = (
+      p1: { x: number; z: number },
+      p2: { x: number; z: number },
+      q1: { x: number; z: number },
+      q2: { x: number; z: number },
+    ): number => {
+      const orient = (
+        a: { x: number; z: number },
+        b: { x: number; z: number },
+        c: { x: number; z: number },
+      ): number => (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x);
+      const o1 = orient(p1, p2, q1);
+      const o2 = orient(p1, p2, q2);
+      const o3 = orient(q1, q2, p1);
+      const o4 = orient(q1, q2, p2);
+      if (o1 !== 0 && o2 !== 0 && o3 !== 0 && o4 !== 0 && (o1 > 0) !== (o2 > 0) && (o3 > 0) !== (o4 > 0)) return 0;
+      return Math.min(
+        ptSeg(p1, q1, q2),
+        ptSeg(p2, q1, q2),
+        ptSeg(q1, p1, p2),
+        ptSeg(q2, p1, p2),
+      );
+    };
+    const loop0 = carrierLoop(0);
+    const wps = loop0.waypoints;
+    const legs: Array<[{ x: number; z: number }, { x: number; z: number }]> = [
+      [{ x: loop0.startPos.x, z: loop0.startPos.z }, { x: wps[0]!.x, z: wps[0]!.z }],
+      ...wps.map(
+        (w, i) =>
+          [
+            { x: w.x, z: w.z },
+            { x: wps[(i + 1) % wps.length]!.x, z: wps[(i + 1) % wps.length]!.z },
+          ] as [{ x: number; z: number }, { x: number; z: number }],
+      ),
+    ];
+    let worstAnalytic = Infinity;
+    let worstAnalyticWhat = '';
+    for (let li = 0; li < legs.length; li++) {
+      for (const s of strips) {
+        const d = segSeg(legs[li]![0], legs[li]![1], s.a, s.b);
+        if (d < worstAnalytic) {
+          worstAnalytic = d;
+          worstAnalyticWhat = `leg ${li} vs ${s.name}`;
+        }
+      }
+    }
+    check(
+      'runway clearance (analytic): every loop leg + entry leg >= 500 m from every runway strip',
+      worstAnalytic >= 500,
+      `worst ${worstAnalytic.toFixed(0)} m (${worstAnalyticWhat}); old loop worst was 163 m (Bravo)`,
+    );
+    // Flown: one carrier per slot, 30 sim-minutes, 1 s samples.
+    for (const slot of [0, 1, 2]) {
+      const loop = carrierLoop(slot);
+      const c = await makeCarrier(loop.waypoints, loop.startPos, loop.startIndex);
+      const wp0 = loop.waypoints[loop.startIndex]!;
+      c.reset(
+        loop.startPos.clone(),
+        Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
+      );
+      let worstFlown = Infinity;
+      let worstFlownWhat = '';
+      for (let t = 0; t < 1800; t += 1) {
+        c.update(1);
+        if (!c.alive) break;
+        for (const s of strips) {
+          const d = ptSeg({ x: c.pos.x, z: c.pos.z }, s.a, s.b);
+          if (d < worstFlown) {
+            worstFlown = d;
+            worstFlownWhat = `${s.name} at t=${t}s`;
+          }
+        }
+      }
+      check(
+        `runway clearance (flown, slot ${slot}): actual path over 30 sim-minutes stays >= 500 m from every runway strip`,
+        c.alive && worstFlown >= 500,
+        `alive=${c.alive} worst ${worstFlown.toFixed(0)} m (${worstFlownWhat})`,
+      );
+    }
   }
 
   console.log(failures === 0 ? 'ALL PROBE CHECKS PASSED' : `${failures} CHECK(S) FAILED`);

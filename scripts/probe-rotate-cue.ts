@@ -458,6 +458,82 @@ async function main(): Promise<void> {
       !rc.classList.contains('show') && rc.textContent === '',
       `text=${JSON.stringify(rc.textContent)}`,
     );
+
+    // Pass 13 (worker E), toast auto-hide: the old timeout only
+    // removed the `show` class, so "FORWARD FLIGHT" stayed in the
+    // DOM long after the VTOL transition — the same class of bug as
+    // the ROTATE cue above. Real 3.2 s timeout, so real waits.
+    const sleep = (ms: number): Promise<void> =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+    const toastEl = els.get('toast')!;
+    const toastTitle = els.get('toastTitle')!;
+    const toastSub = els.get('toastSub')!;
+    hud.toast('FORWARD FLIGHT', 'VTOL off — wings level');
+    check(
+      'HUD toast shown: class show + title/sub text present',
+      toastEl.classList.contains('show') &&
+        toastTitle.textContent === 'FORWARD FLIGHT' &&
+        toastSub.textContent === 'VTOL off — wings level',
+      `title=${JSON.stringify(toastTitle.textContent)} sub=${JSON.stringify(toastSub.textContent)}`,
+    );
+    await sleep(3500);
+    check(
+      'HUD toast auto-hide: hidden AND title/sub text cleared from DOM after 3.2 s',
+      !toastEl.classList.contains('show') &&
+        toastTitle.textContent === '' &&
+        toastSub.textContent === '',
+      `show=${toastEl.classList.contains('show')} title=${JSON.stringify(toastTitle.textContent)} sub=${JSON.stringify(toastSub.textContent)}`,
+    );
+    // A re-fired toast must not be wiped by the first toast's timer:
+    // toast A, re-fire B at 1.5 s (A's timer is cancelled), then at
+    // 3.5 s — past A's original 3.2 s deadline — B must still show.
+    hud.toast('VTOL HOVER', 'first');
+    await sleep(1500);
+    hud.toast('FORWARD FLIGHT', 'second');
+    await sleep(2000);
+    check(
+      'HUD toast re-fire: first toast timer does not hide the second toast early',
+      toastEl.classList.contains('show') &&
+        toastTitle.textContent === 'FORWARD FLIGHT' &&
+        toastSub.textContent === 'second',
+      `show=${toastEl.classList.contains('show')} title=${JSON.stringify(toastTitle.textContent)}`,
+    );
+    await sleep(1500);
+    check(
+      'HUD toast re-fire: second toast auto-hides AND clears after its own 3.2 s',
+      !toastEl.classList.contains('show') &&
+        toastTitle.textContent === '' &&
+        toastSub.textContent === '',
+      `show=${toastEl.classList.contains('show')} title=${JSON.stringify(toastTitle.textContent)}`,
+    );
+
+    // Pass 13 (worker E), mirrored compass: the game heading is
+    // atan2(fwd.x, fwd.z) with north = −Z, so a right turn DECREASES
+    // it — the HUD heading read backwards. Displayed heading must
+    // be the TRUE heading (180 − game): game 0 (flying +Z, south) →
+    // 180, game 90 (east) → 090, game 180 (north) → 000, game 270
+    // (west) → 270, and a right turn (game 90 → 80) must read as an
+    // INCREASE (090 → 100). Real FlightHUD, stub document, same
+    // harness as the ROTATE checks above.
+    const hdgEl = els.get('hudHdg')!;
+    const hdgFor = (gameDeg: number): string => {
+      const g = (gameDeg * Math.PI) / 180;
+      const ac = fakeAc({ alive: true, rotateCue: false });
+      // fakeAc's fwd() returns (0,0,1); override per heading.
+      (ac as unknown as { fwd: () => THREE.Vector3 }).fwd = () =>
+        new THREE.Vector3(Math.sin(g), 0, Math.cos(g));
+      hud.update(ac, game);
+      return hdgEl.textContent;
+    };
+    check('HUD compass: game 0 (south) reads 180°', hdgFor(0) === '180°', `got ${hdgFor(0)}`);
+    check('HUD compass: game 90 (east) reads 090°', hdgFor(90) === '090°', `got ${hdgFor(90)}`);
+    check('HUD compass: game 180 (north) reads 000°', hdgFor(180) === '000°', `got ${hdgFor(180)}`);
+    check('HUD compass: game 270 (west) reads 270°', hdgFor(270) === '270°', `got ${hdgFor(270)}`);
+    check(
+      'HUD compass: right turn (game 90 → 80) reads as an increase (090 → 100)',
+      hdgFor(90) === '090°' && hdgFor(80) === '100°',
+      `90→${hdgFor(90)} 80→${hdgFor(80)}`,
+    );
   }
 
   console.log(failures === 0 ? '\nALL ROTATE-CUE CHECKS PASSED' : `\n${failures} ROTATE-CUE CHECK(S) FAILED`);

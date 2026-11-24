@@ -92,8 +92,6 @@ function check(name: string, ok: boolean, detail = ''): void {
   if (!ok) failures++;
 }
 
-const LOOP_SCALES = [1.0, 0.75, 1.25];
-const START_INDEXES = [0, 2, 4];
 
 async function main(): Promise<void> {
   await RAPIER.init();
@@ -134,15 +132,16 @@ async function main(): Promise<void> {
   const owners = new Map<number, Aircraft | 'terrain' | 'deck'>();
   owners.set(terrainCollider.handle, 'terrain');
 
-  // Build all three carriers (as main.ts does), each on its own loop.
-  const carriers = LOOP_SCALES.map((scale, i) => {
-    const loop = carrierLoop(scale);
+  // Build all three carriers (as main.ts does), each on the shared
+  // loop at its own slot (phase-offset ~1/3 lap).
+  const carriers = [0, 1, 2].map((i) => {
+    const loop = carrierLoop(i);
     return new HelicarrierController(scene, world, {
       modelGlbUri: HELICARRIER_GLB,
       deckTopSourceY: 29.78,
       heightAt: (x, z) => heightfieldHeightAt(heights, res, x, z),
       waypoints: loop.waypoints,
-      startIndex: START_INDEXES[i]!,
+      startIndex: loop.startIndex,
     });
   });
   await Promise.all(carriers.map((c) => c.build()));
@@ -160,13 +159,9 @@ async function main(): Promise<void> {
     carriers.map((c) => String(c.modelReady)).join(','),
   );
 
-  const resetCarrier = (
-    c: HelicarrierController,
-    scale: number,
-    startIndex: number,
-  ): void => {
-    const loop = carrierLoop(scale);
-    const wp0 = loop.waypoints[startIndex]!;
+  const resetCarrier = (c: HelicarrierController, slot: number): void => {
+    const loop = carrierLoop(slot);
+    const wp0 = loop.waypoints[loop.startIndex]!;
     c.reset(
       loop.startPos.clone(),
       Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -188,7 +183,7 @@ async function main(): Promise<void> {
   // carrier's deck centre (where the deck would be if active).
   let deckSeen = false;
   for (let i = 0; i < 3; i++) {
-    const loop = carrierLoop(LOOP_SCALES[i]!);
+    const loop = carrierLoop(i);
     if (deckHeightAll(loop.startPos.x, loop.startPos.z) > -Infinity) deckSeen = true;
   }
   check(
@@ -214,7 +209,7 @@ async function main(): Promise<void> {
   );
 
   // ---- 2. Count 1: primary only ----
-  resetCarrier(carriers[0]!, LOOP_SCALES[0]!, START_INDEXES[0]!);
+  resetCarrier(carriers[0]!, 0);
   carriers[1]!.deactivate();
   carriers[2]!.deactivate();
   let minY1 = Infinity;
@@ -239,7 +234,7 @@ async function main(): Promise<void> {
   for (const count of [2, 3]) {
     carriers.forEach((c, i) => {
       if (i < count) {
-        resetCarrier(c, LOOP_SCALES[i]!, START_INDEXES[i]!);
+        resetCarrier(c, i);
       } else {
         c.deactivate();
       }
@@ -273,7 +268,7 @@ async function main(): Promise<void> {
   // ---- 5. Count 2 deck spawn: jet rides the primary through a turn ----
   carriers.forEach((c, i) => {
     if (i < 2) {
-      resetCarrier(c, LOOP_SCALES[i]!, START_INDEXES[i]!);
+      resetCarrier(c, i);
     } else {
       c.deactivate();
     }

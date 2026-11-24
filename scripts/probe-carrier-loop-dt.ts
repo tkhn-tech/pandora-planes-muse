@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   const heightAt = (x: number, z: number): number => heightfieldHeightAt(heights, res, x, z);
   const scene = new THREE.Scene();
   const world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-  const loop = carrierLoop(1.0);
+  const loop = carrierLoop(0);
   let downAt = -1;
   let downDetail = '';
   let t = 0;

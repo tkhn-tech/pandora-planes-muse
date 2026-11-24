@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.7, 20 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.8, 20 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -153,17 +153,13 @@
   #pipper{position:fixed;left:-100px;top:-100px;width:34px;height:34px;margin:-17px 0 0 -17px;z-index:6;pointer-events:none;
     border:2px solid rgba(255,209,102,.9);border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
   #pipper:after{content:'';position:absolute;left:50%;top:50%;width:6px;height:6px;margin:-3px 0 0 -3px;background:#ffd166;border-radius:50%}
-  /* ROTATE cue (green, under the warn line) + CCIP bomb pipper (gold ring
-     with crosshair; red when below the min-release altitude). */
+  /* ROTATE cue (green, under the warn line). The CCIP bomb pipper
+     was removed in pass 13 (it was the amber crosshair Nicholas
+     asked to be gone from all jets); the PULL UP warning it fed
+     still fires from the computed release altitude. */
   #rotateCue{position:fixed;left:50%;top:calc(88px + env(safe-area-inset-top));transform:translateX(-50%);z-index:6;
     pointer-events:none;font-size:15px;font-weight:800;letter-spacing:.14em;color:#7dff8a;text-shadow:0 1px 6px rgba(0,0,0,.8);opacity:0;transition:opacity .2s}
   #rotateCue.show{opacity:1}
-  #ccip{position:fixed;left:-100px;top:-100px;width:30px;height:30px;margin:-15px 0 0 -15px;z-index:6;pointer-events:none;
-    border:2px solid rgba(255,209,102,.9);border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
-  #ccip:before{content:'';position:absolute;left:50%;top:-7px;width:2px;height:44px;margin-left:-1px;background:rgba(255,209,102,.9)}
-  #ccip:after{content:'';position:absolute;top:50%;left:-7px;height:2px;width:44px;margin-top:-1px;background:rgba(255,209,102,.9)}
-  #ccip.danger{border-color:rgba(255,90,90,.95)}
-  #ccip.danger:before,#ccip.danger:after{background:rgba(255,90,90,.95)}
   .overlay{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;
     background:rgba(4,10,18,.78);backdrop-filter:blur(4px);padding:16px;overflow-y:auto}
   .card{max-width:520px;width:100%;max-height:calc(100vh - 48px);max-height:calc(100dvh - 48px);overflow-y:auto;text-align:center;
@@ -290,7 +286,6 @@
   <button id="pickerCancel">Cancel</button>
 </div>
 <div id="pipper" style="display:none"></div>
-<div id="ccip" style="display:none"></div>
 <div id="debug" class="hidden"></div>
 
 <div id="thrWrap"><span class="tLab">THR</span><input type="range" id="thr" min="0" max="100" value="0"><span id="thrVal">0%</span></div>
@@ -378,7 +373,7 @@
         <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v4.7 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.8 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 
@@ -398,7 +393,7 @@
       <b>VTOL pad:</b> F-35A only — vector 70°+, slow vertical descent onto a marked yellow pad on the deck.<br>
       <b>Lead pipper:</b> the gold ring on the HUD is where your gun rounds will meet the locked target — put the ring on the jet, not the jet itself.<br>
       <b>ROTATE:</b> the green cue appears on the runway roll at your jet's rotation speed — hold ↑ (keyboard) or drag the stick up and HOLD it, not before, and not a tap.<br>
-      <b>CCIP:</b> with bombs carried, the gold crosshair ring marks where a bomb released now would hit; it turns red (and the HUD warns PULL UP) when you are below the minimum-release altitude for your dive — the 4&nbsp;g pull-out needs that height.<br>
+      <b>Pull up:</b> diving with bombs below the minimum-release altitude warns PULL UP — the 4&nbsp;g pull-out needs that height.<br>
       <b>Spin:</b> if the jet departs into a spin the HUD shows an arrow — push the stick WITH the arrow, nose down, and the spin unwinds.<br>
       <b>Stall:</b> below stall speed the wing drops and the nose falls — push the nose down and add power to recover.<br>
       <b>Damage:</b> wing hits roll you, engine hits cost thrust. Smoke under 60%, fire under 35%.<br>

@@ -16,17 +16,26 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /** On-screen joystick (touch stick, wired in main.ts) authority scale
- *  vs indicated airspeed, pass 12 worker D. At low speed the stick is
- *  1:1; at high speed its authority falls as 150/ias (floored at
- *  0.30), so a full drag at 586 kt no longer commands the ±10 G /
- *  instant-loop response the v4.6.1 live check saw — the stick's
- *  FEEL stays roughly constant across the speed range instead of
- *  getting twitchier as q rises. main.ts applies this in the touch
- *  branch of the playerInput merge (patch spec — MobileFlightInput
- *  only owns tilt; the touch stick itself lives in main.ts). */
+ *  vs indicated airspeed, pass 12 worker D, curve steepened pass 13
+ *  worker B. At low speed the stick is 1:1; at high speed its
+ *  authority falls as 110/ias (floored at 0.15), so a full drag at
+ *  586 kt no longer commands the ±10 G / instant-loop response the
+ *  v4.6.1 live check saw — the stick's FEEL stays roughly constant
+ *  across the speed range instead of getting twitchier as q rises.
+ *  The pass-12 curve (150/ias, floor 0.30) was still too strong
+ *  live: a full 1.5 s drag at 700 kt rolled the F-35A 92 deg
+ *  (measured, probe-roll section F — the v4.7 live check saw
+ *  59–81 deg from 1.5–2 s drags), because the BET roll rate at full
+ *  deflection is ~150 deg/s at that speed and 0.30 of it is still
+ *  ~45 deg/s, plus ~13 deg of post-release roll inertia. 110/ias
+ *  puts a full drag at ~25 deg/s at 700 kt, close to a full
+ *  keyboard hold there (kbRollScale, ~30 deg/s). main.ts applies
+ *  this in the touch branch of the playerInput merge (patch spec —
+ *  MobileFlightInput only owns tilt; the touch stick itself lives
+ *  in main.ts). */
 export function touchStickScale(iasKt: number): number {
   if (!Number.isFinite(iasKt) || iasKt <= 150) return 1;
-  return Math.max(0.3, Math.min(1, 150 / iasKt));
+  return Math.max(0.15, Math.min(1, 110 / iasKt));
 }
 
 /** Pitch-only touch-stick scale. Pitch needs a STRONGER curve than
