@@ -1006,10 +1006,13 @@ async function main(): Promise<void> {
         check(`${key} E: wreck fire still present at +20 s`, s20.attached >= 1, `attached=${s20.attached}`);
       }
       {
-        // Generic debris boxes: the 4 null-segment pieces are plain
+        // Generic debris pieces: the 4 null-segment pieces are plain
         // Meshes (torn wing/tail arrive as Groups holding the
         // segment). They must be charred dark, not light grey, and
-        // not all the same slab size.
+        // not all the same slab size. Pass 15 (worker F, item 8):
+        // the pieces are torn panels, not BoxGeometry boxes, so
+        // sizes come from each mesh's bounding box, not from
+        // geometry parameters (which no longer exist).
         const V = vfx as unknown as { debris: DebrisRec[]; scorches: ScorchRec[] };
         const boxes = V.debris.filter((d) => d.mesh instanceof THREE.Mesh);
         let maxChan = 0;
@@ -1018,11 +1021,18 @@ async function main(): Promise<void> {
           const m = d.mesh as THREE.Mesh;
           const mat = m.material as THREE.MeshLambertMaterial;
           if (mat.color) maxChan = Math.max(maxChan, Math.max(mat.color.r, mat.color.g, mat.color.b));
-          const g = m.geometry as THREE.BoxGeometry;
-          if (g.parameters) sizes.add(`${g.parameters.width.toFixed(1)}x${g.parameters.height.toFixed(1)}x${g.parameters.depth.toFixed(1)}`);
+          const bb = new THREE.Box3().setFromObject(m);
+          const sz = new THREE.Vector3();
+          bb.getSize(sz);
+          sizes.add(`${sz.x.toFixed(1)}x${sz.y.toFixed(1)}x${sz.z.toFixed(1)}`);
         }
-        check(`${key} E: debris boxes are charred wreckage, not light-grey slabs`, boxes.length >= 4 && maxChan < 0.35, `boxes=${boxes.length} maxChan=${maxChan.toFixed(2)} (old 0x8a97a3 = 0.64)`);
-        check(`${key} E: debris boxes vary in size (not 4 identical slabs)`, sizes.size >= 2, `distinctSizes=${sizes.size} [${[...sizes].join(', ')}]`);
+        check(`${key} E: debris pieces are charred wreckage, not light-grey slabs`, boxes.length >= 4 && maxChan < 0.35, `pieces=${boxes.length} maxChan=${maxChan.toFixed(2)} (old 0x8a97a3 = 0.64)`);
+        check(`${key} E: debris pieces vary in size (not 4 identical slabs)`, sizes.size >= 2, `distinctSizes=${sizes.size} [${[...sizes].join(', ')}]`);
+        // Pass 15 (worker F, item 8): the pieces must be torn
+        // panels, not boxes — see probe-pass15-slabs for the shape
+        // measurement; this is the cheap type guard here.
+        const boxCount = boxes.filter((d) => ((d.mesh as THREE.Mesh).geometry as THREE.BufferGeometry).type === 'BoxGeometry').length;
+        check(`${key} E: debris pieces are torn panels, not BoxGeometry slabs`, boxCount === 0, `boxGeometries=${boxCount}/${boxes.length}`);
         const scorch = V.scorches[0];
         check(`${key} E: scorch is an irregular blotch, not a perfect disc (textured, not a flat circle)`, scorch !== undefined && (scorch.mesh.material as THREE.MeshBasicMaterial).map !== null, `map=${(scorch?.mesh.material as THREE.MeshBasicMaterial)?.map ? 'yes' : 'none'}`);
       }

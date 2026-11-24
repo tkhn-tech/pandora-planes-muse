@@ -101,6 +101,27 @@ const ROTATION_RATE_MAX = 55 * D2R; // rad/s nose-up while the gear is on
 // deg/s authority and powers through the contact, so the BET cap
 // matches it — the jet rotates fast, the lift builds, and it is
 // off the deck before a tail strike can develop.
+/** Rotation-intent threshold on pitchIn (stick units, negative =
+ *  pull). Every "is the pilot pulling?" test in this file — the
+ *  hasRotated flag, the grounded flag, the on-surface rotation
+ *  gate, the no-pull nose-up gate, the stay-on-the-ground hold,
+ *  the deck pre-coupling — reads this one constant, so a pull is
+ *  a pull everywhere or nowhere. Pass 15 (Worker A, item 1): was
+ *  0.25 (the v2 template's rotation trigger). That is ABOVE what a
+ *  real partial pull produces at speed: the touch joystick's pitch
+ *  scale is (200/ias)^1.5, so a HALF drag at 350 kt is pitchIn
+ *  -0.20 and a 28 px drag at 400 kt is -0.12 — both read as "no
+ *  pull" at 0.25, so hasRotated never set, the rotation gate stayed
+ *  shut, the stay-on-the-ground hold kept driving the pitch to
+ *  +1.5 deg nose-down, and the jet skimmed to 379-495 kt and
+ *  crashed into rising terrain (probe-pass15-pull-profiles
+ *  joy-late350-half: F-15E 379 kt, F-18 495 kt — the v4.9 live
+ *  F-22/F-15E signature exactly). 0.10 admits those pulls while
+ *  staying above the touch deadzone (0.06 stick, which reads
+ *  exactly 0) and above stick noise, and the rotation gate still
+ *  requires Vr, so a gentle pull below Vr still does nothing and
+ *  a hands-off jet (pitchIn exactly 0) still cannot auto-lift. */
+const ROTATION_INTENT = 0.1;
 /** BET stall nose-drop rate, rad/s nose-down (probe-stall-respawn
  *  2a). The BET solver has no emergent nose-down departure past
  *  the peak-CL AoA (the wing AC sits near the CG), so a stalled
@@ -636,6 +657,15 @@ export class Aircraft {
   aoaDeg = 0;
   ias = 0;
   gload = 1;
+  /** Display G for the HUD (pass 15, worker E, item 13): the specific
+   *  force the airframe feels, |lift + drag + thrust| / (m*g). In any
+   *  steady flight (level, climb, dive, hover) the force sum balances
+   *  weight, so this reads 1.0; in a pull it is 2-4; in free fall it
+   *  is 0 (weightless). gload stays the wing-lift-only load factor:
+   *  main.ts's VTOL vector floor reads it as the wing's real lift,
+   *  and the over-G check reads it as the wing-bending load — both
+   *  would be wrong on this value. */
+  gDisplay = 1;
   vsi = 0;
   stalled = false;
   /** Spin amount 0..1 (BET §2 — the solver's spin state). */
@@ -1304,6 +1334,22 @@ export class Aircraft {
     const rollIn = controlRoll(controls);
     const thr = resolveThrottleTarget(controls);
     if (thr !== null) this.thrTarget = clamp(thr, 0, 1);
+    // Surface under the jet (hoisted from below: the hover hold
+    // needs the deck-relative speed, and the solver needs floorY).
+    const terrainH = terrainHeightAt(this.pos.x, this.pos.z);
+    const deckY =
+      this.deck && this.deck.alive
+        ? this.deck.deckHeightAt(this.pos.x, this.pos.z)
+        : -Infinity;
+    const floorY = Math.max(terrainH, deckY);
+    this.floorY = floorY;
+    const isDeck = deckY > terrainH;
+    // Deck-point velocity (for the hover hold's deck-relative gate
+    // and vertical-speed measurement below).
+    const deckVelHold =
+      isDeck && this.deck && this.deck.alive
+        ? this.deck.velocityAt(this.pos.x, this.pos.z)
+        : new THREE.Vector3();
     // VTOL hover altitude-hold (pass 6, item 8): the F-35A at VEC 90
     // and 100% throttle lifted off the deck but sank and went down
     // instead of hovering — the pilot cannot hold the ~94% hover
@@ -1313,16 +1359,44 @@ export class Aircraft {
     // In a deep hover (vector >= 70 deg, slow, airborne) the
     // throttle becomes an altitude command: the pilot's throttle
     // sets the desired vertical speed relative to the hover point
-    // (100% -> +~2 m/s climb, hover point -> 0, idle -> -5 m/s
+    // (100% -> +4.5 m/s climb, hover point -> 0, idle -> -4 m/s
     // descent), and a P loop on the vertical-speed error drives the
     // actual throttle to hold it. Gated on !onSurface (previous
     // step): on the deck the pilot's throttle rules, so a parked
-    // jet at vector 90 does not lift off by itself. Forward flight
-    // (vector < 70 or ias >= 25) is untouched.
+    // jet at vector 90 does not lift off by itself.
+    //
+    // Pass 15 (item 5): the speed gate is the speed RELATIVE TO THE
+    // SUPPORTING SURFACE, not the airspeed. A jet hovering over a
+    // carrier does ~40 m/s through the air (the carrier's own
+    // speed), so the old ias < 25 gate never engaged after a deck
+    // liftoff and the jet sank on wing downforce at full throttle
+    // (probe-vtol-live D2b: AoA -28 deg, G -0.40, sink -7.2 m/s).
+    // Over a deck the relative speed is ~0; elsewhere it is the
+    // airspeed. The vertical speed is likewise deck-relative over
+    // a deck: the deck heaves -10..+15 m/s, and holding an ABSOLUTE
+    // vs while the deck moves under the jet chases the heave
+    // instead of holding height above the deck.
+    //
+    // Pass 15 (item 5): the vsDes map. The old
+    // (pilotThr - hoverThr) * 30 capped the 100% climb at 1.85 m/s
+    // sim — and the sim runs at 0.4-0.6x wall time at 4-9 fps, so
+    // the pilot saw ~170 fpm (the v4.9 live deep hover: 210 -> 335
+    // ft). The thrust margin at 100% is only 6.6% (0.65 m/s^2),
+    // and the old map throttled back to ~95% as soon as the VS
+    // rose, wasting it. The new map holds full throttle until the
+    // VS approaches +4.5 m/s (~890 fpm): a deadband of +/-0.005
+    // around the hover point (so 94% still holds altitude — the
+    // 40 s hover check), then a steep 90 (m/s per throttle unit)
+    // climb ramp, and the old gentle 30 slope down (85% still
+    // descends at ~-2.5 m/s, not a fall).
+    const hoverRelSpeed = isDeck
+      ? this.vel.clone().sub(deckVelHold).length()
+      : this.ias;
+    const hoverVsMeas = isDeck ? this.vel.y - deckVelHold.y : this.vel.y;
     if (
       this.spec.vtol &&
       this.vectorDeg >= 70 &&
-      this.ias < 25 &&
+      hoverRelSpeed < 25 &&
       !this.onSurface &&
       this.alive &&
       !this.dying
@@ -1332,13 +1406,17 @@ export class Aircraft {
       // setter), NOT thrTarget itself — the hold writes thrTarget,
       // so reading it back would feed the auto-throttle's own output
       // into its command and oscillate (pass 6 diagnosis).
-      const vsDes = clamp((this.pilotThr - hoverThr) * 30, -5, 3);
+      const dThr = this.pilotThr - hoverThr;
+      const vsDes =
+        dThr >= 0
+          ? clamp((dThr - 0.005) * 90, 0, 4.5)
+          : clamp((dThr + 0.005) * 30, -4, 0);
       // Pass 9 (item 8): integral term. The P loop alone leaves a
       // steady-state sink (~20 fpm live) because holding a constant
       // VS needs throttle slightly above hoverThr, which a pure P
       // loop only produces while an error persists. Accumulate the
       // VS error (clamped against windup) and add it.
-      const vsErr = vsDes - this.vel.y;
+      const vsErr = vsDes - hoverVsMeas;
       this.hoverVsInt = clamp(
         this.hoverVsInt + vsErr * dt * HOVER_VS_KI,
         -HOVER_VS_INT_MAX,
@@ -1390,15 +1468,6 @@ export class Aircraft {
     const vAir = vel.clone().sub(wind);
     this.ias = vAir.length();
 
-    const terrainH = terrainHeightAt(this.pos.x, this.pos.z);
-    const deckY =
-      this.deck && this.deck.alive
-        ? this.deck.deckHeightAt(this.pos.x, this.pos.z)
-        : -Infinity;
-    const floorY = Math.max(terrainH, deckY);
-    this.floorY = floorY;
-    const isDeck = deckY > terrainH;
-
     const result = this.solver.solve({
       velocityAir: vAir,
       quat: this.quat,
@@ -1445,6 +1514,50 @@ export class Aircraft {
     });
     this.aoaDeg = result.aoaDeg;
     this.gload = result.gLoad;
+    // Pass 15 (worker E, item 13): the HUD G meter. gload is the
+    // wing-lift-only load factor, so in a steep climb — velocity
+    // aligned with the nose, AoA ~ 0, the wing unloaded — it reads
+    // 0.1-0.3 live while the thrust still carries the jet at ~1 g
+    // (probe-g-meter §0: lift-G 0.26 vs specific-G 0.95 in a vertical
+    // climb; §2: lift-G decays 5.83 -> 0.31 in a held 75 deg climb).
+    // The display value is the specific-force magnitude, the total
+    // non-gravitational force over the weight. gload itself is
+    // unchanged (see the field comment): the VTOL vector floor and
+    // the over-G check read the wing load, not this.
+    this.gDisplay =
+      result.lift.clone().add(result.drag).add(result.thrust).length() /
+      (m * G);
+    // Pass 15 (item 5): AoA/G in VTOL hover. The solver's gLoad is
+    // WING lift only, so in a hover it read 0.00 (deep hover, wing
+    // unloaded — probe-vtol-live D3) or -0.50 (deck liftoff, wing at
+    // AoA -20 deg making downforce) while the jet was in fact
+    // supported by the lift fan at ~1 g. In the vectored regime
+    // the honest load factor is the TOTAL vertical force — wing
+    // lift plus vertical thrust — over the weight: ~1.00 at the
+    // hover point, ~1.07 at full throttle. (The main.ts vector
+    // floor reads max(potential lift at 10 deg AoA, gload), so in
+    // the vectored regime it does read this gload — at hover it
+    // is ~1.0 and the floor is ~0 — but the override only applies
+    // at vector >= 70: as soon as the vector drops below 70 the
+    // gload definition reverts to wing-only, the floor snaps back
+    // to ~70 deg, and the nozzle cannot be rotated fully forward
+    // at 0 kt. Forward flight, vector < 70, keeps the wing-only
+    // gLoad: in a banked turn the pilot's G is the wing's lift,
+    // and the over-G check reads it.)
+    // Near-zero airspeed the AoA formula atan2(-vBody.y, vBody.z)
+    // divides by a ~0 forward component, so the climb rate itself
+    // reads as AoA (live deep hover: -18 deg at 7-12 kt while
+    // climbing at ~2 m/s). Below 12 m/s the wing is not flying;
+    // report 0. Only the reported values are gated — the solver's
+    // own AoA (stall flag, trim) is untouched, like the grounded
+    // override below.
+    if (this.spec.vtol && this.vectorDeg >= 70) {
+      this.gload = (result.lift.y + result.thrust.y) / (m * G);
+      if (this.ias < 12) {
+        this.aoaDeg = 0;
+        this.betaDeg = 0;
+      }
+    }
     // Pass 5 (item 6): the STALL warning showed spuriously in VTOL
     // hover. The BET stall flag LATCHES (it only clears once the jet
     // has regained flying speed, v > 20 m/s), so a flag set during
@@ -1643,37 +1756,37 @@ export class Aircraft {
     // bound the gate could never re-engage, a one-way cliff. A
     // jet 12 m under the deck is still excluded; a jet dipping
     // 3 m is a hard touchdown, and the coupling pulls it back.
-    // Pass 14 (item 13): VTOL liftoff release. A VTOL jet parked
-    // on the deck with the nozzle down (vector >= 70 deg) whose
-    // SPOOLED vertical thrust exceeds its weight must lift off,
-    // not ride the deck: the vertical coupling below overwrites
-    // newVel.y every step with the deck's vertical velocity plus
-    // a spring back to rest height, so at 100% throttle (191 kN
-    // vs ~179 kN weight) the thrust-driven climb (~+0.03 m/s per
-    // substep) was erased and the jet sat pinned at gear height
-    // forever (probe-vtol 5b: 2.20 m for 30 s at 100%). The
-    // release is gated on the SPOOLED throttle (the actual thrust
-    // right now, not the target), so the jet stays pinned while
-    // spooling up and lifts only once thrust > weight. At the
-    // 94% hover point the margin is ~0.2%: the jet un-pins and
-    // hovers at rest height, which is the correct behaviour for a
-    // jet at hover thrust; below hover thrust it stays pinned.
-    // The gate is a thrust comparison, not a velocity check, so a
-    // deck descent cannot release it by accident (pass-8
-    // hysteresis: the deck can drop > 1 m in a substep, which a
-    // velocity-based release would misread as a liftoff).
-    // Applies to BOTH coupling sites (pre-coupling below and the
-    // in-branch coupling): either one alone re-pins the jet.
+    // Pass 15 (item 5): the release is a NET vertical-force gate,
+    // not thrust-vs-weight. The pass-14 gate ignored the wing: a
+    // level jet on a deck CLIMBING at +15 m/s (40 m/s forward) reads
+    // AoA -20 deg, and the wing makes -33 kN of downforce — more
+    // than the +12 kN thrust margin at 100% — so the jet physically
+    // cannot lift off in that phase, yet the old gate released it
+    // and it sank back onto the deck (v4.9 live: lifted ~30 ft,
+    // sank at -2,133 fpm, hard-landing crash at vs -10.83 m/s;
+    // probe-vtol-live D2b reproduces it: AoA -28 deg, G -0.40,
+    // sink -7.2 m/s). The gate now compares the solver's actual
+    // vertical forces — wing lift (signed, world-vertical) plus
+    // vertical thrust (spooled throttle, so the jet still stays
+    // pinned while spooling up) — against the weight. It also
+    // refuses to release while the deck itself is descending fast
+    // (deckVel.y < -3 m/s): the jet inherits that sink, the thrust
+    // margin (+0.65 m/s^2) cannot arrest -10 m/s before the deck
+    // levels under it, and the relative sink at re-contact is a
+    // hard landing. The deck heave is brief (vy < -8 only ~4% of
+    // a live run, |vy| < 3 ~79%), so the jet waits on the deck for
+    // a calm phase instead of lifting into a crash. Applies to
+    // BOTH coupling sites (pre-coupling below and the in-branch
+    // coupling): either one alone re-pins the jet.
     const vtolLiftoff =
       S.vtol &&
       this.vectorDeg >= 70 &&
-      this.throttle * S.thrustMax *
-          Math.sin((this.vectorDeg * Math.PI) / 180) >
-        S.mass * G;
+      result.lift.y + result.thrust.y > S.mass * G &&
+      (!isDeck || deckVel.y >= -3);
     const surfLo = floorY + gearH - 3.0;
     if (isDeck && this.pos.y <= floorY + gearH + surfTol && this.pos.y >= surfLo) {
       const rotating =
-        spPre > S.stallSpeed * 0.85 && this.pitchIn < -0.25;
+        spPre > S.stallSpeed * 0.85 && this.pitchIn < -ROTATION_INTENT;
       if (!rotating && !vtolLiftoff) {
         newVel.y = deckVel.y + (floorY + gearH - this.pos.y) * 8.0;
       }
@@ -1748,7 +1861,7 @@ export class Aircraft {
       // Rotation flag (pass 14, Worker C): a pull on the ground is
       // a rotation; rolling below rotation speed without one means
       // this takeoff has not rotated yet.
-      if (pitchIn < -0.25) this.hasRotated = true;
+      if (pitchIn < -ROTATION_INTENT) this.hasRotated = true;
       else if (this.ias < S.rotateSpeedKt * 0.514444) this.hasRotated = false;
       // Pass 6 (item 6): the BET stall flag LATCHES — it only
       // clears once the jet has regained flying speed (v > 20) —
@@ -1906,7 +2019,7 @@ export class Aircraft {
       // (deckYawRate is already set above, from the current deck).
       // Take-off rotation gate (v2): enough speed + pull lifts off
       // naturally via the aero step; the flag just gates roll physics.
-      if (sp > S.stallSpeed * 0.85 && pitchIn < -0.25) this.grounded = false;
+      if (sp > S.stallSpeed * 0.85 && pitchIn < -ROTATION_INTENT) this.grounded = false;
       else if (sp < 5) this.grounded = true;
     } else {
       this.grounded = false;
@@ -1925,8 +2038,11 @@ export class Aircraft {
 
     // G-load on the ground is 1.0, not the solver's 0.2 floor (research
     // §6; the play-test saw 0.2 g on a parked jet). The solver's floor
-    // stays — this override is the controller's ground truth.
+    // stays — this override is the controller's ground truth. The
+    // display G is 1.0 on the ground too: the aero force sum is ~0
+    // parked, and the ground pushing up is the 1 g the pilot feels.
     if (this.grounded) this.gload = 1;
+    if (this.grounded) this.gDisplay = 1;
 
     // AoA on the ground is 0, for the same reason (pass 13, worker E):
     // a parked jet's air velocity is an artefact of being CARRIED, not
@@ -1980,7 +2096,7 @@ export class Aircraft {
     // Pitch-down is left alone (the nose gear stops it). Speed is
     // deck-relative on the carrier.
     // A nose-up rate on the ground is only allowed while the pilot is
-    // actually pulling (pitchIn < -0.25, the same threshold the
+    // actually pulling (pitchIn < -ROTATION_INTENT, the same threshold the
     // grounded flag uses). The BET solver is a moment model: the
     // thrust line sits 0.2 m below the CG, so at full thrust the
     // engines pitch the jet nose-up with a ~39 kN·m moment that
@@ -2015,7 +2131,7 @@ export class Aircraft {
       // deck at 214 kt with full pull and never lifted off). The
       // ias is the air-relative speed, so it is Vr on a runway and
       // on a deck alike.
-      if (this.ias < S.rotateSpeedKt * 0.514444 || pitchIn >= -0.25) rates.pitchRate = 0;
+      if (this.ias < S.rotateSpeedKt * 0.514444 || pitchIn >= -ROTATION_INTENT) rates.pitchRate = 0;
       else rates.pitchRate = Math.max(rates.pitchRate, -ROTATION_RATE_MAX);
     }
     // AoA limiter (BET only, pass 5): a held full pull must not run
@@ -2065,10 +2181,25 @@ export class Aircraft {
     // nose-up rate is free, so a jet pushed nose-down can pitch
     // back up to level. With a pull this does NOT apply — a real
     // rotation / turn gets full pitch authority.
+    // Pass 15 (item 5): the gate does NOT apply in VTOL hover
+    // (vector >= 70). It exists to stop a hands-off jet flying off
+    // a runway end — but a vectored jet hovering 10 m above a deck
+    // is low by definition, and the gate zeroed the hover FCS's
+    // nose-up corrections there, letting the nose diverge down
+    // (probe-vtol-live D2b). The hover FCS owns the pitch in the
+    // vectored regime; the stay-on-the-ground hold already excludes
+    // vector >= 70 the same way.
+    // The pitchedUp threshold is -15 deg, not -5: 1 g flight at
+    // transition speeds needs ~10 deg nose-up (AoA 8-10 deg at
+    // 130-170 kt), so -5 pinned a hands-off transition at pitch
+    // -5.1 deg, AoA 8.3, G 0.73 — still sinking 5 m/s at 167 kt
+    // with the nozzle already at 0 (probe-vtol-live D4: 28.5 m
+    // lost). -15 still blocks a runaway nose-up rotation while
+    // letting the FCS fly the jet at 1 g.
     const pitchNow = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x;
     const bankNow = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z;
     const pitchedUp =
-      pitchNow < (-5 * Math.PI) / 180 &&
+      pitchNow < (-15 * Math.PI) / 180 &&
       Math.abs(bankNow) < (45 * Math.PI) / 180;
     // "Low" is measured against BOTH the terrain below AND the
     // surface the jet left (pass 14, Worker C): past a runway end
@@ -2083,7 +2214,8 @@ export class Aircraft {
     if (
       !onSurface &&
       rates.pitchRate < 0 &&
-      pitchIn >= -0.25 &&
+      pitchIn >= -ROTATION_INTENT &&
+      this.vectorDeg < 70 &&
       (lowAlt || pitchedUp)
     ) {
       rates.pitchRate = 0;
@@ -2148,7 +2280,7 @@ export class Aircraft {
     // pilot PUSH pivoting the jet on its nose gear, not at this.
     if (
       !onSurface &&
-      pitchIn >= -0.25 &&
+      pitchIn >= -ROTATION_INTENT &&
       !this.hasRotated &&
       this.spec.archetype !== 'rotary' &&
       this.vectorDeg < 70 &&
@@ -2280,35 +2412,49 @@ export class Aircraft {
     // 0.40 rad/s (~23 deg/s) so a steep bank returns in seconds,
     // not never; at moderate banks the rate is unchanged in
     // practice (the 30 deg hands-off still levels in ~1 s).
-    // Pass 13 (worker E): the spring is ALSO gated off near the
-    // vertical (|Euler pitch| > 60 deg). Near-vertical the Euler YXZ
-    // bank (z) is a gimbal artefact, not a bank: a straight full
-    // pull from 400 kt reads bank 172° at the loop top, and the
-    // spring then commands a max-rate (−0.4 rad/s) roll about the
-    // nose axis — which, nose-vertical, is a WORLD yaw that slices
-    // the nose sideways (probe-aoa-g §2: beta 0 → +35° in 0.5 s,
-    // AoA +33° → −17°, G +5.3 → −3.2 — the v4.7 live steep-climb
-    // AoA −41°..−54° / G −1.2..−3.0 signature; with the spring off,
-    // §2f, the same pull holds beta 0.0°, AoA +28°..+35°, G
-    // +2.9..+8.7). The curve solver never departs (§2e: beta 0.0°).
-    // "Wings level" is undefined nose-vertical anyway, so the pilot
-    // owns the roll there; the spring still covers every bank in
-    // level flight (the pass-13 worker-B |bank| < 45° removal is
-    // untouched — a 111° bank at pitch ~0° still levels).
+    // Pass 15 (worker B): the bank is now read GIMBAL-SAFE, from
+    // the wing axis, and the |pitch| > 60 deg gate is GONE. The
+    // pass-13 worker-E gate switched the spring off in steep dives
+    // and climbs, so any bank present there — set during the dive /
+    // climb entry, or by the tap itself — persisted for the whole
+    // steep leg with nothing to remove it (the v4.9 live 37 deg
+    // right in a hands-off dive, 30 deg left in a hands-off climb,
+    // 43 deg right in a straight-up hold). And the Euler YXZ bank
+    // it read is not a physical quantity near the vertical: as the
+    // pitch passes 90 deg the decomposition flips and the same
+    // attitude reads bank 172 deg (probe-aoa-g §2), so the spring
+    // commanded a max-rate roll about the nose axis — which,
+    // nose-vertical, is a WORLD yaw that slices the nose sideways
+    // (beta 0 → +35° in 0.5 s, AoA +33° → −17°, G +5.3 → −3.2).
+    // The wing-axis bank cannot do either: w = quat * (1,0,0) is
+    // the LEFT wing direction in the world, and bank = asin(w.y)
+    // is the wings' tilt against the horizon — a continuous
+    // physical quantity at every pitch. In level flight it is
+    // identical to the Euler bank (w.y = sin(bank)); in a steep
+    // dive/climb it still reads the bank (attenuated by cos
+    // pitch, but the spring still saturates at its 0.4 rad/s cap
+    // for any bank worth levelling); nose-vertical it goes to 0
+    // by itself, because rolling about a vertical nose axis does
+    // not tilt the wings against the horizon — so the spring is
+    // inert exactly where "wings level" is undefined, instead of
+    // slicing, and no pitch gate is needed. Past 90 deg of bank
+    // it weakens gracefully to 0 at inverted (asin(sin 170 deg)
+    // = 10 deg) — inverted is a neutral point for any
+    // horizon-referenced measure — while a 111 deg bank still
+    // commands the full 0.4 rad/s, as before. The exact-0 rollIn
+    // gate and the other gates are unchanged.
     if (
       !onSurface &&
       typeof this.solver.syncRates === 'function' &&
       rollIn === 0 &&
       !this.dying &&
       !this.stalled &&
-      this.vectorDeg < 70 &&
-      Math.abs(new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x) <
-        60 * D2R
+      this.vectorDeg < 70
     ) {
-      const bankNow = new THREE.Euler().setFromQuaternion(
+      const wingY = new THREE.Vector3(1, 0, 0).applyQuaternion(
         this.quat,
-        'YXZ',
-      ).z;
+      ).y;
+      const bankNow = Math.asin(clamp(wingY, -1, 1));
       rates.rollRate += clamp(-bankNow * 2, -0.4, 0.4);
     }
     this.solver.syncRates?.(rates);
@@ -3074,6 +3220,7 @@ export class Aircraft {
     this.brake = false;
     this.aoaDeg = 0;
     this.gload = 1;
+    this.gDisplay = 1;
     this.vsi = 0;
     this.ias = 0;
     this.lockT = 0;

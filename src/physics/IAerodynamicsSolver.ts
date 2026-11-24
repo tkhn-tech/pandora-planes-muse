@@ -171,8 +171,8 @@ export const ZERO_DAMAGE: DamageZones = {
  *  fields mean "keep the current target". */
 export interface FlightControls {
   /** Stick pitch, -1..1. NEGATIVE pulls up (v2 template convention:
-   *  pitchIn < -0.25 is the take-off rotation trigger, and
-   *  pitchRate = pitchIn * 55 deg/s). */
+   *  pitchIn < -ROTATION_INTENT (0.10, pass 15) is the take-off
+   *  rotation trigger, and pitchRate = pitchIn * 55 deg/s). */
   pitch?: number;
   /** Stick roll, -1..1. */
   roll?: number;

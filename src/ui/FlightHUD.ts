@@ -227,7 +227,11 @@ export class FlightHUD {
           ? `◀ ${Math.round(-bankDeg)}°`
           : '0°',
     );
-    set('hudG', ac.gload.toFixed(1));
+    // Pass 15 (worker E, item 13): the G meter reads the display G —
+    // the specific-force magnitude (ac.gDisplay) — not the wing-lift
+    // load factor (ac.gload), which collapses to 0.1-0.3 in a steep
+    // climb while the thrust still carries the jet at ~1 g.
+    set('hudG', ac.gDisplay.toFixed(1));
     set('hudFuel', Math.round(ac.fuel * 100) + '%');
     // ROTATE cue (BET §3): green, shown while the gear is on a surface
     // and the jet is at/above its per-spec rotation speed. Pass 9

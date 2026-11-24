@@ -98,10 +98,34 @@ export class AircraftAIController {
   /** Smoothed turn rate (rad/s) for the HF two-loop bank command — the
    *  6/s turn-rate smoothing. */
   private omegaSm = 0;
-  /** Pass 14: previous frame's AoA (deg) and smoothed AoA rate
+  /** Pass 15: previous frame's AoA (deg) and smoothed AoA rate
    *  (deg/s) for the AoA-rate damper. */
   private prevAoA = 0;
   private aoaRateSm = 0;
+  /** Pass 15: SIM-time clock, accumulated from dt. The `time`
+   *  argument update() receives is the caller's `elapsed` — REAL
+   *  time in the live loop (main.ts advances elapsed by rawDt and
+   *  caps sim time at 0.1 s/frame, so at 4 fps elapsed runs 2.5x
+   *  sim time). The AI's internal rhythms (loiter orbit, evade
+   *  weave) must run on SIM time: on real time the loiter orbit
+   *  point moves at 0.08*800 = 64 m/s real = 160 m/s sim, while
+   *  the loitering jet flies at 100 m/s sim — it can never catch
+   *  its orbit point, drifts 3 km from the player during a slow
+   *  human takeoff, and flies into terrain chasing it (delayed60:
+   *  orbit lag 2956 m, terrain death at 26 s sim, never engages —
+   *  the v4.9 live symptom exactly). Accumulating dt makes the
+   *  orbit move at 64 m/s sim, which the 100 m/s loiter holds. */
+  private simTime = 0;
+  /** Pass 15: previous frame's goal-driven vsDes (m/s), for the
+   *  vsDes slew limit below. */
+  private prevVsDes = 0;
+  /** Pass 15: loiter-orbit anchor. The orbit point is anchored to
+   *  the jet's HEADING when it first loiters (see the orbit block):
+   *  the point starts 800 m from the player along the jet's line of
+   *  flight, and loiterT is the sim time spent loitering (the orbit
+   *  advances only while loitering, so a fight does not move it). */
+  private loiterAnchorA: number | null = null;
+  private loiterT = 0;
   /** Pass 14: latched terrain-avoidance turn side (+0.6 left,
    *  -0.6 right, 0 none) — see the turn block for why it latches. */
   private terrainTurnLatch = 0;
@@ -183,8 +207,16 @@ export class AircraftAIController {
     }
   }
 
-  update(dt: number, player: Aircraft, carrier: HelicarrierController, time: number): FlightControls {
+  // `time` is the caller's elapsed clock (real time live); it is
+  // deliberately unused — the AI's rhythms run on this.simTime
+  // (accumulated from dt above). Kept in the signature so callers
+  // (main.ts, probes) do not change.
+  update(dt: number, player: Aircraft, carrier: HelicarrierController, _time: number): FlightControls {
     const ac = this.aircraft;
+    // Pass 15: sim-time clock (see the simTime field note). `time`
+    // is the caller's real-time elapsed; the AI's internal rhythms
+    // below use this.simTime instead.
+    this.simTime += dt;
     this.fireGun = false;
     this.fireMissile = false;
     this.dropBomb = false;
@@ -360,6 +392,12 @@ export class AircraftAIController {
     // patrol whose player is not fair yet.
     const loitering =
       this.state === 'patrol' && this.role === 'enemy' && !fairPlayer;
+    // Pass 15: leaving the loiter resets the orbit anchor, so
+    // re-entering it re-anchors to the jet's then-current heading.
+    if (!loitering) {
+      this.loiterAnchorA = null;
+      this.loiterT = 0;
+    }
     let goal: THREE.Vector3 = this.navTarget;
     let speedWant = 130;
     let gearDown = false;
@@ -404,7 +442,16 @@ export class AircraftAIController {
       // player's cruise with margin to close, inside the airframe
       // envelope, and the corner-speed rule below still slows the
       // jet for a hard turn.
-      speedWant = clamp(player.ias + 60, 200, 380);
+      // Pass 15: the +60 m/s closing margin is too slow to re-close
+      // after ANY separation. Measured (probe-ai-live15 cruise1v1):
+      // after the player is shot down and respawns, the enemy sits
+      // 12-17 km behind and closes at ~60 m/s — 200+ s sim (8+ min
+      // real at 4 fps) to re-engage, so the fight is over after the
+      // first kill. +120 m/s halves that (15 km in ~125 s sim); the
+      // corner-speed rule below still caps the speed when the
+      // heading error is big, and engage takes over inside 2600 m
+      // with player.ias+25, so the merge geometry is unchanged.
+      speedWant = clamp(player.ias + 120, 200, 380);
       vsCap = 30;
       const desHdgHere = Math.atan2(goal.x - ac.pos.x, goal.z - ac.pos.z);
       let hdgErrHere = desHdgHere - curHdg;
@@ -506,13 +553,71 @@ export class AircraftAIController {
     // bank cap does not fight the orbit turn) and a 55 deg loiter
     // bank cap below (the orbit needs ~39 deg at 100 m/s).
     if (this.state === 'patrol' && this.role === 'enemy' && !fairPlayer) {
-      const orbitA = time * 0.08;
+      // Orbit altitude player.y + 800 (was +500). The hills around
+      // Alpha rise to 600+ m, so a 550 m orbit sits AT the hilltop
+      // height — the jet spends the whole ground hold climbing
+      // toward an orbit that is itself below the ridges on its path
+      // (delayed60: climbed 207 -> 617 m but the ridge ahead was
+      // 611 m, dead at 36.8 s). At +800 the orbit is above every
+      // local hilltop.
+      const orbitY = player.pos.y + 800;
+      // ORBIT: anchored, slow, WIDE (radius 1500 m, was 800 m).
+      // The old orbit point started at a fixed phase (orbitA =
+      // time*0.08, due east of the player) — but an enemy spawns
+      // FACING the player, so the point sat ~180 deg behind it, and
+      // the 55 deg loiter bank cap at 130 m/s only turns at ~6
+      // deg/s: the jet flew a 1.2 km radius circle, its nose
+      // 110-168 deg off the player, and drifted 3 km from the
+      // player during a 60 s ground hold. The anchor puts the point
+      // 1500 m from the player ALONG THE JET'S LINE OF FLIGHT
+      // (orbitA = pi/2 - hdg converts the atan2(fwd.x, fwd.z)
+      // heading into the orbit's atan2(z, x) angle), so the jet
+      // flies straight to it — no 180 deg reversal. The orbit
+      // advances at 0.04 rad/s (was 0.08): the point moves at
+      // 60 m/s, the jet at 130 m/s. And the radius is 1500 m, not
+      // 800 m: at 130 m/s an 800 m orbit needs a 65 deg bank —
+      // above the 55 deg cap, so the jet could never hold it and
+      // cut across the circle, spiralling outward (a separate
+      // climb-to-a-point-above-the-player phase was tried and
+      // reverted for the same reason: the jet flies through the
+      // point at 130 m/s, the bearing flips 180 deg, and the
+      // 29 s reversal carries it 2.4 km away). A 1500 m orbit needs
+      // a 49 deg bank at 130 m/s — inside the cap with margin —
+      // and 1500 m is inside the 2600 m engage range, so the enemy
+      // engages the moment the player goes airborne.
+      if (this.loiterAnchorA === null) {
+        const hdg = Math.atan2(ac.fwd().x, ac.fwd().z);
+        this.loiterAnchorA = Math.PI / 2 - hdg;
+        this.loiterT = 0;
+      }
+      this.loiterT += dt;
+      const orbitA = this.loiterAnchorA + this.loiterT * 0.04;
       goal = this.tmpB.set(
-        player.pos.x + Math.cos(orbitA) * 800,
-        player.pos.y + 500,
-        player.pos.z + Math.sin(orbitA) * 800,
+        player.pos.x + Math.cos(orbitA) * 1500,
+        orbitY,
+        player.pos.z + Math.sin(orbitA) * 1500,
       );
-      speedWant = 100;
+      // Pass 15: loiter climb authority 30 m/s (was the patrol
+      // default 15). The floor-driven climb demand caps at +20,
+      // but vsDes itself was capped at vsCap 15, so the jet could
+      // only climb at +15 m/s — not enough to reach an 811 m floor
+      // in the 8 s of lookahead warning (delayed60: +11 m/s
+      // average, grazed a 611 m ridge at 617 m). At 30 m/s it gains
+      // 240 m in 8 s. A transit climb, not a fight manoeuvre.
+      vsCap = 30;
+      // Pass 15: loiter speed 100 -> 130 m/s. At 100 m/s the
+      // MiG-29 cannot hold the 55 deg orbit bank at the AoA limit
+      // (it needs 1/cos(55 deg) = 1.75 g, it makes ~1.5 g at AoA
+      // 10 deg), so it sinks unrecoverably while commanding a climb
+      // (delayed60: bank -55 deg, AoA pinned at 10, vsi +5 -> -19
+      // m/s, dead on flat ground at 31 s sim — the AoA limiter
+      // zeroes the nose-up command and the loiter sink-unload
+      // exemption keeps the bank on). At 130 m/s the dynamic
+      // pressure is 1.7x, the jet holds the orbit bank with climb
+      // margin, and it closes the orbit lag faster. Still above
+      // 1.5x stall (96 m/s), so the low-energy bank cap does not
+      // fight the orbit turn.
+      speedWant = 130;
     }
     const toGoal = this.tmpA.copy(goal).sub(ac.pos);
     const dist = toGoal.length();
@@ -577,15 +682,72 @@ export class AircraftAIController {
       // of the fight (pursuit engage 197 -> 164 s, player lock
       // seconds 9.3 -> 5.2) without fixing e2's ridge death. Four
       // points stand.)
+      // (Pass 15: an ARC lookahead — sampling along the jet's
+      // turning path (omega = -g*tan(bank)/ias) instead of the
+      // straight velocity heading — was tried and REVERTED. It
+      // fixed the late turning-path deaths (cruise4 2 deaths at
+      // 176.3 s -> 1 at 33.6 s, gun 7 -> 14, msl 8 -> 13) but
+      // regressed the pursuit engagement below the pass-14
+      // baseline (engage 230.1 -> 141.8 s vs the 197.0 s baseline)
+      // — the arc samples terrain to the side, so it fires the
+      // terrain demand/climb more often and pulls the AI out of
+      // the fight, the same mechanism as the pass-14 eight-point
+      // revert. The straight-line four points stand; the remaining
+      // turning-path deaths (a fast jet in a sustained bank
+      // turning into a ridge the straight samples miss) are the
+      // known residual, reported honestly.)
       for (const frac of [0.25, 0.5, 0.75, 1.0]) {
-        clearAhead = Math.min(
-          clearAhead,
-          ac.pos.y -
+        const gx = ac.pos.x + travelX * lookAhead * frac;
+        const gz = ac.pos.z + travelZ * lookAhead * frac;
+        const gh = this.groundHeight(gx, gz);
+        clearAhead = Math.min(clearAhead, ac.pos.y - gh);
+      }
+      // Pass 15: INTERCEPT / LOITER GOAL TERRAIN FLOOR. An
+      // intercept flies at the player's altitude, which can be far
+      // below the ridge tops the jet must cross — the player climbs
+      // out over flat Alpha while the jet is kilometres away over
+      // 550 m hills — so the jet meets a ridge it cannot out-climb
+      // or out-turn (cruise1v1: 252 m/s into a ridge rising 268 m
+      // in <250 m of travel, dead at 128 s). A loitering jet has
+      // the same problem in miniature: its orbit point sits at
+      // player.y + 500, but it climbs toward it at only +6 m/s
+      // (the 0.03 vs-gain), so during a 60 s ground hold it never
+      // gets above 400 m — below the hilltops — and flies into a
+      // ridge (delayed60: y 320 -> 385, ridge 165 -> 380, dead at
+      // 29.8 s). Floor the transit goal at the highest terrain on
+      // the lookahead + 200 m, so the jet climbs BEFORE the ridge
+      // instead of meeting it at the player's altitude. Transit
+      // only (intercept + loiter) — the dogfight (engage) still
+      // dives to the player, and the floor only ever raises the goal.
+      // The floor looks FURTHER ahead than the avoidance (ias*8,
+      // min 600 m — ~8 s of flight): the 5 s avoidance lookahead
+      // sees a wall-like ridge only when it is too late to climb
+      // over it (delayed60: ridge rising 72 m/s, jet climbing
+      // +20 m/s, dead at 119.8 s — the crest was 6.8 s out when the
+      // avoidance first fired). And the floor drives a climb
+      // DEMAND of its own (shortfall * 0.05, cap +20): the gentle
+      // 0.03 vs-gain alone only commands +5 m/s for a 160 m
+      // shortfall, which does not clear a ridge in 8 s.
+      if (intercepting || loitering) {
+        const floorLookAhead = Math.max(600, ac.ias * 8);
+        let maxGroundFloor = -Infinity;
+        for (const frac of [0.25, 0.5, 0.75, 1.0]) {
+          maxGroundFloor = Math.max(
+            maxGroundFloor,
             this.groundHeight(
-              ac.pos.x + travelX * lookAhead * frac,
-              ac.pos.z + travelZ * lookAhead * frac,
+              ac.pos.x + travelX * floorLookAhead * frac,
+              ac.pos.z + travelZ * floorLookAhead * frac,
             ),
-        );
+          );
+        }
+        const floorY = maxGroundFloor + 200;
+        goal.y = Math.max(goal.y, floorY);
+        if (floorY > ac.pos.y) {
+          terrainClimb = Math.max(
+            terrainClimb,
+            clamp((floorY - ac.pos.y) * 0.05, 0, 20),
+          );
+        }
       }
       if (clearAhead < 120) {
         terrainClimb = Math.max(
@@ -638,9 +800,20 @@ export class AircraftAIController {
         // from the geometry at the moment the ridge blocked the
         // centre; turning toward it is the way out, and the latch
         // clears only when the centre is clear again.
+        // Pass 15: the turn only fires when a side is CLEARLY
+        // better (+80 m, was +5 m). At +5 m the jet turned toward a
+        // side that was barely better — noise on 500 m hills — and
+        // the 60 deg avoidance bank then killed the climb it needed
+        // (pursuit e2 t=49-54: terrTurn latched, bank 60 deg, AoA
+        // pinned at the limit, vsi -15..0 while the ridge rose
+        // faster than it climbed). When the terrain is high in
+        // every direction the turn is not an escape at all — the
+        // climb is — so the jet climbs wings-level instead (the
+        // bank cap below). A side 80 m clearer is a real valley,
+        // and the turn still fires for it.
         if (this.terrainTurnLatch !== 0) {
           terrainTurn = this.terrainTurnLatch;
-        } else if (best > clearAhead + 5) {
+        } else if (best > clearAhead + 80) {
           this.terrainTurnLatch = clearL >= clearR ? 0.6 : -0.6;
           terrainTurn = this.terrainTurnLatch;
         }
@@ -812,8 +985,20 @@ export class AircraftAIController {
               // known remaining limitation, reported honestly) and
               // the range-gated 45/70 caps — which pass the pursuit
               // probe — are restored.
-              ((ac.pos.distanceTo(goal) <= 1200 ? 70 : 45) * Math.PI) /
-              180
+              // Pass 15: the 70 deg bank returns for the INTERCEPT
+              // only (not engage/evade). The pass-13 constraint is
+              // the dogfight: in intercept the jet is beyond 2600 m,
+              // outside the player's 2500 m lock range, so the player
+              // cannot lock it anyway, and once it enters engage the
+              // range gate below applies as before. At 45 deg and
+              // 217 m/s the turn onto the intercept course takes
+              // ~35 s for 90 deg (delayed60: first engage 52 s after
+              // airborne despite a 3.2 km gap the +120 m/s closure
+              // should cover in ~5 s); at 70 deg it takes ~13 s.
+              (intercepting && Math.abs(hdgErr) > (30 * Math.PI) / 180
+                ? (70 * Math.PI) / 180
+                : ((ac.pos.distanceTo(goal) <= 1200 ? 70 : 45) * Math.PI) /
+                  180)
             : (45 * Math.PI) / 180;
     // (pass 12, Worker E: the combat bank cap is range-gated. In a
     // 70 deg bank the pitch input rotates the nose in the roll plane,
@@ -941,6 +1126,22 @@ export class AircraftAIController {
     if (terrainTurn !== 0 && !lowEnergy) {
       phiDes = ((terrainTurn < 0 ? 1 : -1) * 60 * Math.PI) / 180;
     }
+    // Pass 15: BANK CAP WHILE CLIMBING. When the terrain climb
+    // demand is active and the jet is NOT turning away (no side is
+    // clearly better — the terrain is high in every direction), the
+    // climb is the escape, and a steep bank kills it: in a 60 deg
+    // bank the vertical lift halves, so the jet commands +20 m/s
+    // and sinks instead (pursuit e2 t=42-54: 55-60 deg bank, AoA
+    // pinned at the 10 deg limit, vsi -3..-15 while the ridge rose
+    // faster than it climbed). Cap the bank at 30 deg while the
+    // climb demand is active so the climb has lift. The avoidance
+    // turn above is the escape when a side IS clearly better, and
+    // it keeps its 60 deg bank. This fires only when the terrain
+    // ahead is within 120 m of clearance, so a high dogfight is
+    // untouched.
+    if (terrainClimb > 0 && terrainTurn === 0) {
+      phiDes = clamp(phiDes, (-30 * Math.PI) / 180, (30 * Math.PI) / 180);
+    }
     // (Pass 14: a CLIMB UNLOAD here — levelling the wings when the
     // terrain climb was failing during an avoidance turn — was tried
     // and reverted: it fired through most low-level flying (the
@@ -951,8 +1152,10 @@ export class AircraftAIController {
     const phiNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
     let rollIn = clamp((phiDes - phiNow) * 2.0, -1, 1);
     // v2 evade weave: sin(performance.now() * 0.004); time here is seconds,
-    // so the equivalent angular frequency is 4 rad/s.
-    if (this.state === 'evade') rollIn = clamp(rollIn + Math.sin(time * 4) * 0.5, -1, 1);
+    // so the equivalent angular frequency is 4 rad/s. Pass 15: sim time
+    // (see the simTime note) — on real time the weave runs 2.5x too
+    // fast in sim terms at 4 fps.
+    if (this.state === 'evade') rollIn = clamp(rollIn + Math.sin(this.simTime * 4) * 0.5, -1, 1);
 
     // Pitch from vertical-speed error: vsDes from the goal's elevation,
     // pitchIn from (vsi - vsDes). pitchIn < 0 = nose up, so a climb
@@ -979,7 +1182,19 @@ export class AircraftAIController {
     // jet descends at the slope rate even when exactly on the slope
     // and the proportional term only corrects small errors.
     const vsGain =
-      this.state === 'rtb' ? 0.08 : this.state === 'engage' || this.state === 'evade' ? 0.015 : 0.03;
+      this.state === 'rtb' || loitering
+        ? 0.08
+        : this.state === 'engage' || this.state === 'evade'
+          ? 0.015
+          : 0.03;
+    // (Pass 15: loitering joins RTB at 0.08. The 0.03 gain only
+    // commands +8 m/s toward an orbit point 300 m above, so a
+    // loitering jet takes ~60 s to climb to its orbit altitude and
+    // spends the whole ground hold below the hilltops (delayed60:
+    // y 207 -> 385 over 24 s sim, dead on a 380 m ridge). At 0.08
+    // it commands +15 m/s (the vsCap) and reaches the orbit in
+    // ~20 s. A transit goal moves smoothly, so the porpoising
+    // risk the 0.08 gain carries in engage does not apply here.)
     // (pass 12, Worker E: engage/evade 0.015, was 0.03. The outer
     // altitude loop saturated — vsDes clamped at +-vsCap for any
     // altitude error over ~1000 m — and the inner pitch loop then
@@ -998,6 +1213,29 @@ export class AircraftAIController {
     // steering section — the turn bias feeds desHdg there, and
     // terrainClimb feeds vsDes here.)
     let vsDes = clamp((goal.y - ac.pos.y) * vsGain - slopeSink, -vsCap, vsCap);
+    // Pass 15: VSDES SLEW LIMIT. A state transition steps the goal
+    // (and so the vsDes) in one frame — patrol climb +30 to engage
+    // descent -5 — and the pitch law (pitchIn from the vs error)
+    // slams the nose down to kill the climb: AoA -16.4, g -2.1, vsi
+    // +26 -> -20 in 2 s, 60 m of altitude gone, and the jet ends up
+    // flying low and level at ~330 m over terrain that is rising
+    // toward it (cruise1v1 e0 and cruise4 e1: both dead at ~30 s on
+    // a ridge spike after exactly this dive). The AoA limiter cannot
+    // catch it — it reads the AoA at the START of the step, and the
+    // AoA swings 18 deg inside one substep. Slewing the goal-driven
+    // vsDes at 20 m/s per second (a full +30 -> -30 swing in 3 s,
+    // the engage transition in ~1.8 s) makes the descent gradual
+    // instead of a slam: the jet keeps its climb energy and stays
+    // above the ridges. The slew applies ONLY to the goal-driven
+    // vsDes, BEFORE the terrain-climb max below — a terrain demand
+    // (+20) must still jump in immediately, because a ridge 120 m
+    // ahead cannot wait 1.8 s.
+    vsDes = clamp(
+      vsDes,
+      this.prevVsDes - 20 * dt,
+      this.prevVsDes + 20 * dt,
+    );
+    this.prevVsDes = vsDes;
     if (terrainClimb > 0) vsDes = Math.max(vsDes, terrainClimb);
     const pitchLim = Math.min(pitchCap, 0.6);
     // Pitch gain, speed-scheduled (pass 12, Worker E): a fixed 0.06

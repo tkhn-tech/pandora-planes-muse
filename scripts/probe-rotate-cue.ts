@@ -412,6 +412,11 @@ async function main(): Promise<void> {
         // real controller carries it (default () => 0, assigned by
         // main); this stub must too or update() throws.
         terrainHeightAt: (_x: number, _z: number) => 0,
+        // Pass 15 coordinator: FlightHUD.update now reads
+        // ac.gDisplay (specific-force magnitude, Worker E) — the
+        // real controller carries it (init 1); this stub must too
+        // or update() throws on .toFixed.
+        gDisplay: 1,
         msl: 6,
         flares: 30,
         bombs: 4,

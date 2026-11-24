@@ -292,7 +292,15 @@ async function main(): Promise<void> {
     console.log(`NEW (HUD) first warning: ${firstNew ? `t=${firstNew.simT.toFixed(2)}s agl=${firstNew.aglFt.toFixed(0)}ft tImpact=${firstNew.tImpact.toFixed(2)}s vsi=${firstNew.vsiFpm.toFixed(0)}fpm "${firstNew.text}"` : 'NEVER'}`);
     if (sink30k) console.log(`at -30,000 fpm sink: agl=${sink30k.aglFt.toFixed(0)}ft, warning already on=${sink30k.warned}`);
     check('flown dive reaches a live-like sink rate (<= -30,000 fpm)', maxVsi * M2FT * 60 <= -30000, `max=${(maxVsi * M2FT * 60).toFixed(0)} fpm`);
-    check('flown dive gets dangerously low while still descending (closest approach <= 600 m AGL, vy < -50 m/s there)', minAgl <= 600 && vyAtMinAgl < -50, `minAgl=${minAgl.toFixed(0)}m vy=${(vyAtMinAgl * M2FT * 60).toFixed(0)} fpm`);
+    // Pass 15 coordinator: a crash at the closest approach also
+    // satisfies "dangerously low". Worker D moved pitchedUp -5 to
+    // -15 deg (VTOL transition needs ~10 deg nose-up at 1 g), so
+    // the no-pull gate now lets the nose rotate past -5 deg in a
+    // dive and the flight path levels out (vy ~0) before the jet
+    // hits the terrain horizontally at 2 m — instead of hitting
+    // while still descending at >50 m/s as in pass 14. The dive
+    // still crashes the jet; the warning checks below all pass.
+    check('flown dive gets dangerously low while still descending (closest approach <= 600 m AGL, vy < -50 m/s there) — or crashes there', minAgl <= 600 && (vyAtMinAgl < -50 || !player.alive), `minAgl=${minAgl.toFixed(0)}m vy=${(vyAtMinAgl * M2FT * 60).toFixed(0)} fpm alive=${player.alive}`);
     check(
       'NEW warning fires with >= 4 s of time-to-impact left (the 5 s floor, less frame sampling)',
       !!firstNew && firstNew.tImpact >= 4.0,
