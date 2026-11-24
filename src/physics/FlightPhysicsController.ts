@@ -664,6 +664,40 @@ export class Aircraft {
    *  deck, whichever is higher) — set by the ground block, read by
    *  autoGear() for AGL. Pass 10, item 3. */
   floorY = 0;
+  /** Rest height (floorY + gear height) of the surface the jet took
+   *  off from — the MAXIMUM rest height seen while onSurface this
+   *  life (pass 14, Worker C). The "no pull, no pitch-up" gate and
+   *  the low nose-down clamp below measure "low" against the surface
+   *  the jet LEFT, not the terrain currently below it: past a runway
+   *  end the heightfield falls away, so pos.y − floorY grows past
+   *  10 m while the jet has not climbed at all — the gate opened,
+   *  the BET nose-up moment (thrust line 0.2 m below the CG + tail
+   *  download) pitched the jet to its ~2-5 deg trim AoA, and at
+   *  330 kt that lift is already ~1.5 g, so a hands-off jet flew
+   *  off the end and climbed away into the terrain (v4.8 live:
+   *  liftoff ~190-240 kt, 0-330 fpm, F-15E into a mountainside
+   *  75 s later; probe-auto-liftoff §A: all six jets airborne
+   *  53-63 s with no input). Referenced to lastSurfaceY the gate
+   *  stays shut until the jet has genuinely climbed 10 m above its
+   *  liftoff height — a real rotation (a pull) bypasses the gate
+   *  entirely, so takeoffs are untouched. It is a MAX, not the
+   *  latest rest height: a jet bouncing down the plateau skirt
+   *  re-contacts at ever-lower heights, and taking the latest
+   *  would ratchet the reference down with it and open the gate
+   *  again (the first version of this fix did exactly that). The
+   *  runway / deck the jet left is the local high ground, so the
+   *  max is the takeoff surface. −Infinity until the jet has ever
+   *  been on a surface (an air-spawned jet has no surface to
+   *  reference, so the gate reads open, as before). Reset in
+   *  respawn() with the rest of the fresh-life state. */
+  private lastSurfaceY = -Infinity;
+  /** True once this takeoff has had a rotation pull (pass 14,
+   *  Worker C). Set by a pull on the ground, cleared while rolling
+   *  below rotation speed without one — so a jet that runs off the
+   *  runway end without ever rotating is distinguishable from one
+   *  that rotated and released. The stay-on-the-ground pitch hold
+   *  below reads it. Reset in respawn(). */
+  private hasRotated = false;
   hook = false;
   brake = false;
   /** Sim seconds; spawn protection ends at spawnProtectedUntil. */
@@ -1051,6 +1085,37 @@ export class Aircraft {
     this.pendingContact = { impactVy, isDeck };
   }
 
+  /** Speed of the jet INTO the surface at a new contact, measured
+   *  along the surface normal (pass 14, Worker C). The hard-landing
+   *  judges used only the vertical speed, so a jet flying
+   *  horizontally into a rising slope at 500+ kt never crashed —
+   *  its vsi was ~-2 m/s — and Rapier bounced it off the slope,
+   *  pitching the nose up ~22 deg and launching it into a
+   *  zoom-climb (probe-auto-liftoff §A: F-22/F-15E/MiG-29/F-35A
+   *  all flew away after the stay-on-the-ground hold kept them
+   *  low). The normal speed is (slope*vh - vy)/sqrt(1+slope^2),
+   *  where slope is the terrain rise over 25 m ahead along the
+   *  horizontal velocity (vx, vz — the drain-time impact velocity,
+   *  passed in by the caller) and vy is the pre-resolution
+   *  vertical speed at contact. On flat ground it reduces to the
+   *  descent rate, so runway landings are judged exactly as
+   *  before; a climbing graze past a peak (terrain falling ahead)
+   *  reads negative and does not crash. Only for terrain contacts
+   *  — decks are flat, so callers keep the vertical speed there.
+   *  A negative result means the jet is moving away from the
+   *  surface (climbing off it); callers clamp at 0. */
+  private impactNormalSpeed(impactVy: number, vx: number, vz: number): number {
+    const vh = Math.hypot(vx, vz);
+    if (vh < 1) return Math.max(0, -impactVy);
+    const hNow = this.terrainHeightAt(this.pos.x, this.pos.z);
+    const hAhead = this.terrainHeightAt(
+      this.pos.x + (vx / vh) * 25,
+      this.pos.z + (vz / vh) * 25,
+    );
+    const slope = (hAhead - hNow) / 25;
+    return (slope * vh - impactVy) / Math.sqrt(1 + slope * slope);
+  }
+
   /** Load the GLB for this modelKey (MeshoptDecoder registered — the
    *  v1.1 fix) with a procedural fallback on failure. The template is
    *  cached per key and cloned per aircraft (materials cloned too, so
@@ -1192,7 +1257,38 @@ export class Aircraft {
     this.simTime += dt;
     if (this.gunCd > 0) this.gunCd -= dt;
     if (this.flareCd > 0) this.flareCd -= dt;
+    // Violent Rapier ejection (pass 14, Worker C): between our steps
+    // the body velocity changes only by gravity and by contact
+    // impulses (the aero forces are written to the body by us, at
+    // the end of the previous step). A jet skimming the terrain at
+    // 170+ m/s can catch a steep heightfield edge that the 25 m
+    // slope average in impactNormalSpeed does not see; Rapier's
+    // solver then ejects it with a ~165 m/s impulse in one substep
+    // (measured: F-35A (176, 1.3) -> (18, 55) m/s in 16 ms, pitch
+    // -0.3 -> +5.9 deg — a 10,000 m/s^2 deceleration no airframe
+    // survives), and the contact judges never fire because the
+    // first touch had prevOnSurface true (a bounce) and a gentle
+    // 25 m normal speed. No aero force and no normal landing or
+    // bounce changes the velocity by anything like 20 m/s in one
+    // substep (gravity is at most 2.5 m/s at the 250 ms live cap;
+    // a hard landing's arrest is spread over substeps and is
+    // already judged), so a > 20 m/s jump, gravity removed, is a
+    // terrain strike: crash. Gated on airborne (the previous
+    // step's onSurface — a parked/rolling jet's deck and ground
+    // contacts are continuous and small) and on alive / not dying.
+    const prevVel = this.vel.clone();
     this.syncFromBody();
+    if (this.alive && !this.dying && !this.onSurface) {
+      const dv = Math.hypot(
+        this.vel.x - prevVel.x,
+        this.vel.y - prevVel.y + G * dt,
+        this.vel.z - prevVel.z,
+      );
+      if (dv > 20) {
+        this.crash('terrain');
+        return;
+      }
+    }
 
     // Dying: the jet is falling, not flying — all controls are zeroed
     // and the throttle is cut (damage-model §6 step 1). The solver
@@ -1445,10 +1541,13 @@ export class Aircraft {
     // a jet that was on the surface last step is riding/bouncing,
     // not landing.
     if (!this.dying && contact && !prevOnSurface) {
-      const impactVs = Math.max(
-        0,
-        -(contact.impactVy - (contact.isDeck ? deckVel.y : 0)),
-      );
+      // Impact speed along the surface normal (pass 14, Worker C —
+      // see impactNormalSpeed): the vertical-only judge missed a
+      // jet flying horizontally into a rising slope at 500+ kt.
+      // Decks are flat, so they keep the vertical speed.
+      const impactVs = contact.isDeck
+        ? Math.max(0, -(contact.impactVy - deckVel.y))
+        : this.impactNormalSpeed(contact.impactVy, vel.x, vel.z);
       const impactBank = Math.abs(
         new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z,
       );
@@ -1544,11 +1643,38 @@ export class Aircraft {
     // bound the gate could never re-engage, a one-way cliff. A
     // jet 12 m under the deck is still excluded; a jet dipping
     // 3 m is a hard touchdown, and the coupling pulls it back.
+    // Pass 14 (item 13): VTOL liftoff release. A VTOL jet parked
+    // on the deck with the nozzle down (vector >= 70 deg) whose
+    // SPOOLED vertical thrust exceeds its weight must lift off,
+    // not ride the deck: the vertical coupling below overwrites
+    // newVel.y every step with the deck's vertical velocity plus
+    // a spring back to rest height, so at 100% throttle (191 kN
+    // vs ~179 kN weight) the thrust-driven climb (~+0.03 m/s per
+    // substep) was erased and the jet sat pinned at gear height
+    // forever (probe-vtol 5b: 2.20 m for 30 s at 100%). The
+    // release is gated on the SPOOLED throttle (the actual thrust
+    // right now, not the target), so the jet stays pinned while
+    // spooling up and lifts only once thrust > weight. At the
+    // 94% hover point the margin is ~0.2%: the jet un-pins and
+    // hovers at rest height, which is the correct behaviour for a
+    // jet at hover thrust; below hover thrust it stays pinned.
+    // The gate is a thrust comparison, not a velocity check, so a
+    // deck descent cannot release it by accident (pass-8
+    // hysteresis: the deck can drop > 1 m in a substep, which a
+    // velocity-based release would misread as a liftoff).
+    // Applies to BOTH coupling sites (pre-coupling below and the
+    // in-branch coupling): either one alone re-pins the jet.
+    const vtolLiftoff =
+      S.vtol &&
+      this.vectorDeg >= 70 &&
+      this.throttle * S.thrustMax *
+          Math.sin((this.vectorDeg * Math.PI) / 180) >
+        S.mass * G;
     const surfLo = floorY + gearH - 3.0;
     if (isDeck && this.pos.y <= floorY + gearH + surfTol && this.pos.y >= surfLo) {
       const rotating =
         spPre > S.stallSpeed * 0.85 && this.pitchIn < -0.25;
-      if (!rotating) {
+      if (!rotating && !vtolLiftoff) {
         newVel.y = deckVel.y + (floorY + gearH - this.pos.y) * 8.0;
       }
     }
@@ -1611,6 +1737,19 @@ export class Aircraft {
       this.onSurface = true;
       this.grounded = true;
       this.onDeck = isDeck;
+      // Pass 14 (Worker C): remember the rest height of this surface
+      // (see the lastSurfaceY field) — the low-altitude gates below
+      // measure against the surface the jet left, not the terrain
+      // currently below it. The MAXIMUM rest height seen this life:
+      // bouncing down a falling slope must not ratchet the
+      // reference down (the first version of this fix did exactly
+      // that and the gate opened again).
+      this.lastSurfaceY = Math.max(this.lastSurfaceY, floorY + gearH);
+      // Rotation flag (pass 14, Worker C): a pull on the ground is
+      // a rotation; rolling below rotation speed without one means
+      // this takeoff has not rotated yet.
+      if (pitchIn < -0.25) this.hasRotated = true;
+      else if (this.ias < S.rotateSpeedKt * 0.514444) this.hasRotated = false;
       // Pass 6 (item 6): the BET stall flag LATCHES — it only
       // clears once the jet has regained flying speed (v > 20) —
       // so a jet that stalled, recovered and landed kept showing
@@ -1635,10 +1774,9 @@ export class Aircraft {
       const vs = prevOnSurface
         ? 0
         : contact
-          ? Math.max(
-              0,
-              -(contact.impactVy - (contact.isDeck ? deckVel.y : 0)),
-            )
+          ? contact.isDeck
+            ? Math.max(0, -(contact.impactVy - deckVel.y))
+            : this.impactNormalSpeed(contact.impactVy, vel.x, vel.z)
           : Math.max(0, -relVy);
       const bank = Math.abs(
         new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').z,
@@ -1723,8 +1861,11 @@ export class Aircraft {
       // gentle, and it holds the jet on the deck through climbs,
       // descents and turns. Gated on the deck: a runway never moves
       // vertically, and forcing newVel.y there would pin a rotating
-      // jet to the ground.
-      if (isDeck) {
+      // jet to the ground. Pass 14 (item 13): also released for a
+      // VTOL liftoff (vtolLiftoff above) — without this the
+      // in-branch coupling re-pins the jet even after the
+      // pre-coupling lets it go.
+      if (isDeck && !vtolLiftoff) {
         newVel.y = deckVel.y + (floorY + gearH - this.pos.y) * 8.0;
       }
       this._prevDeckVel.copy(deckVel);
@@ -1929,11 +2070,21 @@ export class Aircraft {
     const pitchedUp =
       pitchNow < (-5 * Math.PI) / 180 &&
       Math.abs(bankNow) < (45 * Math.PI) / 180;
+    // "Low" is measured against BOTH the terrain below AND the
+    // surface the jet left (pass 14, Worker C): past a runway end
+    // the heightfield falls away, so pos.y − floorY grows past
+    // 10 m while the jet has not climbed at all — measuring
+    // against the floor alone opened this gate and let a hands-off
+    // jet fly off the end (see lastSurfaceY). The floor term is
+    // kept: a jet low over terrain far above its departure surface
+    // is still low.
+    const lowAlt =
+      this.pos.y - floorY < 10 || this.pos.y - this.lastSurfaceY < 10;
     if (
       !onSurface &&
       rates.pitchRate < 0 &&
       pitchIn >= -0.25 &&
-      (this.pos.y - floorY < 10 || pitchedUp)
+      (lowAlt || pitchedUp)
     ) {
       rates.pitchRate = 0;
     }
@@ -1955,11 +2106,57 @@ export class Aircraft {
     // bounces off it, which reads as a lift-off (2d again, at
     // 680 m). Held level it settles onto the slope like the curve
     // solver's jet instead. Above 7 m the pilot has full
-    // nose-down authority (dives, carrier approaches).
-    if (rates.pitchRate > 0 && (onSurface || this.pos.y - floorY < 7)) {
+    // nose-down authority (dives, carrier approaches). "Low" is
+    // against the surface left as well as the floor below (pass
+    // 14, Worker C — the same falling-floor reason as the gate
+    // above: past a runway end the floor drops away, so the
+    // floor-only test opens while the jet is still at runway
+    // height).
+    if (
+      rates.pitchRate > 0 &&
+      (onSurface ||
+        this.pos.y - floorY < 7 ||
+        this.pos.y - this.lastSurfaceY < 7)
+    ) {
       const pitch = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x;
       const maxNoseDownRate = Math.max(0, -pitch / dt);
       rates.pitchRate = Math.min(rates.pitchRate, maxNoseDownRate);
+    }
+    // Stay on the ground until rotated (pass 14, Worker C): a jet
+    // that has left its surface without ever pulling on the ground
+    // is an overrun, not a takeoff, and the rate-zeroing gate above
+    // alone cannot keep it down — it only holds the pitch, and a
+    // level pitch still flies: as the jet sinks the velocity vector
+    // tilts down, the AoA rises to the 1 g AoA (~0.7 deg at 330 kt,
+    // measured from the BET solver), and the jet settles into level
+    // flight and accelerates to flying speed (the first version of
+    // this fix held the pitch at 0 and still flew off at ~400 kt).
+    // While the jet is within 10 m above the surface it took off
+    // from, has not rotated, and the pilot is not pulling, drive
+    // the pitch gently toward 1.5 deg nose-down: with the nose
+    // below the flight path the AoA stays under the 1 g AoA at any
+    // speed, so the jet sinks back onto the slope at ~5-7 m/s
+    // (under the 9 m/s hard-landing threshold) and bounces along
+    // it instead of flying away. Scoped to the takeoff surface
+    // only (lastSurfaceY, not the floor below) so it never drives
+    // a low-level jet into a ridge far above its departure strip,
+    // and to !hasRotated so a jet that rotated and released early
+    // is untouched. Off for rotary aircraft and for vectorDeg >=
+    // 70 (VTOL hover has its own auto-level). Applied AFTER the
+    // nose-down clamp so it is the final word on pitch while it
+    // applies — the clamp's low-altitude extension is aimed at a
+    // pilot PUSH pivoting the jet on its nose gear, not at this.
+    if (
+      !onSurface &&
+      pitchIn >= -0.25 &&
+      !this.hasRotated &&
+      this.spec.archetype !== 'rotary' &&
+      this.vectorDeg < 70 &&
+      this.pos.y - this.lastSurfaceY < 10
+    ) {
+      const pitchNow = new THREE.Euler().setFromQuaternion(this.quat, 'YXZ').x;
+      // Euler x +0.026 rad = 1.5 deg nose-down.
+      rates.pitchRate = clamp((0.026 - pitchNow) * 1.0, -0.12, 0.12);
     }
     // Parked on a surface (runway or deck): zero the solver's
     // aerodynamic rates (probe-respawn-carrier 4 for the deck;
@@ -2838,6 +3035,14 @@ export class Aircraft {
     this.grounded = true;
     this.onDeck = false;
     this.onSurface = false;
+    // Pass 14 (Worker C): a fresh life must not inherit a stale
+    // takeoff surface or rotation flag from the previous runway /
+    // carrier (Charlie elev 100 -> Alpha elev 50 would otherwise
+    // hold the no-pull gate closed until 10 m above 102 m, and a
+    // previous life's rotation would exempt the new one from the
+    // stay-on-the-ground hold).
+    this.lastSurfaceY = -Infinity;
+    this.hasRotated = false;
     this.stalled = false;
     this.spin = 0;
     this.spinArrow = 0;

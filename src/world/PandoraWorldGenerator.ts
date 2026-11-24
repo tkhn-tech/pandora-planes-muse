@@ -34,6 +34,7 @@ import {
 } from './PandoraTerrainWorker';
 import { RUNWAYS, type Runway } from './RunwayPlacer';
 import type { FloatingOrigin } from './FloatingOrigin';
+import { CARRIER_START_POS, CARRIER_WAYPOINTS } from '../entities/HelicarrierController';
 
 export { heightAt, runwayBlend, plateauWeight, fbm, WORLD_SIZE, WORLD_SEED } from './PandoraTerrainWorker';
 export { RUNWAYS, type Runway } from './RunwayPlacer';
@@ -45,6 +46,16 @@ const FLORA_STEMS = 420; // v2 instanced stems + caps
 const FLORA_SPIRES = 90; // v2 instanced spires
 const CLOUD_COUNT = 26; // v2
 const WATERFALL_PARTICLES = 70; // v2
+
+/** Minimum island-centre distance from any carrier-loop segment (m).
+ *  Pass 14 (worker F, item 11). Island radii run 60–150 m, so the
+ *  nearest island surface stays >= 850 m from the carrier's flown
+ *  path. Before this, island-3 sat 270 m (centre) from the W0→W1
+ *  leg at y 400 m — the same altitude band as the carriers (350 m)
+ *  — so from the deck it read as a brown inverted cone floating
+ *  next to the SHIELD ship (the v4.8 live report's "two brown
+ *  funnels"; island-1 was 776 m from the W1→W2 leg). */
+export const ISLAND_LOOP_CLEARANCE_M = 1000;
 
 const SKY_DAY = new THREE.Color(0x87b5d9);
 const SKY_DUSK = new THREE.Color(0xe8905a);
@@ -328,8 +339,14 @@ export class PandoraWorldGenerator {
     const topMat = new THREE.MeshLambertMaterial({ color: 0x5a9a62, emissive: 0x2a4a26 });
     const rootMat = new THREE.MeshLambertMaterial({ color: 0x6a5a48, emissive: 0x54402c });
     for (let i = 0; i < ISLAND_COUNT; i++) {
-      const x = (rand() - 0.5) * (WORLD_SIZE * 0.8);
-      const z = (rand() - 0.5) * (WORLD_SIZE * 0.8);
+      const x0 = (rand() - 0.5) * (WORLD_SIZE * 0.8);
+      const z0 = (rand() - 0.5) * (WORLD_SIZE * 0.8);
+      // Pass 14 (worker F, item 11): relocate the sampled centre
+      // clear of the carrier loop (see clearOfCarrierLoop below).
+      // Pure geometry — consumes NO rand, so the flora/cloud
+      // scatter after the islands keeps its exact v2 positions,
+      // and only the islands that violate the clearance move.
+      const { x, z } = clearOfCarrierLoop(x0, z0);
       const y = 260 + rand() * 260;
       const R = 60 + rand() * 90;
       const g = new THREE.Group();
@@ -757,6 +774,68 @@ export class PandoraWorldGenerator {
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * Push an island centre clear of the carrier loop polyline — the
+ * entry leg from the round-start position into waypoint 0, then the
+ * hexagon W0 → … → W5 → W0 (the exact flown path, same constants as
+ * HelicarrierController). Pass 14 (worker F, item 11). Iterates
+ * because pushing off one leg can land near another; converges in
+ * 1–2 passes for the v2 positions. The result is clamped to the
+ * ±4800 m scatter square the islands are sampled from.
+ */
+function clearOfCarrierLoop(x: number, z: number): { x: number; z: number } {
+  const pts: Array<{ x: number; z: number }> = [
+    { x: CARRIER_START_POS.x, z: CARRIER_START_POS.z },
+    ...CARRIER_WAYPOINTS.map((w) => ({ x: w.x, z: w.z })),
+  ];
+  // Segments: start→W0, W0→W1, …, W4→W5, then W5→W0 to close the hexagon.
+  const segs: Array<[{ x: number; z: number }, { x: number; z: number }]> = [];
+  for (let s = 0; s < pts.length - 1; s++) segs.push([pts[s]!, pts[s + 1]!]);
+  segs.push([pts[pts.length - 1]!, pts[1]!]);
+  let px = x;
+  let pz = z;
+  for (let iter = 0; iter < 16; iter++) {
+    let bestD = Infinity;
+    let bx = 0;
+    let bz = 0;
+    for (const [a, b] of segs) {
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const len2 = dx * dx + dz * dz;
+      const t =
+        len2 === 0
+          ? 0
+          : Math.max(0, Math.min(1, ((px - a.x) * dx + (pz - a.z) * dz) / len2));
+      const cx = a.x + t * dx;
+      const cz = a.z + t * dz;
+      const d = Math.hypot(px - cx, pz - cz);
+      if (d < bestD) {
+        bestD = d;
+        bx = cx;
+        bz = cz;
+      }
+    }
+    if (bestD >= ISLAND_LOOP_CLEARANCE_M) break;
+    // Push radially away from the nearest loop point to the
+    // clearance plus a 5 m margin: pushing to exactly 1000 m
+    // re-measures as 999.999… m under a different summation order
+    // in the probe, so the margin keeps the check cleanly green.
+    // Push radially away from the nearest loop point to exactly the clearance.
+    let dx = px - bx;
+    let dz = pz - bz;
+    if (dx === 0 && dz === 0) {
+      dx = 1;
+      dz = 0;
+    }
+    const len = Math.hypot(dx, dz);
+    px = bx + (dx / len) * (ISLAND_LOOP_CLEARANCE_M + 5);
+    pz = bz + (dz / len) * (ISLAND_LOOP_CLEARANCE_M + 5);
+    px = Math.max(-4800, Math.min(4800, px));
+    pz = Math.max(-4800, Math.min(4800, pz));
+  }
+  return { x: px, z: pz };
 }
 
 function makeCloudTexture(): THREE.CanvasTexture {

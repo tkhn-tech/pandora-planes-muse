@@ -59,36 +59,53 @@ const DEFAULT_SHAPING: StickShaping = {
 
 /** Keyboard stick slew, units/s — the arrow-key stick ramps to its
  *  target instead of jumping, so it moves like a real stick. */
-/** Keyboard ROLL slew rates (per second), pass 13 worker B. The pass-12
- *  asymmetric slew (UP 12/s, DOWN 2.5/s) is far too strong LIVE at high
- *  speed / variable dt: getControls() runs once per substep but its dt
- *  comes from the wall clock, so the FIRST substep of a 250 ms frame
- *  slews by 12 * 0.1 (dt clamped) = 1.2 — the stick snaps to FULL
- *  deflection on a single 100 ms tap — and the slow 2.5/s return then
- *  holds ~0.4 s of near-full deflection. At 776 kt the BET roll rate
- *  at full deflection is ~150 deg/s (measured: bank@1 s = 144 deg at
- *  rollIn 1), so one tap banked 62 deg live-style (111 deg in the
- *  v4.7 live check) and a 1 s hold rolled the jet inverted (178 deg).
- *  Three changes, all measured in probe-roll section F:
- *  (a) UP 7/s — full travel in ~0.14 s, still snappy for a hold;
- *  (b) a per-call step cap of 0.40 — one low-FPS frame can move the
- *  stick at most 0.40, so the tap impulse no longer depends on how
- *  many frames the tap happened to span (60 fps tap: kbRoll ~0.8;
- *  4 fps tap: kbRoll 0.40 — the impulse differs by ~25%, not 5x);
- *  (c) speed-scaled keyboard roll authority (kbRollScale, below):
- *  the keyboard is bang-bang — full deflection or nothing — so at
- *  high speed the stick itself must command less, the way the touch
- *  stick already does (touchStickScale). The mouse yoke and gamepad
- *  are proportional devices the pilot can feather, so they keep
- *  full authority; only the keyboard stick is scaled.
- *  The return is 3/s (pass 12 used 2.5/s): the long tail was pass
- *  12's way to make a tap visible, but with the speed scale the
- *  tail no longer needs to linger — the bank a tap creates (~5-8
- *  deg) persists through the roll-inertia overshoot, and the
- *  auto-level now genuinely returns the wings — and a shorter tail
- *  also shortens the window in which a stale PC deflection vetoes
- *  the touch stick in the main.ts merge. */
-const ROLL_SLEW_UP = 7;
+/** Keyboard ROLL slew rates (per second), pass 13 worker B, retimed
+ *  pass 14 worker A. The pass-12 asymmetric slew (UP 12/s, DOWN
+ *  2.5/s) is far too strong LIVE at high speed / variable dt — and
+ *  the pass-13 retune (UP 7/s, DOWN 3/s, per-call cap 0.4,
+ *  kbRollScale) swung the other way live: a 100 ms tap at 223 kt
+ *  banked 1.1 deg (probe-pass14 S1) while the same tap banked 6.5
+ *  deg in probe-roll's ~17 fps harness. The cause is WHERE the slew
+ *  clock comes from: getControls() derived its dt from the WALL
+ *  clock (performance.now() - lastPoll), but it is called once per
+ *  SUBSTEP while wall time advances (almost) only between FRAMES —
+ *  the render takes the frame. So the slew advanced ~once per frame
+ *  (first substep dt ~0.1, the rest ~0.002): the effective slew rate
+ *  was 0.4/frame, i.e. 1.6/s at 4 fps and 7/s at 60 fps, and a tap
+ *  shorter than one frame moved the stick exactly once. The stick's
+ *  effect is integrated in SIM time, so the slew must run in SIM
+ *  time too: main.ts playerInput passes its substep dt into
+ *  getControls(simDt), and the slew advances rate * simDt per
+ *  substep — 7/s of sim at any frame rate, so a 100 ms tap slews
+ *  the stick to ~0.7 whether the frame is 16 ms or 250 ms, and a
+ *  1 s hold reaches full deflection in ~0.14 s of sim. The wall
+ *  clock remains only as the fallback when no simDt is passed (old
+ *  probes / other callers). With simDt <= 0.05 the per-call step is
+ *  at most 7 * 0.05 = 0.35, so the 0.40 cap is now a safety bound,
+ *  not the tap-impulse limiter it was in pass 13.
+ *  The UP/DOWN asymmetry and the speed scale are unchanged: the
+ *  return is 3/s (pass 12 used 2.5/s): the long tail was pass 12's
+ *  way to make a tap visible, but with the speed scale the tail no
+ *  longer needs to linger — the bank a tap creates (~5-8 deg)
+ *  persists through the roll-inertia overshoot, and the auto-level
+ *  now genuinely returns the wings — and a shorter tail also
+ *  shortens the window in which a stale PC deflection vetoes the
+ *  touch stick in the main.ts merge.
+ *  Pass 14 (worker A): UP 7 -> 10/s. At 7/s a 100 ms tap (0.10 s
+ *  of sim at live frame rates) slewed the stick only to 0.7, and at
+ *  223 kt — where the BET roll rate at full deflection is only
+ *  ~25-30 deg/s — that banked 2.4 deg (probe-pass14 S1), below the
+ *  3-12 deg sane-tap band. 10/s traverses full stick travel in
+ *  0.10 s of sim, i.e. inside one tap, so the tap commands ~full
+ *  scaled deflection: 223 kt taps bank ~4 deg, 524/776 kt taps
+ *  ~6/5 deg, and a 1 s hold still banks progressively without
+ *  inverting (probe-pass14 S1/S2/S3/S4). This is NOT the pass-12
+ *  12/s overshoot: that one slewed on the wall clock, so the first
+ *  substep of a 250 ms frame jumped 1.2 (full deflection in one
+ *  call) and the 2.5/s tail held it ~0.4 s; the sim-time slew
+ *  advances at most 10 * 0.05 = 0.50 per substep and the tap's
+ *  stick-time integral stays bounded by the tap's sim duration. */
+const ROLL_SLEW_UP = 10;
 const ROLL_SLEW_DOWN = 3;
 /** Max keyboard-stick movement in one getControls() call (stick
  *  units). Bounds the tap impulse at low FPS: without it a 250 ms
@@ -241,10 +258,19 @@ export class PCFlightInput implements IFlightInputProvider {
     return this.gpName;
   }
 
-  getControls(): FlightControls {
+  getControls(simDt?: number): FlightControls {
+    // Pass 14 (worker A): the slew clock. When the caller passes the
+    // simulation substep dt (main.ts playerInput does), the stick and
+    // throttle slew in SIM time — the rate is then frame-rate
+    // independent (see the ROLL_SLEW comment above). Otherwise fall
+    // back to the wall clock, as before.
     const now = performance.now();
-    const dt = Math.min(0.1, Math.max(0.001, (now - this.lastPoll) / 1000));
+    const wallDt = Math.min(0.1, Math.max(0.001, (now - this.lastPoll) / 1000));
     this.lastPoll = now;
+    const dt =
+      simDt !== undefined && Number.isFinite(simDt) && simDt > 0
+        ? Math.min(0.1, Math.max(0.001, simDt))
+        : wallDt;
 
     this.pollGamepad();
 

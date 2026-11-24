@@ -57,8 +57,7 @@ import {
 } from './aircraft/CockpitBuilder';
 import {
   applyCameraFloor,
-  applyDeckCeiling,
-  deckChaseCameraPosition,
+  chaseCameraPosition,
   deckOrbitYaw,
   orbitCameraPosition,
   orbitCameraPositionDeckAware,
@@ -80,7 +79,7 @@ import { MobileFlightInput, touchStickScale, touchPitchScale, touchDeadzone } fr
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.8 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.9 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -243,9 +242,24 @@ const modelStatus: Record<string, { state: string; tris?: number; error?: string
 }
 
 // ---- renderer / scene (template ~499–512) ----
+// Pass 14 (worker E — MEASUREMENT ONLY, defaults unchanged): the
+// v4.9 live check found FPS 4-9 everywhere and the render-side cost
+// is still unmeasured from Node, so the ?debug=1 panel now shows a
+// renderer.info readout (see updateDebugPanel) and these two URL
+// knobs let the live check A/B the prime suspect — fragment fill at
+// DPR<=2 + 4x MSAA + ACES — in one run:
+//   ?dpr=1   (or 1.5) — drawing-buffer pixel ratio for this session
+//   ?noaa=1  — create the renderer with antialias:false (no MSAA)
+// With neither param the renderer is EXACTLY as before
+// (antialias:true, DPR=min(devicePixelRatio, 2)). Do NOT turn either
+// knob into a shipped cap until a live check measures the FPS effect.
+const DEBUG_DPR_RAW = new URLSearchParams(location.search).get('dpr');
+const DEBUG_DPR = DEBUG_DPR_RAW === null ? null : Math.min(2, Math.max(0.5, Number(DEBUG_DPR_RAW) || 2));
+const DEBUG_NOAA = new URLSearchParams(location.search).get('noaa') === '1';
+const RENDER_ANTIALIAS = !DEBUG_NOAA;
 const canvas = $('game') as HTMLCanvasElement;
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: RENDER_ANTIALIAS });
+renderer.setPixelRatio(DEBUG_DPR ?? Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 const scene = new THREE.Scene();
@@ -668,7 +682,20 @@ const joy = { x: 0, y: 0, active: false, id: -1 };
     audio();
     joy.active = true;
     joy.id = e.pointerId;
-    (joyEl as HTMLElement).setPointerCapture(e.pointerId);
+    // Pass 14 (worker A): capture is a progressive enhancement, not
+    // the drag itself. A synthetic pointer event (or a browser that
+    // rejects the capture) throws NotFoundError here — and the throw
+    // used to skip joySet below, leaving joy.active true with
+    // joy.x/joy.y = 0, i.e. the merge took the touch branch with a
+    // centred stick for the whole drag: a dead stick that looks
+    // exactly like the v4.9 live "joystick held full-right, bank 0".
+    // The drag still works without capture while the pointer stays
+    // over the stick, so a failed capture must never lose the drag.
+    try {
+      (joyEl as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // No capture — the pointermove handler still tracks the drag.
+    }
     joySet(e.clientX, e.clientY);
   });
   joyEl?.addEventListener('pointermove', (e) => {
@@ -1067,7 +1094,18 @@ function showRespawnPicker(forStuck: boolean): void {
     b.classList.toggle('on', (b as HTMLElement).dataset['target'] === def);
   });
   const cancel = $('pickerCancel');
-  if (cancel) cancel.style.display = forStuck ? '' : 'none';
+  // Pass 14 (worker D, item 3): Cancel is ALWAYS offered — the old
+  // code hid it whenever the jet was dead, so the picker covered
+  // the centre of the wreck view with no way to dismiss it until
+  // respawn. Dead: the button reads "Watch the wreck" and closing
+  // the picker returns to the spectate orbit (the respawn timer
+  // already fired, so nothing re-opens the picker; R / the Respawn
+  // button re-opens it via skipSpectate). Stuck/alive: it keeps
+  // reading "Cancel" and just closes the picker.
+  if (cancel) {
+    cancel.style.display = '';
+    cancel.textContent = forStuck ? 'Cancel' : 'Watch the wreck';
+  }
   el.classList.add('show');
   pickerOpen = true;
 }
@@ -1214,6 +1252,14 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   camOrbit = spawnedOnDeck
     ? { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 }
     : { yaw: 0, pitch: 0.32 };
+  // Pass 14 (worker D, item 1): snap the camera onto the chase
+  // want too — the mode/distance reset above is not enough, the
+  // camera position itself was left at the wreck spectate orbit
+  // (possibly kilometres from the respawn runway) and lerped in
+  // through terrain. Deck respawn snaps under the overhead sheet
+  // (the live carrier the jet spawned on); runway respawn snaps
+  // with no deck ceiling.
+  snapCameraToChase(spawnedOnDeck && liveCarrier ? liveCarrier.deckTopY : null);
   clearTransientUI();
 }
 
@@ -1384,7 +1430,8 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // Player spawn: Alpha runway, or the helicarrier deck. A deck spawn
   // with 0 carriers falls back to Alpha (the menu hides the option,
   // but a stale saved config could still ask for it).
-  if (cfg.spawn === 'carrier' && heliCount > 0) {
+  const spawnedOnDeck = cfg.spawn === 'carrier' && heliCount > 0;
+  if (spawnedOnDeck) {
     // Deck spawn: DECK_SPAWN_AFT_M aft of the deck centre (the full
     // deck ahead for the roll), facing the bow at the carrier's
     // heading, inheriting the carrier's cruise velocity so the jet
@@ -1412,8 +1459,6 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.body.setLinvel({ x: dv.x, y: dv.y, z: dv.z }, true);
     player.vel.copy(dv);
     lastSpawnLabel = 'carrier';
-    camDist = 30;
-    camOrbit = { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 };
   } else {
     // Runway spawn — Alpha / Bravo / Charlie (pass 12, worker D).
     // Gear feet on the box top (elev + 2.25, see respawnPlayer
@@ -1427,6 +1472,23 @@ async function startRound(next: SandboxConfig): Promise<void> {
     player.resetAt(r.x, r.elev + 2.25, r.z, r.hdg);
     lastSpawnLabel = cfg.spawn;
   }
+  // Pass 14 (worker D, item 1): a new round starts in the default
+  // chase view, snapped to the jet — the old code reset NONE of the
+  // camera state here (respawnPlayer did), so a round that ended
+  // spectating restarted in free orbit at a stale zoom, and the
+  // chase camera lerped in from wherever the previous round left
+  // it: the v4.9 side-on, below-ground first frame after every
+  // Apply & Restart. Reset the mode/distance/orbit to the chase
+  // defaults (deck orbit yaw on a deck spawn, world-south on a
+  // runway spawn — the same defaults respawnPlayer uses) and snap
+  // the camera onto the chase want before the first frame renders.
+  camMode = 0;
+  pcInput.setCameraMode(0);
+  camDist = 30;
+  camOrbit = spawnedOnDeck
+    ? { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 }
+    : { yaw: 0, pitch: 0.32 };
+  snapCameraToChase(spawnedOnDeck ? carrier.deckTopY : null);
   // Pass 8 (item 1): a new round starts with neutral controls (see
   // resetFlightInputs — a stuck yoke / deflected joystick / tilt
   // offset from the menu or a previous round must not deflect the
@@ -1610,6 +1672,11 @@ function cycleCam(): void {
 
 $('pauseBtn')?.addEventListener('click', togglePause);
 $('respawnBtn')?.addEventListener('click', skipSpectate);
+// Pass 14 (worker D, item 3): the spectate banner ("WENT DOWN — … ·
+// watching the wreck") gets its own dismiss button — hiding the
+// banner only, while spectating continues (the camera stays on the
+// wreck; R / the Respawn button still open the picker).
+$('spectateDismiss')?.addEventListener('click', () => setSpectateBanner(false));
 // Respawn picker buttons (issue 4): each picks its target at once.
 // The carrier button is hidden when there are 0 carriers (the
 // picker hides it in showRespawnPicker too).
@@ -1686,7 +1753,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.8 · Vite + Rapier).
+// Footer version string (v4.9 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1729,6 +1796,34 @@ function updateSky(dt: number): void {
 }
 
 // ---- camera (chase / cockpit / free orbit) ----
+/** Snap the camera to the chase position for the current spawn
+ *  (pass 14, worker D, item 1): the first frame after a restart or
+ *  respawn must already BE the chase view. The old code left
+ *  camera.position wherever the previous life ended (kilometres
+ *  away, or orbiting a wreck) and let the chase lerp converge onto
+ *  it — the straight-line lerp runs through terrain (the v4.8
+ *  below-ground half-black frame) and at 1 fps during a janky
+ *  restart takes 4-9 s to converge. `deckTopY` is the deck the jet
+ *  spawned on (null for a runway spawn): the snap uses the same
+ *  ceiling as the chase branch, so a deck spawn never starts above
+ *  the overhead sheet. Called from startRound and respawnPlayer
+ *  right after the spawn, once camMode / camDist / camOrbit are
+ *  reset to the chase defaults. */
+function snapCameraToChase(deckTopY: number | null): void {
+  if (!player) return;
+  camera.position.copy(
+    chaseCameraPosition(
+      player.pos,
+      player.fwd(),
+      player.up(),
+      camDist,
+      heightfieldGroundHeight,
+      deckTopY,
+    ),
+  );
+  camera.lookAt(player.pos.clone());
+}
+
 function updateCamera(dt: number): void {
   if (!player) return;
   const p = player;
@@ -1795,20 +1890,21 @@ function updateCamera(dt: number): void {
     // Pass 12 (carrier deck camera): on a deck, cap the chase under
     // the detail_0 overhead sheet (deckTop + 4.7 m) so the jet stays
     // visible. Off a deck deckTopY is null and the plain chase is returned.
+    // Pass 14 (worker D): the want comes from chaseCameraPosition —
+    // the same helper snapCameraToChase uses — so the lerp target and
+    // the snap position can never drift apart. The floor rule (v1.1:
+    // clear not just the ground under the camera but the terrain
+    // between it and the jet — the analytic heightAt() can sit ~13 m
+    // below the rendered surface at plateau edges) lives in the helper.
     const deckTopY = p.onDeck ? carrier.deckTopY : null;
-    const want = deckChaseCameraPosition(p.pos, fwd, up, camDist, deckTopY);
-    // v1.1: keep the sightline clear — clear not just the ground under the
-    // camera but the terrain between it and the jet. Sampled mesh height:
-    // the analytic heightAt() can sit ~13 m below the rendered surface
-    // at plateau edges, which clipped the camera into terrain.
-    const mid = p.pos.clone().addScaledVector(fwd, -camDist * 0.5);
-    const floor = Math.max(
-      heightfieldGroundHeight(want.x, want.z) + 6,
-      heightfieldGroundHeight(mid.x, mid.z) + 8,
-      p.pos.y + 2,
+    const want = chaseCameraPosition(
+      p.pos,
+      fwd,
+      up,
+      camDist,
+      heightfieldGroundHeight,
+      deckTopY,
     );
-    if (want.y < floor) want.y = floor;
-    if (deckTopY !== null) applyDeckCeiling(want, deckTopY);
     camera.position.lerp(want, 1 - Math.pow(0.001, dt));
     if (shakeT > 0) {
       camera.position.x += (Math.random() - 0.5) * shakeT * 4;
@@ -1956,15 +2052,20 @@ function playerInput(dt: number): void {
   // The old rule was "PC wins when nonzero" — but the PC stick is
   // nonzero for ~0.4 s after ANY arrow tap (the kbRoll return tail),
   // and a mouse yoke can sit a hair off zero, so a touch drag in
-  // that window was silently ignored: the v4.8 live check saw a
+  // that window was silently ignored: the v4.9 live check saw a
   // left drag do nothing at all while the bank kept rising the
   // wrong way (measured in probe-roll section F: rollIn stayed
   // +0.36..+0.08 for ~0.45 s after a tap while the stick dragged
   // left). The stick under the pilot's finger is the live input;
   // a stale PC tail is not. Keyboard arrows still win the moment
   // the finger lifts (joy.active false).
+  // Pass 14 (worker A): the keyboard stick slew runs in SIM time —
+  // playerInput's substep dt is passed into getControls, so the
+  // stick ramps at the same rate per sim second at any frame rate
+  // (the wall-clock slew made a 100 ms tap bank 1.1 deg at 4-9 fps
+  // and 6.5 deg at ~17 fps — probe-pass14 S1 vs probe-roll F2).
   pcInput.setAirspeedKt(p.ias * MS2KT);
-  const pc = pcInput.getControls();
+  const pc = pcInput.getControls(dt);
   const tilt = tiltInput.getControls();
   let px: number;
   let rx: number;
@@ -2594,11 +2695,38 @@ function updateDebugPanel(): void {
           : s.state)
     );
   });
+  // Pass 14 (worker E): renderer.info readout — the live check's
+  // instrument for the FPS-low-everywhere finding. renderer.info is
+  // reset by each render, and this panel is built BEFORE that frame's
+  // renderer.render call (animate: updateDebugPanel, then render), so
+  // these are the LAST COMPLETED frame's submitted calls/tris.
+  // programs is null until the first render populates it (three r160).
+  const bufSize = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const renderInfoLine = hud.renderInfoLine({
+    calls: renderer.info.render.calls,
+    triangles: renderer.info.render.triangles,
+    geometries: renderer.info.memory.geometries,
+    textures: renderer.info.memory.textures,
+    programs: Array.isArray(renderer.info.programs) ? renderer.info.programs.length : 0,
+    pixelRatio: renderer.getPixelRatio(),
+    bufferW: bufSize.x,
+    bufferH: bufSize.y,
+    antialias: RENDER_ANTIALIAS,
+  });
   const lines = [
     `PANDORA ${VERSION_FOOTER} ?debug — FPS ${fpsEMA.toFixed(0)} · sim dt ${lastDt.toFixed(3)}s · rapier: on`,
+    renderInfoLine,
     ...modelLines,
     `origin shift: ${worldGen.originShift.x.toFixed(0)}, ${worldGen.originShift.z.toFixed(0)} · gamepad: ${pcInput.gamepadName || 'none'} · tilt: ${tiltInput.isEnabled ? 'on' : 'off'}`,
-    `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · spawn ${lastSpawnLabel} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
+    // Pass 14 (worker A): this line used to show ONLY the sensitivity
+    // CONFIG (norm/INV + multiplier) — the v4.9 live check misread it
+    // as a stale stick readout. It now also shows the LIVE stick:
+    // the merged pitchIn/rollIn the controller actually sees, and
+    // the touch stick's live position (joy active? x/y). If the jet
+    // does not answer the stick, this line says which side of the
+    // merge is dead: live 0.00 with joy (0.99, 0.00) = the merge
+    // dropped it; live 0.96 with no response = the controller/regime.
+    `stick: pitch ${cfg.invertPitch ? 'INV' : 'norm'} ${cfg.pitchSens.toFixed(2)}× · roll ${cfg.invertRoll ? 'INV' : 'norm'} ${cfg.rollSens.toFixed(2)}× · live p${(player?.pitchIn ?? 0).toFixed(2)} r${(player?.rollIn ?? 0).toFixed(2)} joy ${joy.active ? 'on' : 'off'} (${joy.x.toFixed(2)}, ${joy.y.toFixed(2)}) · spawn ${lastSpawnLabel} · enemies ${cfg.enemies === 0 ? 'Off' : cfg.enemies} · fail ${cfg.failure} / ${cfg.failWhen}`,
     // Pass 8 (item 3): per-carrier live readout — y vs ground vs
     // look-ahead ground, alive/dying, pod HP. If a CARRIER DOWN toast
     // fires, this says which carrier and what its clearance was.

@@ -11,8 +11,13 @@ import type { FlightControls } from '../physics/IAerodynamicsSolver';
 
 export interface IFlightInputProvider {
   /** Merged stick/yaw/throttle for this frame. Throttle is null when this
-   *  provider has no throttle opinion this frame (main keeps the last value). */
-  getControls(): FlightControls;
+   *  provider has no throttle opinion this frame (main keeps the last value).
+   *  Pass 14 (worker A): callers that step in sim time pass the substep
+   *  dt so the provider's internal slews (keyboard stick, throttle)
+   *  advance in SIM time and stay frame-rate independent; without it
+   *  the provider falls back to its wall-clock dt. Providers without
+   *  slews (tilt) ignore it. */
+  getControls(simDt?: number): FlightControls;
 
   /** 'fixed-wing' | 'vtol' | 'rotary' — lets a provider adapt (e.g. tilt
    *  sensitivity). Optional; providers may ignore it. */

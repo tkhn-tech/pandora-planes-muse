@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.8, 20 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.9, 24 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -96,6 +96,10 @@
   #spectate.show{display:flex}
   #spectateText{font-size:12px;font-weight:800;letter-spacing:.06em;color:#ffb3b3;text-shadow:0 1px 6px rgba(0,0,0,.8)}
   #respawnBtn{background:#c0392b;color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:12px;font-weight:800;cursor:pointer}
+  /* Pass 14 (worker D, item 3): dismiss the spectate banner without
+     respawning — the wreck watch continues behind it. */
+  #spectateDismiss{background:none;border:1px solid rgba(255,179,179,.5);color:#ffb3b3;border-radius:50%;
+    width:22px;height:22px;line-height:1;font-size:12px;font-weight:800;cursor:pointer;flex:none}
   /* Respawn picker (issue 4): shown after the jet goes down (and after
      the spectate sequence when one applies). The player chooses the
      runway/deck to respawn at; the last choice is highlighted. */
@@ -272,7 +276,7 @@
 <div id="toast"><h2 id="toastTitle"></h2><p id="toastSub"></p></div>
 <div id="warn"></div>
 <div id="rotateCue">ROTATE — HOLD ↑ / PULL BACK</div>
-<div id="spectate"><span id="spectateText"></span><button id="respawnBtn">Respawn now (R)</button></div>
+<div id="spectate"><span id="spectateText"></span><button id="respawnBtn">Respawn now (R)</button><button id="spectateDismiss" title="Hide this banner — keep watching the wreck">✕</button></div>
 <div id="respawnPicker">
   <h2>Respawn at</h2>
   <p>Choose where to get back in the air</p>
@@ -373,7 +377,7 @@
         <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v4.8 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.9 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 

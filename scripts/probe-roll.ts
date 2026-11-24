@@ -641,7 +641,11 @@ async function main(): Promise<void> {
       );
     }
     // E6: the scale functions themselves — roll 1.0 at/below 150 kt,
-    // falling with speed, floored at 0.15; pitch squared, floored 0.12.
+    // falling with speed, floored at 0.15; pitch (200/ias)^1.5,
+    // floored 0.15 (pass 14 worker A: the old squared curve
+    // (150/ias)^2, floor 0.12, was too weak to fly with — a full
+    // drag down at 240 kt commanded pitchIn 0.39 and pitched 4.4
+    // deg in 5 s at altitude, probe-pass14 E2b).
     // Pass 13: the roll curve steepened 150/ias -> 110/ias (a full
     // 1.5 s drag at 700 kt rolled the F-35A 92 deg on the old curve).
     check(
@@ -654,12 +658,15 @@ async function main(): Promise<void> {
       `s(100)=${touchStickScale(100)} s(287)=${touchStickScale(287).toFixed(2)} s(586)=${touchStickScale(586).toFixed(2)} s(1000)=${touchStickScale(1000)}`,
     );
     check(
-      'touchPitchScale: 1.0 at <= 150 kt, ~0.27 at 287 kt, floored 0.12 at 586 kt',
+      'touchPitchScale: 1.0 at <= 200 kt, ~0.76 at 240 kt, ~0.58 at 287 kt, ~0.20 at 586 kt, floored 0.15 at 776+ kt',
       touchPitchScale(100) === 1 &&
         touchPitchScale(150) === 1 &&
-        Math.abs(touchPitchScale(287) - (150 / 287) ** 2) < 0.01 &&
-        touchPitchScale(586) === 0.12,
-      `p(100)=${touchPitchScale(100)} p(287)=${touchPitchScale(287).toFixed(2)} p(586)=${touchPitchScale(586)}`,
+        touchPitchScale(200) === 1 &&
+        Math.abs(touchPitchScale(240) - (200 / 240) ** 1.5) < 0.01 &&
+        Math.abs(touchPitchScale(287) - (200 / 287) ** 1.5) < 0.01 &&
+        Math.abs(touchPitchScale(586) - (200 / 586) ** 1.5) < 0.01 &&
+        touchPitchScale(1000) === 0.15,
+      `p(100)=${touchPitchScale(100)} p(240)=${touchPitchScale(240).toFixed(2)} p(287)=${touchPitchScale(287).toFixed(2)} p(586)=${touchPitchScale(586).toFixed(2)} p(1000)=${touchPitchScale(1000)}`,
     );
   }
 
@@ -756,7 +763,14 @@ async function main(): Promise<void> {
         for (let k = 0; k < sub; k++) {
           pcF.setAirspeedKt(ac.ias * 1.94384);
           pcF.consumeEvents();
-          const c = pcF.getControls();
+          // Pass 14: pass the substep dt, exactly like main.ts
+          // playerInput (pcInput.getControls(dt)). The old
+          // no-arg call used the wall-clock fallback, which the
+          // live game no longer exercises: vnowF advances once
+          // per frame here, so the first substep saw a wall dt of
+          // 0.11-0.25 s and the rest ~0 — the slew jumped to its
+          // 0.4 cap once per frame instead of slewing in sim time.
+          const c = pcF.getControls(dt);
           const pcPitch = c.pitch ?? 0;
           const pcRoll = c.roll ?? 0;
           let rx: number;
@@ -809,8 +823,14 @@ async function main(): Promise<void> {
       r.trace.reduce((a, b) => (Math.abs(b.t - tt) < Math.abs(a.t - tt) ? b : a));
     // F1: the v4.7 live repro — one 100 ms Right-Arrow tap, F-18 at
     // 776 kt. Before: peak bank 62 deg live-style (111 deg live),
-    // still 62 deg 3 s later (no auto-level past 45 deg). After:
-    // a few degrees, and level again within 2 s.
+    // still 62 deg 3 s later (no auto-level past 45 deg). After
+    // pass 14 (sim-dt slew, ROLL_SLEW_UP 10/s): peak 11.0 deg
+    // here, 7.2 deg in the faithful 4-9 fps probe-pass14-inputs
+    // S2/S3 (this section runs sim time == wall time, so its 100 ms
+    // tap delivers more sim time than the 4-9 fps live loop, where
+    // the 0.10 s sim cap runs at ~0.4-0.6x). Band <= 12 deg: it
+    // must stay a small tap (v4.7 was 62 deg), and it levels
+    // again within 2 s.
     {
       const r = runLive('fa18', 776, (t) => {
         if (t === 0) return { keyDown: ['ArrowRight'] };
@@ -818,9 +838,9 @@ async function main(): Promise<void> {
         return {};
       }, 3);
       check(
-        'LIVE tap Right 100ms (fa18 776kt): peak bank <= 10 deg',
-        r.peakBank <= 10,
-        `peak bank=${r.peakBank.toFixed(1)} deg (before fix: 62.1 deg)`,
+        'LIVE tap Right 100ms (fa18 776kt): peak bank <= 12 deg',
+        r.peakBank <= 12,
+        `peak bank=${r.peakBank.toFixed(1)} deg (before fix: 62.1 deg; faithful 4-9 fps probe: 7.2 deg)`,
       );
       check(
         'LIVE tap Right 100ms (fa18 776kt): bank back <= 5 deg within 2 s (auto-levels)',

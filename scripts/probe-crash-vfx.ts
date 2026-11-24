@@ -31,8 +31,9 @@
 //   old 6 s plumes were gone by +6 s), tracking the wreck
 // - debris field present at +1/+3/+10 s, torn wing + torn tail pieces
 //   among it, resting on the ground (scenario B), still present at
-//   +29 s and expired by +31 s (old rule deleted pieces on first
-//   ground contact, so the field was gone within ~3 s)
+//   +29 s and NOT expired by +31 s (pass 14: 90 s life — the old
+//   30 s life expired the field before the player looked at +75 s
+//   real; expiry at +91 s is owned by probe-wreck-watch)
 // - scorch present, and conforming to the slope (old flat disc was
 //   buried uphill / floating downhill on a mountainside)
 // - wreck visible, wing + tail detached
@@ -498,8 +499,8 @@ async function main(): Promise<void> {
     check(`${key} ${tag}: debris field still present at +3 s (old rule had 0-2 left)`, at(3).debris >= 6, `debris=${at(3).debris}`);
     check(`${key} ${tag}: torn wing + torn tail pieces in the debris field`, at(3).tornPieces >= 2, `torn=${at(3).tornPieces} detachEvents=${JSON.stringify(detachEvents)}`);
     check(`${key} ${tag}: debris field still present at +10 s`, at(10).debris >= 4, `debris=${at(10).debris}`);
-    check(`${key} ${tag}: debris field still present at +29 s (30 s life)`, at(29).debris >= 1, `debris=${at(29).debris}`);
-    check(`${key} ${tag}: debris expired by +31 s`, at(31).debris === 0, `debris=${at(31).debris}`);
+    check(`${key} ${tag}: debris field still present at +29 s (90 s life)`, at(29).debris >= 1, `debris=${at(29).debris}`);
+    check(`${key} ${tag}: debris NOT expired by +31 s (90 s life — expiry at +91 s is owned by probe-wreck-watch)`, at(31).debris >= 1, `debris=${at(31).debris}`);
     check(`${key} ${tag}: no debris piece fell through the terrain`, at(10).debrisBelowGround === 0, `below=${at(10).debrisBelowGround}`);
     if (flatGround) {
       check(`${key} ${tag}: debris resting on the ground at +10 s`, at(10).debrisResting === at(10).debris && at(10).debris > 0, `resting=${at(10).debrisResting}/${at(10).debris}`);

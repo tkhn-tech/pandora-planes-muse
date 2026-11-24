@@ -31,6 +31,28 @@ export interface HudGameState {
   };
 }
 
+/** One frame of renderer.info, formatted by FlightHUD.renderInfoLine
+ *  for the ?debug=1 panel (pass 14, worker E). */
+export interface RenderInfoSnapshot {
+  /** renderer.info.render.calls (last completed frame). */
+  calls: number;
+  /** renderer.info.render.triangles (last completed frame). */
+  triangles: number;
+  /** renderer.info.memory.geometries. */
+  geometries: number;
+  /** renderer.info.memory.textures. */
+  textures: number;
+  /** renderer.info.programs.length (0 until first render). */
+  programs: number;
+  /** renderer.getPixelRatio(). */
+  pixelRatio: number;
+  /** renderer.getDrawingBufferSize() width / height (device px). */
+  bufferW: number;
+  bufferH: number;
+  /** The antialias flag the renderer was created with. */
+  antialias: boolean;
+}
+
 export interface MinimapEntities {
   player: Aircraft | null;
   enemies: Aircraft[];
@@ -55,6 +77,69 @@ const R2D = 180 / Math.PI;
  *  AI behaviour changes. */
 export function gameToTrueHdg(gameDeg: number): number {
   return (((180 - gameDeg) % 360) + 360) % 360;
+}
+
+/** Time-to-impact PULL UP criterion (pass 14, worker D). The CCIP
+ *  min-release-alt flag (game.belowMinReleaseAlt) fires only when
+ *  h < dH — the altitude lost in a 4 g pull-out started NOW, with no
+ *  margin: in a steep dive entered low, that crossing happens ~1 s
+ *  before impact (the v4.8 live finding: PULL UP first seen at
+ *  123 ft in a −42,131 fpm dive), and computeCcip returns null below
+ *  30 m AGL, so the warning vanishes in the last 98 ft. This
+ *  criterion warns on TIME TO IMPACT instead: in a genuine fast dive
+ *  (speed >= 60 m/s, dive angle >= 20 deg — a landing flare, a
+ *  runway bounce and a VTOL hover-descent all fall outside it) the
+ *  warning fires while the ballistic time to the ground is still
+ *  less than the pull-out time plus a 2 s reaction margin, or under
+ *  5 s outright. The pull-out time is tPull = theta * V / (g * 3):
+ *  the time to rotate the velocity vector through the dive angle at
+ *  the 4 g turn rate (g * (4 - 1) / V). Pure (no DOM) so a probe can
+ *  drive it from a real stepped Aircraft. */
+export const PULL_UP_REACT_S = 2.0;
+/** Absolute time-to-impact floor (s): warn below this in a steep
+ *  fast dive even when the pull-out itself would be quick. */
+export const PULL_UP_MIN_WARN_S = 5.0;
+/** Minimum dive angle (deg) for the time-based warning: shallower
+ *  descents (approach, flare, bounce) never trigger it. */
+export const PULL_UP_MIN_DIVE_DEG = 20;
+/** Minimum speed (m/s) for the time-based warning: a VTOL hover or
+ *  a slow vertical sink has no wing-borne pull-out to warn about. */
+export const PULL_UP_MIN_SPEED_MS = 60;
+
+export interface PullUpTimeState {
+  warn: boolean;
+  /** Ballistic time to the ground (s) at the current velocity. */
+  tImpact: number;
+  /** Time (s) to rotate the velocity vector level at 4 g. */
+  tPull: number;
+  /** Dive angle (deg), 0 when climbing or level. */
+  thetaDeg: number;
+  /** Height above the terrain under the jet (m). */
+  aglM: number;
+}
+
+export function pullUpTimeBased(ac: Aircraft): PullUpTimeState {
+  const g = 9.81;
+  const agl = ac.pos.y - ac.terrainHeightAt(ac.pos.x, ac.pos.z);
+  const V = ac.vel.length();
+  const vy = ac.vel.y;
+  const theta = vy < 0 && V > 0 ? Math.asin(Math.min(1, -vy / V)) : 0;
+  const tImpact =
+    agl > 0 ? (vy + Math.sqrt(vy * vy + 2 * g * agl)) / g : 0;
+  const tPull = (theta * V) / (g * 3);
+  const warn =
+    !ac.grounded &&
+    agl > 0 &&
+    V >= PULL_UP_MIN_SPEED_MS &&
+    theta >= (PULL_UP_MIN_DIVE_DEG * Math.PI) / 180 &&
+    tImpact < Math.max(PULL_UP_MIN_WARN_S, tPull + PULL_UP_REACT_S);
+  return {
+    warn,
+    tImpact,
+    tPull,
+    thetaDeg: (theta * 180) / Math.PI,
+    aglM: agl,
+  };
 }
 
 /** The ROTATE cue's text (verbatim from index.html). FlightHUD owns
@@ -231,6 +316,13 @@ export class FlightHUD {
     // Fire second: a burning jet (damage-model §3) — the kind tells
     // the player what to do (fuel fire: dive fast to blow it out;
     // engine fire: cut the throttle).
+    // Pass 14 (worker D): the time-based pull-up (pullUpTimeBased)
+    // is evaluated here, next to the CCIP flag — it fires seconds
+    // before the CCIP flag in a steep dive (see the helper), and it
+    // is not gated on bombs, so the F-22 / F-35A get a terrain
+    // warning too. Its text says TERRAIN (a time-to-impact warning),
+    // the CCIP one keeps BELOW MIN RELEASE ALT.
+    const pullUp = pullUpTimeBased(ac);
     const w = this.el['warn'];
     if (w) {
       // Dying jets own no #warn (live finding 4): while the jet is
@@ -255,8 +347,10 @@ export class FlightHUD {
       } else if (ac.stalled && ac.alive) {
         w.textContent = '⚠ STALL — NOSE DOWN, FULL POWER';
         w.classList.add('show');
-      } else if (game.belowMinReleaseAlt && ac.alive) {
-        w.textContent = '⚠ PULL UP — BELOW MIN RELEASE ALT';
+      } else if (ac.alive && (pullUp.warn || game.belowMinReleaseAlt)) {
+        w.textContent = pullUp.warn
+          ? '⚠ PULL UP — TERRAIN'
+          : '⚠ PULL UP — BELOW MIN RELEASE ALT';
         w.classList.add('show');
       } else if (ac.fuel < 0.15 && ac.alive) {
         // 0.15 on the 0..1 fuel scale — the old `ac.fuel < 15` compared a
@@ -453,6 +547,21 @@ export class FlightHUD {
     this.el['toast']?.classList.remove('show');
     if (this.el['toastTitle']) this.el['toastTitle'].textContent = '';
     if (this.el['toastSub']) this.el['toastSub'].textContent = '';
+  }
+
+  /** Snapshot of THREE.WebGLRenderer.info for the ?debug=1 panel
+   *  (pass 14, worker E). Values are the LAST COMPLETED frame's
+   *  render (main.ts reads them before that frame's render call, so
+   *  they lag one frame — the numbers, not the frame, are what the
+   *  live check needs). programs is renderer.info.programs.length
+   *  (0 until the first render populates it). */
+  renderInfoLine(s: RenderInfoSnapshot): string {
+    return (
+      `renderer: ${s.calls} calls · ${s.triangles.toLocaleString()} tris · ` +
+      `${s.geometries} geo · ${s.textures} tex · ${s.programs} programs · ` +
+      `DPR ${s.pixelRatio} · buffer ${s.bufferW}x${s.bufferH} · ` +
+      `AA ${s.antialias ? 'on' : 'off'} · ACES`
+    );
   }
 
   /** ?debug=1 panel (v1.1 feature): FPS + sim dt + per-model load status +
