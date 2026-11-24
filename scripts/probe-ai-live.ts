@@ -34,6 +34,19 @@
 // Usage: node_modules/.bin/esbuild scripts/probe-ai-live.ts --bundle
 //   --platform=node --format=esm --outfile=/tmp/probe-ai-live.mjs
 //   && node /tmp/probe-ai-live.mjs
+//
+// Scenarios (pass 13, Worker D): the default `pursuit` scenario is the
+// pass-12 probe unchanged (F-22, 4 enemies, scripted pursuit player).
+// The live failure was 1 enemy vs a HUMAN F-35A that does NOT pursue:
+//   --scenario cruise1v1  F-35A, 1 MiG-29, takeoff then cruise east at
+//                         ~200 m/s / 1000 m with a gentle weave, never
+//                         turning toward the enemy (the live profile).
+//   --scenario delayed1v1 same, but the player sits on the runway for
+//                         25 s before takeoff (a slow human takeoff).
+//   --sim <seconds>      sim length (default 240; cruise scenarios 300).
+// The cruise scenarios are the live reproduction: they must FAIL
+// before the fix (enemy never engages/closes over several minutes)
+// and PASS after it.
 
 if (typeof (globalThis as unknown as { ProgressEvent?: unknown }).ProgressEvent === 'undefined') {
   (globalThis as unknown as { ProgressEvent?: unknown }).ProgressEvent = class ProgressEvent {
@@ -129,8 +142,19 @@ Math.random = (): number => {
 };
 
 const R2D = 180 / Math.PI;
-const SIM_SECONDS = 240;
-const ENEMY_COUNT = 4; // live default
+// Pass 13, Worker D: scenario selection (default = pass-12 probe).
+const argv = process.argv.slice(2);
+const scenarioArg = (argv[argv.indexOf('--scenario') + 1] ?? 'pursuit') as string;
+const SCENARIO: 'pursuit' | 'cruise1v1' | 'delayed1v1' =
+  scenarioArg === 'cruise1v1' || scenarioArg === 'delayed1v1' ? scenarioArg : 'pursuit';
+const IS_CRUISE = SCENARIO !== 'pursuit';
+const simIdx = argv.indexOf('--sim');
+const SIM_SECONDS = simIdx >= 0 ? Number(argv[simIdx + 1] ?? (IS_CRUISE ? 300 : 240)) : (IS_CRUISE ? 300 : 240);
+const ENEMY_COUNT = IS_CRUISE ? 1 : 4; // live default
+const PLAYER_KEY = IS_CRUISE ? 'f35a' : 'f22'; // live jet vs probe jet
+const spdIdx = argv.indexOf('--spd');
+const CRUISE_SPD = spdIdx >= 0 ? Number(argv[spdIdx + 1] ?? 200) : 200; // m/s, human cruise in the F-35A
+const TAKEOFF_DELAY_S = SCENARIO === 'delayed1v1' ? 25 : 0;
 const LOCK_CONE_DEG = 15;
 const LOCK_RANGE = 2500;
 const LOCK_TIME = 1.2;
@@ -227,9 +251,9 @@ async function main(): Promise<void> {
   const player = new Aircraft({
     scene,
     world,
-    spec: SPECS['f22']!,
+    spec: SPECS[PLAYER_KEY]!,
     isPlayer: true,
-    modelKey: SPECS['f22']!.modelKey,
+    modelKey: SPECS[PLAYER_KEY]!.modelKey,
   });
   player.terrainHeightAt = heightAtLive;
   origin.registerBody(player.body);
@@ -307,9 +331,9 @@ async function main(): Promise<void> {
 
   // ---- live loop, SIM_SECONDS of sim time ----
   const dtPattern = [0.016, 0.033, 0.05, 0.016, 0.1, 0.033, 0.25, 0.05, 0.016, 0.033];
-  const vrMs = SPECS['f22']!.rotateSpeedKt * 0.514444;
+  const vrMs = SPECS[PLAYER_KEY]!.rotateSpeedKt * 0.514444;
   const ALT_TARGET = 1000;
-  const SPD_TARGET = 150; // m/s, a human cruise
+  const SPD_TARGET = IS_CRUISE ? CRUISE_SPD : 150; // m/s, a human cruise
   let simT = 0;
   let frame = 0;
   let airborneAt = -1;
@@ -344,8 +368,12 @@ async function main(): Promise<void> {
   const enemyHpStart = enemies.map((e) => e.hp);
   let playerTarget: Aircraft | null = null; // sticky pursuit target
   let playerOmegaSm = 0; // smoothed turn rate for the two-loop heading (below)
+  let playerHpLast = 1000; // pass 13: damage-triggered break (cruise only)
+  let breakUntil = -1;
+  let breakTarget: Aircraft | null = null;
   const stateSeconds: Record<string, number> = {};
   let lastLogSim = -10;
+  let lastTraceSim: number | null = null; // pass 13: 1v1 enemy trace clock
 
   // Scripted player autopilot — PITCH-ATTITUDE control, not vertical
   // speed: a vs-controller saturates nose-down (+0.4..+0.5) whenever
@@ -357,6 +385,129 @@ async function main(): Promise<void> {
   // pull, released the moment the jet is airborne.
   const flyPlayer = (dt: number): void => {
     if (!player.alive) return;
+    // Pass 13 cruise scenarios: a human who does NOT pursue. Delayed
+    // takeoff holds on the runway (throttle idle) for TAKEOFF_DELAY_S.
+    if (IS_CRUISE && player.onSurface && simT < TAKEOFF_DELAY_S) {
+      player.thrTarget = 0;
+      player.pitchIn = 0;
+      player.rollIn = 0;
+      return;
+    }
+    if (IS_CRUISE && !player.onSurface) {
+      player.thrTarget = clamp(
+        player.thrTarget + (player.ias < SPD_TARGET ? dt * 0.5 : -dt * 0.5),
+        0,
+        1,
+      );
+      // Pass 13: progressive power shed when high (a human pulls
+      // power to stop a climb). Level flight at 200 m/s needs only
+      // ~0.26 throttle on the F-35A, so power above that while high
+      // is climb power: shed it progressively with altitude excess
+      // (0.6 at 1100 m, 0.3 at 2500 m). Without it the throttle law —
+      // which only watches airspeed — saturates at 1.0 while the jet
+      // zoom-climbs (ias never reaches 200 while climbing), and the
+      // full-thrust nose-up moment fights the nose-down elevator
+      // until the "cruise" is at 4000+ m.
+      const altExcess = Math.max(0, player.pos.y - ALT_TARGET);
+      player.thrTarget = Math.min(
+        player.thrTarget,
+        0.6 - Math.min(0.3, altExcess * 0.0002),
+      );
+      // Cruise east with a gentle +/-15 deg weave; never turns toward
+      // the enemy. Pitch is the AI's own vs-cascade (verbatim gains):
+      // vsDes from the altitude error, pitchIn from the vs error with
+      // a speed-scheduled gain, AoA limiter at 12 deg. The ATTITUDE
+      // law tried before could not climb off the runway: its pitchIn
+      // chattered around the solver's -0.25 nose-up gate (pitchIn
+      // -0.12..-0.37, mostly above the gate, so the pitch rate was
+      // quartered), the nose never reached its -10 deg target, and the
+      // jet skimmed at 3 m for 14 s — where the weave's ~59 deg bank
+      // (a 10.7 deg/s turn at 87 m/s needs that much bank) dipped a
+      // wingtip into the runway and crashed it "hard landing" every
+      // ~11 s. The vs-law keeps commanding nose-up until the vsi
+      // actually rises, so it pushes through the gate and climbs; the
+      // progressive throttle cap above is what stops the zoom-climb
+      // the vs-law had on a saturated throttle (4600 m). The weave is
+      // also gated on altitude (straight east below 300 m) so the jet
+      // never banks hard near the ground.
+      const vsDes = clamp((ALT_TARGET - player.pos.y) * 0.03, -15, 15);
+      const pitchGain = clamp(4.2 / Math.max(player.ias, 1), 0.025, 0.06);
+      player.pitchIn = clamp((player.vsi - vsDes) * pitchGain, -0.6, 0.6);
+      if (player.aoaDeg > 12) player.pitchIn = Math.max(player.pitchIn, 0);
+      if (player.stalled) player.pitchIn = Math.max(player.pitchIn, 0.5);
+      if (player.aoaDeg < -10) {
+        player.pitchIn = Math.min(player.pitchIn, clamp((player.aoaDeg + 10) * 0.03, -0.4, 0));
+      }
+      // Pass 13: defensive break. A human under fire turns INTO the
+      // attacker — a straight-line cruise profile never presents the
+      // enemy in the 15 deg lock cone (it attacks from astern), so the
+      // player could never lock even in a working fight (maxLockT 0.00
+      // across every 1v1 run). On taking damage, break toward the
+      // nearest enemy for up to 12 s: the head-on pass that follows is
+      // the lock opportunity a real pilot gets. Damage-triggered only
+      // (no damage, no break), so the cruise profile is unchanged
+      // until the fight reaches the player.
+      if (player.hp < playerHpLast - 1) {
+        breakUntil = simT + 12;
+        let best: Aircraft | null = null;
+        let bd = Infinity;
+        for (const e of enemies) {
+          if (!e.alive || e.dying) continue;
+          const d = e.pos.distanceTo(player.pos);
+          if (d < bd) {
+            bd = d;
+            best = e;
+          }
+        }
+        breakTarget = best;
+      }
+      playerHpLast = player.hp;
+      const breaking = simT < breakUntil && breakTarget !== null && breakTarget.alive && !breakTarget.dying;
+      // Pass 13: the weave is gated on altitude — straight east below
+      // 300 m, so the jet never banks hard near the ground (see the
+      // pitch comment above: a 59 deg weave bank at 3 m dips a wingtip
+      // into the runway). Above 300 m the weave resumes.
+      let desHdg = (90 * Math.PI) / 180;
+      if (player.pos.y > 300) {
+        desHdg += (15 * Math.PI) / 180 * Math.sin(simT * 0.05);
+      }
+      if (breaking && breakTarget) {
+        // Pass 13: the break is a LEAD pursuit, not a pure pursuit.
+        // A pure pursuit aims at where the enemy IS; by the time the
+        // 180 deg reversal completes the enemy has moved 200 m/s *
+        // ~10 s = 2 km and the nose points at empty sky. Leading the
+        // target (same 0.5 lead the AI uses) puts the enemy in the
+        // 15 deg lock cone during the head-on pass that follows.
+        const dBreak = breakTarget.pos.distanceTo(player.pos);
+        const leadPt = breakTarget.pos
+          .clone()
+          .addScaledVector(breakTarget.vel, (dBreak / 280) * 0.5);
+        desHdg = Math.atan2(leadPt.x - player.pos.x, leadPt.z - player.pos.z);
+      }
+      const curHdg = Math.atan2(player.fwd().x, player.fwd().z);
+      let hdgErr = desHdg - curHdg;
+      while (hdgErr > Math.PI) hdgErr -= 2 * Math.PI;
+      while (hdgErr < -Math.PI) hdgErr += 2 * Math.PI;
+      // Pass 13: the break is a MAX-PERFORMANCE turn (full sustained
+      // rate, ~18 deg/s), not the 0.6x cruise rate (~11 deg/s). At
+      // 0.6x an 8 s break turned the jet only ~90 deg and the enemy —
+      // itself turning at up to 22 deg/s — was never in the 15 deg
+      // lock cone (maxLockT 0.00-0.03 s). A human breaking into an
+      // attacker pulls hard; the full rate completes the 180 deg
+      // reversal inside the 12 s break and the head-on pass that
+      // follows is the lock opportunity.
+      const rateCap = breaking ? 0.31 : 0.31 * 0.6;
+      const omegaDes = clamp(hdgErr * 1.5, -rateCap, rateCap);
+      playerOmegaSm += (omegaDes - playerOmegaSm) * Math.min(1, dt * 6);
+      const bankDes = clamp(
+        -Math.atan((playerOmegaSm * Math.max(player.ias, 1)) / 9.81),
+        (-70 * Math.PI) / 180,
+        (70 * Math.PI) / 180,
+      );
+      const bankNow = new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').z;
+      player.rollIn = clamp((bankDes - bankNow) * 2.0, -1, 1);
+      return;
+    }
     player.thrTarget = clamp(
       player.thrTarget + (player.ias < SPD_TARGET ? dt * 0.5 : -dt * 0.5),
       0,
@@ -596,6 +747,9 @@ async function main(): Promise<void> {
         );
         player.resetAt(alpha.x - origin.cumulativeShift.x, alpha.elev + 2.25, alpha.z - origin.cumulativeShift.z, alpha.hdg);
         player.hp = 1000;
+        playerHpLast = 1000;
+        breakUntil = -1;
+        breakTarget = null;
       }
     }
     const shift = origin.shiftIfNeeded(player.pos);
@@ -610,6 +764,22 @@ async function main(): Promise<void> {
                 `e${j} ${e.alive ? 'alive' : 'DEAD'} ${ais[j]!.state} d=${e.pos.distanceTo(player.pos).toFixed(0)}m y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt hp=${e.hp.toFixed(0)} msl=${e.msl}`,
             )
             .join(' '),
+      );
+    }
+    // Pass 13: 10 s enemy trace in the 1v1 cruise scenarios — the
+    // reproduction evidence: state, distance, and the nose angle to
+    // the player, so the break point (patrol drift / reversal /
+    // disengage) is visible instead of inferred from the summary.
+    if (IS_CRUISE && simT - (lastTraceSim ?? -10) >= 10) {
+      lastTraceSim = simT;
+      const e = enemies[0]!;
+      const ai0 = ais[0]!;
+      const noseAng = e.alive
+        ? (e.fwd().angleTo(e.pos.clone().sub(player.pos).normalize().negate()) * R2D).toFixed(0)
+        : '-';
+      const pitchDbg = (new THREE.Euler().setFromQuaternion(player.quat, 'YXZ').x * R2D).toFixed(1);
+      console.log(
+        `  [trace t=${simT.toFixed(0)}s] e0 ${e.alive ? ai0.state : 'DEAD'} d=${e.pos.distanceTo(player.pos).toFixed(0)}m noseToPlayer=${noseAng}deg y=${e.pos.y.toFixed(0)} ias=${(e.ias * 1.944).toFixed(0)}kt playerFromAlpha=${Math.hypot(player.pos.x + origin.cumulativeShift.x - alpha.x, player.pos.z + origin.cumulativeShift.z - alpha.z).toFixed(0)}m playerY=${player.pos.y.toFixed(0)} pitch=${pitchDbg} pitchIn=${player.pitchIn.toFixed(2)} thr=${player.thrTarget.toFixed(2)} vsi=${player.vsi.toFixed(0)}`,
       );
     }
   }
@@ -630,6 +800,24 @@ async function main(): Promise<void> {
   for (const r of enemyDeathReasons) console.log(`  ENEMY DEATH: ${r}`);
   for (const r of playerDeathReasons) console.log(`  PLAYER DEATH: ${r}`);
 
+  console.log(`  scenario=${SCENARIO} player=${PLAYER_KEY} enemies=${ENEMY_COUNT} sim=${SIM_SECONDS}s`);
+  if (IS_CRUISE) {
+    // Pass 13 live reproduction: one enemy vs a non-pursuing human.
+    // The live round showed NO LOCK for 4:49 — the enemy never
+    // closed. These bars are the live bar: the single enemy must
+    // find and fight a player who is NOT flying toward it.
+    check('1v1 cruise: AI engages within 60 s of the player going airborne', firstEngageAt >= 0 && airborneAt >= 0 && firstEngageAt - airborneAt <= 60, firstEngageAt >= 0 ? `first at ${firstEngageAt.toFixed(1)}s (airborne ${airborneAt.toFixed(1)}s)` : 'never engaged');
+    check('1v1 cruise: AI stays engaged (total engage time >= 30 s)', engageSeconds >= 30, `engageSeconds=${engageSeconds.toFixed(1)}s states=${JSON.stringify(stateSeconds)}`);
+    check('1v1 cruise: AI closes to gun range (min dist < 900 m) and holds < 2200 m for >= 20 s', minDist < 900 && timeWithin2200 >= 20, `minDist=${minDist.toFixed(0)}m within2200=${timeWithin2200.toFixed(1)}s within900=${timeWithin900.toFixed(1)}s`);
+    check('1v1 cruise: AI fires on the player (gun and/or missile, and the fire lands)', (aiGunShots >= 1 || aiMslLaunched >= 1) && playerHpLost > 0, `gun=${aiGunShots} msl=${aiMslLaunched} firstFireAt=${firstFireAt >= 0 ? firstFireAt.toFixed(1) + 's' : 'never'} playerHpLost=${playerHpLost.toFixed(0)}`);
+    check('1v1 cruise: player achieves full missile lock (lockT > 1.2 s)', maxLockT > LOCK_TIME, `maxLockT=${maxLockT.toFixed(2)}s lockSeconds=${lockSeconds.toFixed(1)}s`);
+    check('1v1 cruise: enemy survives (no terrain death)', terrainDeathAt < 0, terrainDeathAt >= 0 ? `first terrain death at t=${terrainDeathAt.toFixed(1)}s` : (enemyDeathAt >= 0 ? `shot down at t=${enemyDeathAt.toFixed(1)}s (legitimate player kill)` : 'alive'));
+    check('1v1 cruise: probe runs the full sim (player respawns like live)', simT >= SIM_SECONDS - 1, `simT=${simT.toFixed(1)}s playerDeaths=${playerDeaths}`);
+    for (const e of enemies) e.dispose();
+    player.dispose();
+    console.log(failures === 0 ? 'ALL 1V1-CRUISE CHECKS PASSED' : `${failures} 1V1-CRUISE CHECK(S) FAILED`);
+    process.exit(failures === 0 ? 0 : 1);
+  }
   check('scripted player flies a sane profile (max alt < 3000 m, max |vsi| < 70 m/s — a dogfighting player climbs/dives at up to 15 deg, i.e. ~39 m/s at 150 m/s, and a hard pursuit pull can reach ~60 m/s; the old zoom-climb failure was 20,000 m at +50..100 m/s sustained, max|vsi| 109-119)', maxPlayerAlt < 3000 && maxPlayerVsi < 70, `maxAlt=${maxPlayerAlt.toFixed(0)}m max|vsi|=${maxPlayerVsi.toFixed(0)}m/s`);
   check('AI engages within 30 s of the player going airborne', firstEngageAt >= 0 && airborneAt >= 0 && firstEngageAt - airborneAt <= 30, firstEngageAt >= 0 ? `first at ${firstEngageAt.toFixed(1)}s (airborne ${airborneAt.toFixed(1)}s)` : 'never engaged');
   check('AI stays engaged (total engage time >= 60 s across enemies)', engageSeconds >= 60, `engageSeconds=${engageSeconds.toFixed(1)}s states=${JSON.stringify(stateSeconds)}`);

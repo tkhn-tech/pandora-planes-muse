@@ -25,9 +25,8 @@ import {
   HelicarrierController,
   carrierLoop,
 } from '../src/entities/HelicarrierController';
-// Same values as main.ts (not exported from the controller).
-const CARRIER_LOOP_SCALES = [1.0, 0.75, 1.25];
-const CARRIER_START_INDEXES = [0, 2, 4];
+// Same slots as main.ts: all three carriers fly the shared loop,
+// phase-offset ~1/3 lap (pass 13, worker E).
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = ''): void {
@@ -52,12 +51,12 @@ async function main(): Promise<void> {
     heightfieldHeightAt(heights, res, x + origin.cumulativeShift.x, z + origin.cumulativeShift.z);
   const events: string[] = [];
   const carriers = [0, 1, 2].map((i) => {
-    const loop = carrierLoop(CARRIER_LOOP_SCALES[i]!);
+    const loop = carrierLoop(i);
     return new HelicarrierController(scene, world, {
       modelGlbUri: undefined,
       heightAt: hAt,
       waypoints: loop.waypoints,
-      startIndex: CARRIER_START_INDEXES[i]!,
+      startIndex: loop.startIndex,
       onCarrierImpact: () => events.push(`impact@${i}`),
       onCarrierDown: () => events.push(`down@${i}`),
     });
@@ -71,8 +70,8 @@ async function main(): Promise<void> {
   const startRound = (count: number): void => {
     carriers.forEach((c, i) => {
       if (i < count) {
-        const loop = carrierLoop(CARRIER_LOOP_SCALES[i]!);
-        const wp0 = loop.waypoints[CARRIER_START_INDEXES[i]!]!;
+        const loop = carrierLoop(i);
+        const wp0 = loop.waypoints[loop.startIndex]!;
         c.reset(
           loop.startPos.clone(),
           Math.atan2(wp0.x - loop.startPos.x, wp0.z - loop.startPos.z),
@@ -112,7 +111,7 @@ async function main(): Promise<void> {
   {
     const unbuilt = new HelicarrierController(scene, world, {
       heightAt: hAt,
-      waypoints: carrierLoop(1.0).waypoints,
+      waypoints: carrierLoop(0).waypoints,
       startIndex: 0,
       onCarrierDown: () => events.push('down@unbuilt'),
       onCarrierImpact: () => events.push('impact@unbuilt'),
@@ -132,7 +131,7 @@ async function main(): Promise<void> {
   {
     const high = new HelicarrierController(scene, world, {
       heightAt: () => 1000,
-      waypoints: carrierLoop(1.0).waypoints,
+      waypoints: carrierLoop(0).waypoints,
       startIndex: 0,
       onCarrierDown: () => events.push('down@high'),
       onCarrierImpact: () => events.push('impact@high'),

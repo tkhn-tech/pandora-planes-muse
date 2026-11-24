@@ -122,6 +122,8 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import type { DeckProvider } from '../src/physics/FlightPhysicsController';
+import { gameToTrueHdg } from '../src/ui/FlightHUD';
+import { PCFlightInput } from '../src/input/PCFlightInput';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import {
@@ -601,6 +603,293 @@ async function main(): Promise<void> {
     owners.set(terrainCollider.handle, 'terrain');
   }
 
+  // --- (H) LIVE-PATH landing: the section-B 500 m final, flown
+  // through the REAL keyboard input chain (pass 13, worker B). The
+  // v4.7 live landing attempt was defeated by the pitch/roll
+  // controls (the jet ended 21,280 ft up, 7.1 km away, still
+  // climbing) — so this section proves the FIXED controls can land:
+  // the same PD approach laws as section B, but their pitch/roll
+  // outputs reach the aircraft only via the real PCFlightInput
+  // (slew + kbRollScale) merged exactly as main.ts does, driven by
+  // a key servo: every substep the Arrow keys are driven from the
+  // error between the PD target and the stick position
+  // getControls() actually returned, so the stick tracks the PD
+  // target the way a pilot feathering the keys would. Throttle,
+  // gear, hook and flaps are set directly (not under test here);
+  // after touchdown the controls are zeroed directly, as in B.
+  {
+    const listenersH = new Map<string, Array<(e: unknown) => void>>();
+    const gH = globalThis as unknown as Record<string, unknown>;
+    gH['window'] = globalThis;
+    gH['addEventListener'] = (t: string, f: (e: unknown) => void): void => {
+      const arr = listenersH.get(t) ?? [];
+      arr.push(f);
+      listenersH.set(t, arr);
+    };
+    gH['removeEventListener'] = (t: string, f: (e: unknown) => void): void => {
+      listenersH.set(t, (listenersH.get(t) ?? []).filter((x) => x !== f));
+    };
+    // Node's real navigator HAS userAgent; the shim must keep it —
+    // THREE's GLTFParser reads navigator.userAgent.indexOf at
+    // parse time, so a userAgent-less shim throws inside every
+    // later GLB load in this process (carrier2's build caught it
+    // and fell back to the procedural hull: deckTopY 340.4 instead
+    // of 344.7 — that is what made section D diverge in the first
+    // H runs, not the control changes).
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { userAgent: 'NodeProbe/1.0', getGamepads: () => [] as unknown[] },
+      configurable: true,
+    });
+    let vnowH = 0;
+    Object.defineProperty(globalThis, 'performance', {
+      value: { now: () => vnowH },
+      configurable: true,
+    });
+    const fakeCanvasH = {
+      addEventListener: (): void => {},
+      removeEventListener: (): void => {},
+    } as unknown as HTMLCanvasElement;
+    const fireKeyH = (type: 'keydown' | 'keyup', code: string): void => {
+      for (const f of listenersH.get(type) ?? []) {
+        f({ code, repeat: false, preventDefault: (): void => {} });
+      }
+    };
+    const pcH = new PCFlightInput(fakeCanvasH);
+    for (const key of ['fa18', 'f22'] as const) {
+      const spec = SPECS[key]!;
+      contacts = [];
+      simT = 0;
+      const ac = new Aircraft({
+        scene,
+        world,
+        spec,
+        isPlayer: true,
+        modelKey: spec.modelKey,
+      });
+      ac.terrainHeightAt = (x: number, z: number) =>
+        heightfieldHeightAt(heights, res, x, z);
+      ac.deck = deckProvider;
+      for (const h of ac.colliderHandles()) owners.set(h, ac);
+      carrier.reset(CARRIER_START_POS.clone(), Math.PI / 2);
+      const fwd = new THREE.Vector3(Math.sin(carrier.yaw), 0, Math.cos(carrier.yaw));
+      const sx = carrier.pos.x - fwd.x * 500;
+      const sz = carrier.pos.z - fwd.z * 500;
+      const dv0 = deckProvider.velocityAt(sx, sz);
+      const vApp = Math.max(46, spec.stallSpeed * 0.8);
+      ac.resetAt(sx, carrier.deckTopY + 32, sz, (carrier.yaw * 180) / Math.PI);
+      ac.setAirspeed(Math.hypot(dv0.x, dv0.z) + vApp);
+      ac.body.setLinvel({ x: dv0.x + fwd.x * vApp, y: 0, z: dv0.z + fwd.z * vApp }, true);
+      ac.vel.set(dv0.x + fwd.x * vApp, 0, dv0.z + fwd.z * vApp);
+      ac.thrTarget = 0.65;
+      ac.gear = true;
+      ac.hook = true;
+      ac.flaps = 30;
+      const vAirApp = Math.hypot(dv0.x, dv0.z) + vApp;
+      const clNeed =
+        (2 * spec.mass * 9.81) / (1.225 * vAirApp * vAirApp * spec.wingArea);
+      const aoaTrim = Math.max(0, Math.min(15, (clNeed - 0.15 - 0.35) / 0.08));
+      console.log(`\n--- ${key} LIVE-PATH landing: 500m final via Arrow keys, hook down ---`);
+      let touchedDown = false;
+      let touchdownLz: number | null = null;
+      let pitchInt = 0;
+      let prevPitchX: number | null = null;
+      let stopped = false;
+      let stoppedLz: number | null = null;
+      let fellThrough = false;
+      let minClearance = Infinity;
+      let keyTransitions = 0;
+      let peakRollIn = 0;
+      let peakPitchIn = 0;
+      // PD targets for this frame (set by pdStep, tracked by the
+      // key servo below). The first version quantised the PD output
+      // into HELD keys with a 0.12 deadband — that is bang-bang with
+      // full deflection: the PD's small corrections (0.05-0.3) never
+      // moved the stick at all, the jet drifted nose-up on its
+      // untrimmed approach, and when the error finally crossed the
+      // deadband the key drove kbPitch to FULL (pitch rate 55 deg/s)
+      // — a limit cycle swinging pitch -17..+25 deg that flew over
+      // the deck and climbed away (F-18), or sank through it (F-22,
+      // pitchIn stuck at 0.00 while the keys read up/-). The fix is
+      // a servo: every substep the keys are driven from the error
+      // between the PD target and the stick position getControls()
+      // actually returned, so the stick tracks the PD target the way
+      // a pilot feathering the keys would. Deadband 0.15 (see the
+      // servo below): the stick moves up to 0.15 per substep, so a
+      // tighter band can never settle.
+      let pdPitchTgt = 0;
+      let pdRollTgt = 0;
+      let heldRoll: 'left' | 'right' | null = null;
+      let heldPitch: 'up' | 'down' | null = null;
+      const setRollKey = (want: 'left' | 'right' | null): void => {
+        if (want === heldRoll) return;
+        if (heldRoll === 'left') fireKeyH('keyup', 'ArrowLeft');
+        if (heldRoll === 'right') fireKeyH('keyup', 'ArrowRight');
+        heldRoll = want;
+        if (want === 'left') fireKeyH('keydown', 'ArrowLeft');
+        if (want === 'right') fireKeyH('keydown', 'ArrowRight');
+        keyTransitions++;
+      };
+      const setPitchKey = (want: 'up' | 'down' | null): void => {
+        if (want === heldPitch) return;
+        if (heldPitch === 'up') fireKeyH('keyup', 'ArrowUp');
+        if (heldPitch === 'down') fireKeyH('keyup', 'ArrowDown');
+        heldPitch = want;
+        if (want === 'up') fireKeyH('keydown', 'ArrowUp');
+        if (want === 'down') fireKeyH('keydown', 'ArrowDown');
+        keyTransitions++;
+      };
+      // A previous jet may have exited with keys held in pcH (its
+      // loop ends on touchdown/stop, not on key release) — force all
+      // four arrows up directly (the local held* state starts null,
+      // so setRollKey/setPitchKey would no-op and leave pcH's keys
+      // held into the fresh jet).
+      fireKeyH('keyup', 'ArrowLeft');
+      fireKeyH('keyup', 'ArrowRight');
+      fireKeyH('keyup', 'ArrowUp');
+      fireKeyH('keyup', 'ArrowDown');
+      // PD approach laws, verbatim from section B (same gains,
+      // same 3.5 deg slope to local z=-75, same deck-vY
+      // feed-forward, same PI pitch hold, same centreline bank,
+      // same speed hold) — only the actuator differs: the key servo.
+      const pdStep = (frameDt: number): void => {
+        const loc = localOfPos(ac.pos.x, ac.pos.z);
+        if (touchedDown) return;
+        const slopeAlt = carrier.deckTopY + 2 + Math.max(0, (-75 - loc.z) * 0.061);
+        const altErr = slopeAlt - ac.pos.y;
+        const dvY = deckProvider.velocityAt(ac.pos.x, ac.pos.z).y;
+        const vsDes = clamp(-vApp * 0.061 + altErr * 0.35 + dvY, -4.5, 15.0);
+        const airspeed = Math.max(20, Math.hypot(ac.vel.x, ac.vel.z));
+        const gammaDes = Math.atan2(vsDes, airspeed);
+        const pitchDes = -(gammaDes + (aoaTrim * Math.PI) / 180);
+        const pitchNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').x;
+        const pitchErr = pitchDes - pitchNow;
+        pitchInt = clamp(pitchInt + pitchErr * frameDt * 0.8, -0.35, 0.35);
+        // Derivative term (servo path only — section B's direct PD
+        // has none): the key servo adds ~0.25 s of actuator lag
+        // (slew + decay), which turns the PI loop's phase margin
+        // negative on the F-22's fast pitch axis — the jet balloons
+        // nose-up, the loop overcorrects nose-down, and the
+        // touchdown point swings 50+ m between servo tunings
+        // (-80.9 at a fixed 0.15 band, -128.5 at a scaled band).
+        // A D gain of 0.5 s/rad restores ~0.13 s of phase lead
+        // (D/P); D=1.0 over-damped the F-22 (it floated to +30.7),
+        // D=0.5 still floats it past the wires (-32.2, stopped on
+        // brakes, no wire). D=0.35 interpolates the measured
+        // swing (D=0: -128.5, D=0.5: -32.2, D=1.0: +30.7) to the
+        // middle of the wire zone. The F-18's pitch rate on the
+        // final is small, so it is barely affected. The rate is the
+        // Euler-x delta per frame, clamped so a single long frame
+        // cannot spike it.
+        const pitchRate = prevPitchX === null ? 0 : clamp((pitchNow - prevPitchX) / Math.max(frameDt, 0.001), -1, 1);
+        prevPitchX = pitchNow;
+        pdPitchTgt = clamp(pitchErr * 4.0 + pitchInt - pitchRate * 0.35, -0.7, 0.7);
+        const bankNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
+        pdRollTgt = clamp((0 - loc.x) * 0.03 - bankNow * 1.0, -0.7, 0.7);
+        ac.thrTarget = clamp(0.5 + (vApp - deckRelSpeed(ac)) * 0.12, 0.15, 0.9);
+      };
+      // Key servo: drive the keys from the error between the PD
+      // target and the stick position getControls() just returned.
+      // pitchIn < 0 is nose up, so "need more nose-up" (target
+      // below current) holds ArrowUp; rollIn > 0 is right bank.
+      // The deadband scales with the target — max(0.05, 30% of
+      // |target|): a fixed 0.05 band chatters on a large target
+      // (the F-22's +/-0.65 target flipped the keys 662 times and
+      // dove through the stern, because the stick decays toward 0
+      // at 3/s whenever no key is held, so a tight band re-holds
+      // every few substeps), while a fixed 0.15 band never acts on
+      // a small target (the F-18's +/-0.16 target stayed inside it,
+      // the jet flew open-loop on trim and floated 5 m past the
+      // last wire, then rolled off the bow). 30% of the target
+      // keeps the band below the per-substep stick movement on
+      // small targets and above the decay dither on large ones.
+      const servoKeys = (curPitch: number, curRoll: number): void => {
+        const bandPitch = Math.max(0.05, 0.3 * Math.abs(pdPitchTgt));
+        const bandRoll = Math.max(0.05, 0.3 * Math.abs(pdRollTgt));
+        if (pdRollTgt - curRoll > bandRoll) setRollKey('right');
+        else if (curRoll - pdRollTgt > bandRoll) setRollKey('left');
+        else setRollKey(null);
+        if (curPitch - pdPitchTgt > bandPitch) setPitchKey('up');
+        else if (pdPitchTgt - curPitch > bandPitch) setPitchKey('down');
+        else setPitchKey(null);
+      };
+      let logT = 0;
+      let tH = 0;
+      let piH = 0;
+      while (tH < 60 && !stopped && ac.alive) {
+        const rawDt = DT_PATTERN[piH % DT_PATTERN.length]!;
+        piH++;
+        // Frame-level: PD + key dispatch, once per frame.
+        if (!touchedDown) pdStep(rawDt);
+        else {
+          setRollKey(null);
+          setPitchKey(null);
+        }
+        vnowH += rawDt * 1000;
+        const sub = Math.ceil(rawDt / 0.05);
+        const dt = rawDt / sub;
+        for (let s = 0; s < sub; s++) {
+          pcH.setAirspeedKt(ac.ias * 1.94384);
+          pcH.consumeEvents();
+          const c = pcH.getControls();
+          if (!touchedDown) {
+            ac.pitchIn = clamp(c.pitch ?? 0, -1, 1);
+            ac.rollIn = clamp(c.roll ?? 0, -1, 1);
+            // Servo the keys toward the PD targets from the stick
+            // position just returned — takes effect next substep.
+            servoKeys(ac.pitchIn, ac.rollIn);
+          } else {
+            ac.brake = true;
+            ac.thrTarget = 0;
+            ac.pitchIn = 0;
+            ac.rollIn = 0;
+          }
+          peakRollIn = Math.max(peakRollIn, Math.abs(ac.rollIn));
+          peakPitchIn = Math.max(peakPitchIn, Math.abs(ac.pitchIn));
+          substep(ac, dt);
+          simT += dt;
+          const loc = localOfPos(ac.pos.x, ac.pos.z);
+          const deckY = carrier.deckHeightAt(ac.pos.x, ac.pos.z);
+          if (deckY > -Infinity) minClearance = Math.min(minClearance, ac.pos.y - deckY);
+          if (deckY > -Infinity && ac.pos.y < deckY - 1) fellThrough = true;
+          if (!touchedDown && ac.onDeck) {
+            touchedDown = true;
+            touchdownLz = loc.z;
+            console.log(`  TOUCHDOWN (keys) t=${tH.toFixed(1)} local=(${loc.x.toFixed(1)}, ${loc.z.toFixed(1)}) sp=${deckRelSpeed(ac).toFixed(1)}`);
+          }
+          if (touchedDown && !stopped && deckRelSpeed(ac) < 1) {
+            stopped = true;
+            stoppedLz = loc.z;
+          }
+        }
+        tH += rawDt;
+        if (tH - logT >= 2) {
+          logT = tH;
+          const loc = localOfPos(ac.pos.x, ac.pos.z);
+          const eul = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ');
+          console.log(
+            `  t=${tH.toFixed(1)} local=(${loc.x.toFixed(1)}, ${loc.z.toFixed(1)}) alt=${(ac.pos.y - carrier.deckTopY).toFixed(1)} sp=${deckRelSpeed(ac).toFixed(1)} pitch=${(eul.x * 57.3).toFixed(1)} bank=${(eul.z * 57.3).toFixed(1)} pitchIn=${ac.pitchIn.toFixed(2)} rollIn=${ac.rollIn.toFixed(2)} keys=${heldPitch ?? '-'}/${heldRoll ?? '-'} onDeck=${ac.onDeck} alive=${ac.alive}`,
+          );
+        }
+      }
+      const deckContactsOffSurface = contacts.filter((c) => c.other === 'deck' && !c.onDeck);
+      console.log(
+        `  result (keys): touchedDown=${touchedDown} touchdownLz=${touchdownLz === null ? 'NONE' : touchdownLz.toFixed(1)} ` +
+          `stopped=${stopped} stoppedLz=${stoppedLz === null ? 'NONE' : stoppedLz.toFixed(1)} fellThrough=${fellThrough} ` +
+          `keyTransitions=${keyTransitions} peakRollIn=${peakRollIn.toFixed(2)} peakPitchIn=${peakPitchIn.toFixed(2)} ` +
+          `minClearanceOverDeck=${minClearance === Infinity ? 'n/a' : minClearance.toFixed(2)} deckContactsWhileOffSurface=${deckContactsOffSurface.length} alive=${ac.alive}`,
+      );
+      check(`${key} LIVE-PATH landing: touches down on the deck (via Arrow keys)`, touchedDown && touchdownLz !== null && touchdownLz > -128 && touchdownLz < 152, `touchdownLz=${touchdownLz === null ? 'NONE' : touchdownLz.toFixed(1)} (wire zone -105..-45)`);
+      check(`${key} LIVE-PATH landing: rolls out to a stop ON the deck`, stopped && stoppedLz !== null && stoppedLz > -128 && stoppedLz < 152, `stoppedLz=${stoppedLz === null ? 'NONE' : stoppedLz.toFixed(1)}`);
+      check(`${key} LIVE-PATH landing: never falls through the deck`, !fellThrough, `minClearance=${minClearance === Infinity ? 'n/a' : minClearance.toFixed(2)}`);
+      check(`${key} LIVE-PATH landing: no deck side/end-face contact while off the surface`, deckContactsOffSurface.length === 0, `${deckContactsOffSurface.length} contacts`);
+      check(`${key} LIVE-PATH landing: actually flown through the keys (transitions > 10)`, keyTransitions > 10, `keyTransitions=${keyTransitions}`);
+      ac.dispose();
+      owners.clear();
+      owners.set(terrainCollider.handle, 'terrain');
+    }
+    pcH.dispose();
+  }
+
   // --- (C) Parked heading through the waypoint-0 turn ---
   // The carrier starts heading east (yaw 90 deg) toward waypoint 0,
   // 4,900 m away: it reaches it at ~122 s, then turns ~120 deg toward
@@ -753,12 +1042,20 @@ async function main(): Promise<void> {
   // --- (F) Carrier bearing / distance from live state ---
   // The HUD patch (FlightHUD + main.ts, patch spec in the pass-12
   // report) shows: absolute bearing to the carrier (deg, 0 = north /
-  // +Z, clockwise), bearing RELATIVE to the jet's nose (deg, + = right),
-  // and slant range (m). Verified here against the true geometry at
-  // three live moments: deck spawn, mid-transit (carrier 3 km away
-  // after the takeoff), and on final. The formula under test is the
-  // one the patch spec gives main.ts/FlightHUD — a wrong sign or axis
-  // here is exactly the "carrier cannot be found" live failure.
+  // −Z, clockwise — TRUE heading), bearing RELATIVE to the jet's nose
+  // (deg, + = right), and slant range (m). Verified here against the
+  // true geometry at three live moments: deck spawn, mid-transit
+  // (carrier 3 km away after the takeoff), and on final. The formula
+  // under test is the one the patch spec gives main.ts/FlightHUD — a
+  // wrong sign or axis here is exactly the "carrier cannot be found"
+  // live failure. Pass 13 (worker E): the game-space formula below
+  // (atan2(dx, dz)) is the OLD mirrored convention — its rel checks
+  // (0 at spawn, ±180 at 3 km out) are sign-agnostic, so they pass
+  // under either convention. The TRUE-space checks after them are
+  // the ones that pin the fix: they use gameToTrueHdg exactly as
+  // main.ts does now (abs, player heading and carrier heading all
+  // converted, rel recomputed in true space — its sign flips vs the
+  // old mirrored value).
   const carrierBearing = (
     from: THREE.Vector3,
     jetFwd: THREE.Vector3,
@@ -792,6 +1089,51 @@ async function main(): Promise<void> {
     console.log(`  3 km east, heading east: abs=${b2.absDeg.toFixed(1)} rel=${b2.relDeg.toFixed(1)} dist=${b2.distM.toFixed(0)}m`);
     check('bearing 3 km out: carrier dead astern (rel ~180 deg)', Math.abs(Math.abs(b2.relDeg) - 180) < 1, `rel=${b2.relDeg.toFixed(2)} deg`);
     check('distance 3 km out: 3,000 m', Math.abs(b2.distM - 3000) < 1, `dist=${b2.distM.toFixed(1)}m`);
+    // TRUE-space (pass 13, worker E): the same two moments through
+    // gameToTrueHdg, exactly as main.ts computes them now. Deck
+    // spawn: carrier dead ahead, bearing true 090 (east — the jet
+    // faces the carrier's east heading), carrier heading true 090,
+    // deck-relative heading 0. 3 km east, heading east: bearing to
+    // the carrier is true 270 (west), jet heading true 090, so the
+    // carrier is dead astern (rel ±180) — and a carrier 3 km NORTH
+    // of an eastbound jet must read rel −90 (left), not +90: the old
+    // mirrored value had the sign backwards.
+    const carrierBearingTrue = (
+      from: THREE.Vector3,
+      jetFwd: THREE.Vector3,
+      carrierYawRad: number,
+    ): { absDeg: number; relDeg: number; carrierHdgDeg: number; deckRelHdgDeg: number } => {
+      const dx = carrier.pos.x - from.x;
+      const dz = carrier.pos.z - from.z;
+      const absDeg = gameToTrueHdg(((Math.atan2(dx, dz) * 180) / Math.PI + 360) % 360);
+      const jetHdg = gameToTrueHdg(((Math.atan2(jetFwd.x, jetFwd.z) * 180) / Math.PI + 360) % 360);
+      const carrierHdgDeg = gameToTrueHdg((((carrierYawRad * 180) / Math.PI % 360) + 360) % 360);
+      return {
+        absDeg,
+        relDeg: wrapDeg(absDeg - jetHdg),
+        carrierHdgDeg,
+        deckRelHdgDeg: wrapDeg(jetHdg - carrierHdgDeg),
+      };
+    };
+    const bt = carrierBearingTrue(jet, fwd, carrier.yaw);
+    console.log(`  TRUE deck spawn: abs=${bt.absDeg.toFixed(1)} rel=${bt.relDeg.toFixed(1)} carrierHdg=${bt.carrierHdgDeg.toFixed(1)} deckRel=${bt.deckRelHdgDeg.toFixed(1)}`);
+    check('TRUE bearing at deck spawn: abs 090 (east)', Math.abs(bt.absDeg - 90) < 1, `abs=${bt.absDeg.toFixed(2)} deg`);
+    check('TRUE bearing at deck spawn: rel ~0 (dead ahead)', Math.abs(bt.relDeg) < 1, `rel=${bt.relDeg.toFixed(2)} deg`);
+    check('TRUE carrier heading at deck spawn: 090 (east)', Math.abs(bt.carrierHdgDeg - 90) < 1, `carrierHdg=${bt.carrierHdgDeg.toFixed(2)} deg`);
+    check('TRUE deck-relative heading at deck spawn: 0', Math.abs(bt.deckRelHdgDeg) < 1, `deckRel=${bt.deckRelHdgDeg.toFixed(2)} deg`);
+    const bt2 = carrierBearingTrue(away, fwd, carrier.yaw);
+    console.log(`  TRUE 3 km east, heading east: abs=${bt2.absDeg.toFixed(1)} rel=${bt2.relDeg.toFixed(1)}`);
+    check('TRUE bearing 3 km out: abs 270 (west)', Math.abs(bt2.absDeg - 270) < 1, `abs=${bt2.absDeg.toFixed(2)} deg`);
+    check('TRUE bearing 3 km out: rel ±180 (dead astern)', Math.abs(Math.abs(bt2.relDeg) - 180) < 1, `rel=${bt2.relDeg.toFixed(2)} deg`);
+    // Jet 3 km SOUTH of the carrier, heading east: the carrier is
+    // due NORTH of the jet (true bearing 000), jet heading 090, so
+    // rel −90 (carrier on the LEFT — facing east, north is left).
+    // The old mirrored formula read +90 here.
+    const southOf = new THREE.Vector3(carrier.pos.x, carrier.deckTopY + 100, carrier.pos.z + 3000);
+    const bt3 = carrierBearingTrue(southOf, fwd, carrier.yaw);
+    console.log(`  TRUE 3 km south of carrier, heading east: abs=${bt3.absDeg.toFixed(1)} rel=${bt3.relDeg.toFixed(1)}`);
+    check('TRUE bearing 3 km south: abs 000 (carrier due north)', Math.abs(bt3.absDeg - 0) < 1, `abs=${bt3.absDeg.toFixed(2)} deg`);
+    check('TRUE bearing 3 km south: rel −90 (carrier on the left)', Math.abs(bt3.relDeg - -90) < 1, `rel=${bt3.relDeg.toFixed(2)} deg`);
   }
 
   // --- (G) Free-orbit ground view: does the legacy camera go under the terrain? ---
@@ -1156,7 +1498,17 @@ async function main(): Promise<void> {
       // both directions. And when slow, never command a climb:
       // trade altitude for speed instead.
       const vTrim = Math.max(ac.ias, desSpeedMs);
-      const clNeed = (2 * spec.mass * 9.81) / (1.225 * vTrim * vTrim * spec.wingArea);
+      // Bank-compensated trim (pass 13): in a banked turn the wing
+      // must carry 1/cos(bank) g, so the trim AoA rises with bank.
+      // The uncompensated law commanded a 1 g trim in a 35 deg
+      // bank and the jet sank 10-15 m/s through the chase — full
+      // nose-up, pitch stuck at ~2 deg, AoA ~13 deg — and mushed
+      // into the terrain (d1/d2/d3). The factor is capped at 1.5
+      // (48 deg bank) so a steep bank does not demand an absurd
+      // AoA; the AoA limiter below still guards the stall.
+      const bankNowTrim = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
+      const loadFactor = Math.min(1.5, 1 / Math.max(0.5, Math.cos(bankNowTrim)));
+      const clNeed = (2 * spec.mass * 9.81 * loadFactor) / (1.225 * vTrim * vTrim * spec.wingArea);
       const aoaTrim = clamp((clNeed - 0.15) / 0.08, 0, 12);
       let vsDes = clamp((desAltM - ac.pos.y) * 0.4, -maxSinkMs, 10);
       if (ac.ias < desSpeedMs - 10) vsDes = Math.min(vsDes, -2);
@@ -1333,15 +1685,53 @@ async function main(): Promise<void> {
               console.log(`  BASETURN DONE t=${tSec.toFixed(1)}s hdg=${jetHdgDeg(ac).toFixed(0)} dist=${b.distM.toFixed(0)}m brgRel=${b.relDeg.toFixed(0)}`);
             }
           } else if (phase === 'chase') {
-            // Fixed-heading + lateral correction down a 3.5 deg glide
-            // path to the gate (deck+40 at 500 m astern). No pursuit
-            // of a moving point: the jet flies the carrier's heading
-            // and corrects its lateral offset, so it cannot orbit.
-            const mLocC = manualLocal2();
-            const desC = cYawDeg() + clamp(-mLocC.x * 0.06, -25, 25);
-            const chaseAltC = carrier2.deckTopY + 40 + Math.max(0, b.distM - 500) * 0.061;
-            flyTo(desC, chaseAltC, 85, dt, 0.45, 12);
+            // Pursuit of a point 500 m astern of the carrier's
+            // CURRENT position (pass 13): the old law flew the
+            // carrier's heading with a +/-25 deg lateral correction,
+            // which has no pursuit term — when the carrier turns
+            // ~120 deg mid-chase the jet ends up orbiting its track
+            // instead of intercepting, and the entry gate never
+            // fires (baseline: min dist 337 m, ends 4351 m away;
+            // h4/h7: the jet then flew the commanded glide path
+            // into a terrain ridge and died). The astern point
+            // moves with the carrier, so pure pursuit converges to
+            // an aligned position behind it. Bank cap 0.61 rad
+            // (35 deg, as in baseTurn) instead of 0.45: turn rate
+            // 4.6 deg/s at 85 m/s instead of 3.2, so the jet can
+            // keep up with the carrier's turn.
+            const cy = carrier2.yaw;
+            const px = carrier2.pos.x - Math.sin(cy) * 500;
+            const pz = carrier2.pos.z - Math.cos(cy) * 500;
+            const dxP = px - ac.pos.x;
+            const dzP = pz - ac.pos.z;
+            const distP = Math.hypot(dxP, dzP);
+            const desC = (Math.atan2(dxP, dzP) * 180) / Math.PI;
+            // 65 m/s, not 85: turn rate 6.6 deg/s at 35 deg bank
+            // (radius 524 m) instead of 4.6 deg/s (1050 m), and the
+            // jet closes on the moving point at ~25 m/s instead of
+            // ~48 — at 85 the jet blew through the entry window
+            // still 174 m high and 49 deg off heading, then
+            // overshot the point and crashed onto the deck edge
+            // (local (32,-99), 40 deg bank, AoA 28 deg). The glide
+            // path reaches deck+40 at 300 m from the point, so the
+            // jet is level and slow well before the gate.
+            const glideAltC = carrier2.deckTopY + 40 + Math.max(0, distP - 300) * 0.061;
+            // Terrain floor: the 3.5 deg glide path can run below a
+            // ridge 2-3 km out (the carrier flies at ~350 m abs
+            // over ~310 m terrain; peaks reach ~540 m). Without it
+            // the jet flies the commanded deck+192 straight into
+            // the ridge (h4/h7 crash, hard landing, alt 193 rel).
+            const floorC = heightAtLive(ac.pos.x, ac.pos.z) + 80;
+            flyTo(desC, Math.max(glideAltC, floorC), 65, dt, 0.61, 15);
             const mLoc = manualLocal2();
+            // No abort here: the first go-around attempt fired on a
+            // recoverable geometry (loc (478,-362), 600 m out — the
+            // pursuit was still correcting the lateral offset) and
+            // the escape itself mushed into the terrain — a 35 deg
+            // banked turn at AoA ~13 deg cannot climb out (full
+            // nose-up, pitch stuck at ~2 deg, descending 10-15
+            // m/s). The pursuit alone (d1) got the jet onto the
+            // deck edge, so the chase is left to run its course.
             // Entry conditions on top of the -600..-450 m window:
             // aligned within 20 deg of the carrier's heading and at
             // deck+0..+150. Return9 entered at 598 m astern, 36 deg

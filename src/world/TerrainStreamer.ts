@@ -127,8 +127,16 @@ export const STREAM_CHUNK_RESOLUTION = STREAM_CHUNK_SEGMENTS + 1;
 export const STREAM_RADIUS = 3;
 /** Max chunks given mesh + collider per update() call (the player's own
  *  chunk is always created synchronously on top of this). At 200 m/s a
- *  chunk takes 15 s to cross, so the window fills far ahead of the jet. */
-export const STREAM_CREATE_BUDGET = 4;
+ *  chunk takes 15 s to cross, so the window fills far ahead of the jet.
+ *  Pass 13 (Worker F): 4 -> 2. A chunk costs ~7.3 ms to create on the
+ *  probe VM (3.5 ms generateChunkHeights + ~3.8 ms mesh +
+ *  computeVertexNormals + heightfield collider), so one fresh-location
+ *  update() at budget 4 cost ~36 ms (5 chunks incl. the synchronous
+ *  player chunk) — a hitch big enough, on a phone, to push a marginal
+ *  frame under the 20 fps substep cliff. At budget 2 the worst such
+ *  frame is ~3 chunks (~22 ms); a boundary crossing adds at most 7
+ *  chunks, filled in 4 frames, still far ahead of the jet. */
+export const STREAM_CREATE_BUDGET = 2;
 /** Chebyshev distance beyond which a chunk's cached heights are dropped
  *  entirely (geometry is already retired past STREAM_RADIUS). */
 const EVICT_RADIUS = STREAM_RADIUS + 3;

@@ -32,6 +32,15 @@ if (typeof (globalThis as unknown as { document?: unknown }).document === 'undef
             drawImage: () => {},
             getImageData: () => ({ data: new Uint8ClampedArray(128 * 128 * 4) }),
             putImageData: () => {},
+            // Pass 13 (coordinator): CrashVFXManager.irregularScorchTexture()
+            // draws with the 2D path API — stub the same methods as
+            // probe-crash-vfx or scorchDecal throws here.
+            beginPath: () => {},
+            moveTo: () => {},
+            lineTo: () => {},
+            closePath: () => {},
+            fill: () => {},
+            arc: () => {},
             set fillStyle(_v: unknown) {},
           }),
         };

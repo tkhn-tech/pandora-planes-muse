@@ -290,15 +290,29 @@ async function main(): Promise<void> {
   check('Alpha roll path flat on the sampled grid too', gridWorst < 0.01, `worst |h - elev| = ${gridWorst.toFixed(4)}`);
 
   // ---- F. Carrier bearing from Alpha ----
+  // Pass 13 (coordinator): the old check demanded the carrier dead ahead
+  // (offNose < 1 deg, dist < 1200 m) — i.e. sitting on Alpha's extended
+  // centreline, which is exactly the defect pass 13 fixed (jets fly under
+  // the carrier on Alpha takeoffs). The new loop keeps the carrier clear
+  // of every runway corridor (>= 500 m) while still ahead and visible:
+  // slot-0 start is 18.4 deg off the nose at 1897 m, 600 m north of the
+  // centreline. Assert that geometry instead.
   const dx = CARRIER_START_POS.x - alpha.x;
   const dz = CARRIER_START_POS.z - alpha.z;
   const bearing = ((Math.atan2(dx, dz) / D2R) % 360 + 360) % 360;
   const offNose = Math.abs(((bearing - alpha.hdg + 540) % 360) - 180);
   const dist = Math.hypot(dx, dz);
+  // Cross-track distance from Alpha's centreline: dot the displacement
+  // with the perpendicular unit vector (cos h, -sin h). For hdg 90 deg
+  // this is |dz| = 600 m at the slot-0 start.
+  const hdgRad = alpha.hdg * D2R;
+  const crossTrack = Math.abs(
+    dx * Math.cos(hdgRad) - dz * Math.sin(hdgRad),
+  );
   check(
-    'Carrier dead ahead of Alpha',
-    offNose < 1 && dist < 1200,
-    `bearing ${bearing.toFixed(1)} deg (runway hdg ${alpha.hdg}), ${offNose.toFixed(1)} deg off the nose, ${dist.toFixed(0)} m`,
+    'Carrier ahead of Alpha but clear of the runway corridor',
+    offNose < 30 && dist < 3000 && crossTrack > 500,
+    `bearing ${bearing.toFixed(1)} deg (runway hdg ${alpha.hdg}), ${offNose.toFixed(1)} deg off the nose, ${dist.toFixed(0)} m, cross-track ${crossTrack.toFixed(0)} m`,
   );
   const wp0 = CARRIER_WAYPOINTS[0]!;
   const wpBearing = ((Math.atan2(wp0.x - CARRIER_START_POS.x, wp0.z - CARRIER_START_POS.z) / D2R) % 360 + 360) % 360;

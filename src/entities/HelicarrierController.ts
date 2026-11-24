@@ -40,46 +40,73 @@ export const DECK_HALF_X = 32;
 export const DECK_HALF_Z = 150;
 export const CARRIER_SPEED = 40; // m/s
 export const CARRIER_ALT = 350; // m
-/** v4 startRound: ~900 m dead ahead of Alpha (was ~1.1 km at 38 deg left
- *  of the takeoff heading — outside a portrait phone's ~±17 deg FOV, so
- *  the carrier was never seen). Alpha is at (-2800, -1800) heading east;
- *  the carrier sits at (-1900, -1800) heading east to its first waypoint,
- *  so it is on the nose at round start in every viewport. */
-export const CARRIER_START_POS = new THREE.Vector3(-1900, 350, -1800);
-/** v4: first leg east from the start position, with the takeoff
- *  direction. Hexagon of ~3000 m radius across the 12 km basin — the
- *  legs stay inside the range bands (terrain < ~130 m on the loop),
- *  so the carrier cruises at its 350 m altitude with ~200 m of
- *  clearance; the terrain-following altitude (issue 8) is the safety
- *  net for the range crossings, not the norm. */
+/** Pass 13 (worker E): round-start position — 1800 m east of Alpha's
+ *  centre on the entry leg into waypoint 0, 600 m NORTH of Alpha's
+ *  centreline (z = −1200 vs the strip's −1800), so the carrier is
+ *  18° off the takeoff heading at round start (just at the portrait
+ *  FOV edge, and it flies east along the leg from there) but NEVER
+ *  over the runway: the old start (−1900, −1800) sat dead on the
+ *  extended centreline, 575 m past the strip end, and every Alpha
+ *  takeoff flew straight under the ship. The entry leg keeps the
+ *  600 m offset for its whole 3800 m run to waypoint 0. */
+export const CARRIER_START_POS = new THREE.Vector3(-1000, 350, -1200);
+/** Pass 13 (worker E): the carrier loop, ONE shared hexagon for all
+ *  three carriers (see carrierLoop below) — a ~3000 m hexagon across
+ *  the 12 km basin, so the legs stay inside the range bands (terrain
+ *  < ~130 m on the loop) and the carrier cruises at 350 m with
+ *  ~200 m of clearance; terrain-following (issue 8) is the safety
+ *  net, not the norm. Runway clearance, measured segment-to-segment
+ *  against the strips (probe-carrier-loop §5): worst leg 813 m
+ *  (Charlie), and no leg enters any runway's ±500 m corridor
+ *  (strip extended ±1000 m along its heading). The old hexagon's
+ *  worst leg was 163 m from Bravo — waypoint 1 sat 224 m from
+ *  Bravo's centre and the z = 2600 leg crossed the strip — and its
+ *  first leg ran ON Alpha's centreline. */
 export const CARRIER_WAYPOINTS: THREE.Vector3[] = [
-  new THREE.Vector3(3000, 350, -1800),
-  new THREE.Vector3(1500, 350, 2600),
+  new THREE.Vector3(2800, 350, -1200),
+  new THREE.Vector3(800, 350, 1800),
   new THREE.Vector3(-1500, 350, 2600),
   new THREE.Vector3(-3000, 350, 0),
-  new THREE.Vector3(-1500, 350, -2600),
+  new THREE.Vector3(-1200, 350, -1000),
   new THREE.Vector3(1500, 350, -2600),
 ];
 
-/** Per-carrier loop for the helicarrier count option (issue 5): the
- *  base hexagon scaled about the origin, with a start position scaled
- *  the same way (so it stays 900 m ahead of Alpha's latitude on the
- *  leg into waypoint 0). Scale 1.0 is the primary carrier; 0.75 and
- *  1.25 are the second and third, on concentric loops that never
- *  overlap or collide. `startIndex` spreads the carriers around
- *  their circuits (0 / 2 / 4) instead of stacking them. */
+/** Per-carrier loop for the helicarrier count option (issue 5): all
+ *  three carriers fly the SAME hexagon (CARRIER_WAYPOINTS), phase-
+ *  offset by ~1/3 of the 16,150 m lap (~5383 m) so they never overlap
+ *  or collide — same speed, same circuit, constant separation.
+ *  `slot` is the carrier index (0 / 1 / 2); the returned startPos
+ *  sits ON the loop at the slot's phase, and startIndex is the next
+ *  waypoint for that slot:
+ *    slot 0: (-1000, -1200) on the entry leg into waypoint 0, index 0;
+ *    slot 1: (1921, 118) on the waypoint 0 → 1 leg, index 1;
+ *    slot 2: (-1963, 1797) on the waypoint 2 → 3 leg, index 3.
+ *  Pass 13 (worker E): the old design scaled the hexagon about the
+ *  origin (1.0 / 0.75 / 1.25) — that CANNOT clear the runways at all
+ *  three scales with any margin. At 0.75 the east leg pulls in to
+ *  x = 3600, 11 m from Charlie's strip; at 1.25 waypoint 0 lands at
+ *  (3750, -1500), 520 m north of Charlie, and every southward leg
+ *  from it crosses the strip; and the 1.25 entry leg runs at
+ *  z = -1500, 300 m north of Alpha's centreline. Scaling about the
+ *  origin moves every leg by 25% of its distance from the origin
+ *  (~1000 m) — far more than the clearance available between the
+ *  strips (which poke out to radius 3831) and the range bands (which
+ *  start at ~±4000). One shared loop is the only geometry that
+ *  clears at every count; the slot starts are measured in
+ *  probe-carrier-loop §5 (min pairwise separation over 10 min). */
 export function carrierLoop(
-  scale: number,
-): { waypoints: THREE.Vector3[]; startPos: THREE.Vector3 } {
+  slot: number,
+): { waypoints: THREE.Vector3[]; startPos: THREE.Vector3; startIndex: number } {
+  const starts: Array<{ pos: THREE.Vector3; index: number }> = [
+    { pos: new THREE.Vector3(-1000, 350, -1200), index: 0 },
+    { pos: new THREE.Vector3(1921, 350, 118), index: 1 },
+    { pos: new THREE.Vector3(-1963, 350, 1797), index: 3 },
+  ];
+  const s = starts[((slot % 3) + 3) % 3]!;
   return {
-    waypoints: CARRIER_WAYPOINTS.map(
-      (w) => new THREE.Vector3(w.x * scale, w.y, w.z * scale),
-    ),
-    startPos: new THREE.Vector3(
-      CARRIER_START_POS.x * scale,
-      CARRIER_START_POS.y,
-      CARRIER_START_POS.z * scale,
-    ),
+    waypoints: CARRIER_WAYPOINTS.map((w) => w.clone()),
+    startPos: s.pos.clone(),
+    startIndex: s.index,
   };
 }
 /** Rotor pod local positions for the PROCEDURAL fallback hull: [x, y, z]
@@ -511,6 +538,25 @@ export class HelicarrierController {
     mat.polygonOffset = true;
     mat.polygonOffsetFactor = -4;
     mat.polygonOffsetUnits = -4;
+    // Pass 13 (worker E): ONE shared UV space across all deck rects,
+    // from the GLOBAL deck bounds — NOT per-rectangle normalisation.
+    // The old code mapped the whole Ford strip onto EACH rect (u over
+    // that rect's own z-range, v over its own x-range), so the strip
+    // appeared twice and the junction (z = 2.0) jumped from u = 1.0
+    // (stern) to u = 0.0 (bow), with a 15% longitudinal and 49%
+    // lateral scale step — the v4.7 live seam. With global bounds
+    // the UVs are continuous functions of world (x, z): the strip
+    // flows across the junction at one scale (probe-ford-texture
+    // pass-13 checks: edge u 1.000 vs 0.000, du/dz 0.00764 vs
+    // 0.00664 /m, dv/dx 0.01396 vs 0.02080 /m before; identical
+    // after). The bow rect is narrower than the stern (48.1 vs
+    // 71.7 m), so it samples the middle of the texture's width —
+    // the strip stays centred and is never cut off. No GLB rebake:
+    // the baked deck_top UVs are untouched; only these planes change.
+    const minX = Math.min(...this.deckRects.map((r) => r.cx - r.hx));
+    const maxX = Math.max(...this.deckRects.map((r) => r.cx + r.hx));
+    const minZ = Math.min(...this.deckRects.map((r) => r.cz - r.hz));
+    const maxZ = Math.max(...this.deckRects.map((r) => r.cz + r.hz));
     for (const r of this.deckRects) {
       const geo = new THREE.PlaneGeometry(r.hx * 2, r.hz * 2);
       geo.rotateX(-Math.PI / 2);
@@ -519,7 +565,7 @@ export class HelicarrierController {
       for (let i = 0; i < posA.count; i++) {
         const x = posA.getX(i) + r.cx;
         const z = posA.getZ(i) + r.cz;
-        uvA.setXY(i, (z - (r.cz - r.hz)) / (2 * r.hz), (x - (r.cx - r.hx)) / (2 * r.hx));
+        uvA.setXY(i, (z - minZ) / (maxZ - minZ), (x - minX) / (maxX - minX));
       }
       uvA.needsUpdate = true;
       const plane = new THREE.Mesh(geo, mat);

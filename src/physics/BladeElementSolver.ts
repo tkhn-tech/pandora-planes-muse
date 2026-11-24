@@ -129,19 +129,49 @@ const CNR = -0.2; // yaw damping, per rad
  *  passes — drives the nose down far enough to kill the lift
  *  and dive. Kept for reference; the moment itself is unused. */
 const STALL_NOSE_DOWN_K = 0.03;
-/** Hands-off 1g auto-trim gain (pass 12): per radian of AoA error
- *  above the 1g AoA, radians of elevator trim (nose-down when the
- *  AoA is too high). See the trim block in solve(): the BET's
- *  geometric trim AoA (~1-4 deg, set by the station layout) is
- *  speed-blind, so at 780 kt it holds ~4 deg AoA and makes ~11 g —
- *  a hands-off steep dive pulls itself out. A real fighter's FCS /
- *  trim holds 1 g hands-off; this proportional trim does the same.
- *  Gain 2.0: the elevator moves the trim AoA ~3.4 deg per degree
- *  of deflection, so the closed-loop trim AoA lands within ~1 deg
- *  of the 1g AoA; the deflection is capped at the scheduled
- *  elevator authority, so the trim can never exceed what the
- *  pilot's own stick commands. */
-const TRIM_K = 2.0;
+/** Hands-off 1g auto-trim gain (pass 12, raised pass 13): per radian
+ *  of AoA error above the 1g AoA, radians of elevator trim
+ *  (nose-down when the AoA is too high). See the trim block in
+ *  solve(): the BET's geometric trim AoA (~1-4 deg, set by the
+ *  station layout) is speed-blind, so at 780 kt it holds ~4 deg
+ *  AoA and makes ~11 g — a hands-off steep dive pulls itself out.
+ *  A real fighter's FCS / trim holds 1 g hands-off; this
+ *  proportional trim does the same.
+ *  Gain 2.0 (pass 12): the elevator moves the trim AoA ~3.4 deg
+ *  per degree of deflection, so the closed-loop trim AoA lands
+ *  within ~1 deg of the 1g AoA; the deflection is capped at the
+ *  scheduled elevator authority, so the trim can never exceed what
+ *  the pilot's own stick commands. That ~1 deg was measured (pass
+ *  13 dive sweep) to be too loose: at high speed the wing makes
+ *  multi-g lift at AoA ~0 (F-22: 2.5 g at AoA -0.7 deg, 350 m/s),
+ *  so a 1 deg steady-state error leaves 1.5-3 g of excess lift
+ *  that curves a shallow dive into a pull-out over 10-25 s — the
+ *  F-22 pulled out of every 30-deg dive and the F-18 pulled out
+ *  of a 45-deg dive given altitude (from 10,000 m: level at 54 s,
+ *  min AGL 1924 m), which is the live F-18 case (-34,286 fpm at
+ *  ~7,000 ft to +8,419 fpm — it dove from ~35,842 ft, so the slow
+ *  pull-out had time to complete). The trim gate is NOT the cause
+ *  — it reads ON through the whole dive (hands-off, wings level,
+ *  unstalled, gear up at altitude; the gear auto-retracts above
+ *  100 m AGL and the bank levels within 2 s, so neither gate can
+ *  hold it off). The loop is just too soft — but stiffening the
+ *  gain alone trades the dive for level flight: K=8/10 held the
+ *  dives yet broke the Su-34 hands-off test (pinned at AoA -1
+ *  deg, vsi decaying to -18,000 fpm over 60 s), because the P
+ *  term targets the WING polar while the tail download makes the
+ *  NET lift short — the soft gain's steady-state error was
+ *  accidentally compensating for it. So the gain stays at 6.0
+ *  (the error lands ~0.2-0.3 deg) and the integral term below
+ *  (TRIM_KI) removes the net-lift shortfall instead. */
+const TRIM_K = 6.0;
+/** Integral-trim gain (pass 13): radians of elevator trim per
+ *  g-second of net-lift error. See the integral term in the trim
+ *  block — the P term alone cannot hold the net lift, because it
+ *  targets the wing polar while the tail download eats part of
+ *  the lift. 0.05 moves the elevator ~3 deg in 10 s at a 0.15 g
+ *  shortfall: fast enough to hold a dive ballistic, slow enough
+ *  not to fight the P term (the pitch plant answers in ~1 s). */
+const TRIM_KI = 0.05;
 /** Dying nose-down moment coefficient (damage-model §6). Tried
  *  and found ineffective — the tail's moment in the flat spin
  *  overwhelms a 0.05·q·S·cbar moment, so dying is a rate bias
@@ -463,6 +493,16 @@ export class BladeElementSolver implements IAerodynamicsSolver {
    *  is computed from it (one-step lag, physical: the downwash takes
    *  time to reach the tail). */
   private prevCL = 0;
+  /** Previous step's NET g-load (lift / weight, all stations —
+   *  the tailplane download is in it). The integral trim reads it
+   *  (one-step lag, like the downwash). Seeded at 1 g. */
+  private prevGLoad = 1;
+  /** Integral-trim state (pass 13): elevator radians learned from
+   *  the net-lift error, so the trim holds the NET lift at the
+   *  flight-path value instead of the wing polar's 1 g. Clamped to
+   *  the elevator authority; frozen while the trim gates are off;
+   *  reset on respawn. */
+  private trimInt = 0;
   /** Integrated angular-velocity state (issue 6 calibration). The
    *  solver integrates ω itself and returns it as the rate; the
    *  controller sets the Rapier body to it. Reading the body's rate
@@ -484,6 +524,8 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     this.stalled = false;
     this.spinModel.reset();
     this.prevCL = 0;
+    this.prevGLoad = 1;
+    this.trimInt = 0;
     this.omega.set(0, 0, 0);
     this.omegaSeeded = false;
   }
@@ -624,6 +666,33 @@ export class BladeElementSolver implements IAerodynamicsSolver {
       }
       const aoaReq = 0.5 * (lo + hi);
       elevDeflect += clamp((aoaDeg - aoaReq) * D2R * TRIM_K, -elevMax, elevMax) * hydroPitch;
+      // Integral trim (pass 13): the P term above targets the WING
+      // polar's 1 g CL, but the net lift sums every station — the
+      // tailplane's download (needed to balance the wing's nose-up
+      // moment) makes the net lift at that AoA less than 1 g, so a
+      // hands-off jet slowly sinks (Su-34: pinned at AoA -1 deg,
+      // vsi decaying to -18,000 fpm over 60 s at 100% throttle).
+      // The P loop's steady-state error used to compensate for it
+      // by accident (a soft gain leaves the AoA above the 1 g
+      // AoA); stiffening the gain alone removes the compensation
+      // and the jet sinks (K=8/10 broke the Su-34 hands-off test
+      // while K=6 left the F-22 high-alt dive pulling out). So the
+      // trim also integrates the NET g-load error against the
+      // flight-path lift (cos γ — 1 g level, 0.71 g in a 45-deg
+      // dive), driving the steady-state net lift to the target
+      // over ~10 s. Same gates as the P term, so it freezes (never
+      // winds up) while the pilot pulls, the jet banks, stalls,
+      // or sits on its gear. Sign: a lift shortfall (prevGLoad <
+      // gTarget) drives the integral negative, which is nose-up
+      // elevator (positive elevDeflect is nose-down).
+      const cosGamma = Math.min(1, Math.hypot(vAir.x, vAir.z) / Math.max(v, 1e-6));
+      const gTarget = Math.max(0, cosGamma);
+      this.trimInt = clamp(
+        this.trimInt + (this.prevGLoad - gTarget) * dt * TRIM_KI,
+        -elevMax,
+        elevMax,
+      );
+      elevDeflect += this.trimInt * hydroPitch;
     }
     const ailDeflect = rollIn * AIL_DEFLECT_DEG * D2R;
     const rudDeflect = -yawIn * RUD_DEFLECT_DEG * D2R;
@@ -965,6 +1034,9 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // displays the raw value (negative G reads negative, which is
     // true); the over-G check only fires on large positive G.
     const gLoad = lift / (m * G);
+    // Pass 13: remember the net g-load for the integral trim (the
+    // next step reads it as prevGLoad, one-step lag like prevCL).
+    this.prevGLoad = gLoad;
 
     // --- Spin (BET §2) as a moment ---
     // The spin is a yaw-rate state; it is applied as a PD moment

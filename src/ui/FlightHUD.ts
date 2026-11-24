@@ -43,6 +43,20 @@ export interface MinimapEntities {
 
 const R2D = 180 / Math.PI;
 
+/** Game heading → true (compass) heading, DISPLAY ONLY (pass 13,
+ *  worker E). The game's internal heading is atan2(fwd.x, fwd.z)
+ *  with north = −Z, so a right turn DECREASES it — the HUD compass
+ *  read backwards (heading fell on a right turn). True heading =
+ *  (180 − game) mod 360: game 0 (flying +Z, i.e. south) → 180,
+ *  game 90 (east) → 90, game 180 (north) → 0, game 270 (west) →
+ *  270; a right turn (game −10) reads as true +10. Internal uses
+ *  (AI headings, spawn quaternions, carrier yaw, runway dirs) stay
+ *  in game space — only displayed numbers convert, so no spawn or
+ *  AI behaviour changes. */
+export function gameToTrueHdg(gameDeg: number): number {
+  return (((180 - gameDeg) % 360) + 360) % 360;
+}
+
 /** The ROTATE cue's text (verbatim from index.html). FlightHUD owns
  *  the textContent now (pass 12): the cue used to keep its static
  *  HTML text in the DOM while hidden (opacity 0), so a DOM read saw
@@ -80,7 +94,7 @@ export class FlightHUD {
       'hudJet', 'hudSpd', 'hudAlt', 'hudVsi', 'hudHdg', 'hudCarrier', 'hudAoA', 'hudBank', 'hudG',
       'hudFuel', 'hudWpn', 'hudScore', 'hudVec', 'vecPill', 'vecRow',
       'miniKills', 'miniTraps', 'miniTime', 'warn', 'lockInd', 'pipper',
-      'ccip', 'rotateCue', 'toast', 'toastTitle', 'toastSub', 'debug',
+      'rotateCue', 'toast', 'toastTitle', 'toastSub', 'debug',
       'soundBtn', 'dmgFuse', 'dmgWing', 'dmgEng', 'dmgFuel',
     ];
     for (const id of ids) this.el[id] = document.getElementById(id);
@@ -97,7 +111,9 @@ export class FlightHUD {
     set('hudSpd', String(Math.round(spdKt(ac))));
     set('hudAlt', String(Math.round(Math.max(0, ac.pos.y) * M2FT)));
     set('hudVsi', String(Math.round(ac.vsi * M2FT * 60)));
-    const hdg = ((Math.atan2(ac.fwd().x, ac.fwd().z) * R2D) % 360 + 360) % 360;
+    const hdg = gameToTrueHdg(
+      ((Math.atan2(ac.fwd().x, ac.fwd().z) * R2D) % 360 + 360) % 360,
+    );
     set('hudHdg', String(Math.round(hdg)).padStart(3, '0') + '°');
     if (game.carrier) {
       const c = game.carrier;
@@ -311,7 +327,17 @@ export class FlightHUD {
       ctx.fillStyle = '#6ab8ff';
       ctx.save();
       ctx.translate(X(c.pos.x), Z(c.pos.z));
-      ctx.rotate(c.yaw);
+      // Pass 13 (worker E): rotate(−yaw), NOT rotate(yaw) — the old
+      // rotation was mirrored. The canvas y-axis is flipped (world
+      // +z = canvas down, north = up), so the bar's long axis lands
+      // on the screen forward direction (sin yaw, cos yaw) only with
+      // the minus: at yaw 45° (forward east+south, down-right on the
+      // map) rotate(+yaw) put the bar on the other diagonal, 90° off;
+      // rotate(−yaw) puts it down-right. The symmetric bar hides the
+      // at cardinal headings (0/90/180/270 all read the same either
+      // way), which is why it went unnoticed. The player triangle
+      // below is NOT symmetric, so it needs the explicit π−hdg.
+      ctx.rotate(-c.yaw);
       ctx.fillRect(-2, -5, 4, 10);
       ctx.restore();
     }
@@ -336,6 +362,10 @@ export class FlightHUD {
       ctx.fillStyle = '#ffffff';
       ctx.save();
       ctx.translate(X(e.player.pos.x), Z(e.player.pos.z));
+      // Already true (pass 13, worker E — verified, not changed):
+      // canvas y is flipped (north = up), so rotate(π − hdg) points
+      // the nose at the true heading — game 0 (+Z, south) → π →
+      // nose down, game 90 (east) → π/2 → nose right.
       ctx.rotate(Math.PI - hdg);
       ctx.beginPath();
       ctx.moveTo(0, -5);
@@ -350,26 +380,6 @@ export class FlightHUD {
   /** Convenience: draw with the canvas this HUD was constructed with. */
   drawMinimapDefault(e: MinimapEntities): void {
     if (this.mini) this.drawMinimap(this.mini, e);
-  }
-
-  /** Place the CCIP (bomb impact point) pipper at viewport pixel coords.
-   *  Gold normally; red when the jet is below the min-release altitude
-   *  for its dive (no room for the 4 g pull-out). Pass null to hide it. */
-  showCcip(x: number | null, y: number | null, danger = false): void {
-    const c = this.el['ccip'];
-    if (!c) return;
-    if (x === null || y === null) {
-      c.style.display = 'none';
-      return;
-    }
-    c.style.left = x + 'px';
-    c.style.top = y + 'px';
-    c.style.display = 'block';
-    c.classList.toggle('danger', danger);
-  }
-
-  hideCcip(): void {
-    this.showCcip(null, null);
   }
 
   /** Place the gold lead-pipper ring at viewport pixel coords (from
@@ -390,7 +400,11 @@ export class FlightHUD {
     this.showPipper(null, null);
   }
 
-  /** Toast banner, auto-hides after 3.2 s (template toast). */
+  /** Toast banner, auto-hides after 3.2 s (template toast). The
+   *  auto-hide also clears the title/sub text (pass 13, worker E):
+   *  the old timeout only removed the `show` class, so "FORWARD
+   *  FLIGHT" stayed in the DOM long after the banner went invisible
+   *  — the same class of bug as the ROTATE cue (pass 12). */
   toast(msg: string, sub?: string): void {
     const t = this.el['toast'];
     if (this.el['toastTitle']) this.el['toastTitle'].textContent = msg;
@@ -398,7 +412,12 @@ export class FlightHUD {
     if (!t) return;
     t.classList.add('show');
     if (this.toastTimer) clearTimeout(this.toastTimer);
-    this.toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+    this.toastTimer = setTimeout(() => {
+      t.classList.remove('show');
+      if (this.el['toastTitle']) this.el['toastTitle'].textContent = '';
+      if (this.el['toastSub']) this.el['toastSub'].textContent = '';
+      this.toastTimer = null;
+    }, 3200);
   }
 
   /** Clear every transient warning/banner (restart / respawn). The

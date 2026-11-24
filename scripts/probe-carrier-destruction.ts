@@ -110,7 +110,7 @@ async function main(): Promise<void> {
   }> => {
     const impact = { fired: false, pos: null as THREE.Vector3 | null };
     const down = { fired: false };
-    const loop = carrierLoop(1.0);
+    const loop = carrierLoop(0);
     const c = new HelicarrierController(scene, world, {
       modelGlbUri: HELICARRIER_GLB,
       deckTopSourceY: 29.78,
