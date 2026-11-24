@@ -450,7 +450,22 @@ export function buildStations(spec: AircraftSpec): Station[] {
     for (const side of [-1, 1]) {
       stations.push({
         kind: 'rollpost',
-        r: new THREE.Vector3(side * 0.45 * span, -0.3, -0.05 * L),
+        // Pass 15 (item 5): z = 0 (at the CG), NOT -0.05·L. The
+        // roll posts' thrust is a MOMENT-ONLY device in this solver
+        // (addThrust adds the moment, never the force — the force
+        // is not part of the 100% nozzle+fan thrust, or the hover
+        // would balance at 63% instead of the calibrated 94%),
+        // so a post aft of the CG applies a PHANTOM pitch moment
+        // for thrust that is never applied as a force: at vector 90
+        // the two posts pushed +74 kN·m nose-down, more than the
+        // tail's -35 kN·m nose-up authority — the nose diverged
+        // down after every deck liftoff (probe-vtol-live D2b:
+        // AoA -28 deg, G -0.40) and the 1g trim could not rotate
+        // the jet in a hands-off transition (D4: 106.7 m lost).
+        // At z = 0 the posts make no pitch moment at all, and the
+        // roll moment (r.x × F.y, ±4.8 m arms) is unchanged, so
+        // hover roll authority is identical.
+        r: new THREE.Vector3(side * 0.45 * span, -0.3, 0),
         area: 0,
         chord: 0,
         side,
@@ -637,6 +652,18 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // nose up against the ~3 deg approach law and the jet floated
     // 45 m long past the last wire (probe-deck-roll return3). In
     // clean cruise (gear up) the trim still owns the dive regime.
+    // Pass 15 (Worker A, item 1) tried 0.10 here — the same
+    // ROTATION_INTENT the controller uses — so the trim would
+    // not fight a gentle pull. Coordinator reverted it to 0.25:
+    // the 0.10 gate let a full joystick drag at 586 kt (pitchIn
+    // ~0.2, speed-crushed) run untrimmed, giving G@0.5s 6.4 vs
+    // the pass-14 3.7 (probe-roll), and the same change produced
+    // the probe-aoa-g min-G -0.09 flicker at pull initiation.
+    // The rotation fix does NOT need it: the controller's
+    // ROTATION_INTENT = 0.10 alone lets a half-drag pull rotate
+    // (probe-pass15-pull-profiles joy-late350-half climbs on all
+    // four jets with byte-identical numbers at either gate).
+    // Was 0.25 (the old v2 rotation trigger); stays 0.25.
     if (
       Math.abs(pitchIn) < 0.25 &&
       Math.abs(new THREE.Euler().setFromQuaternion(quat, 'YXZ').z) < 20 * D2R &&
@@ -896,19 +923,27 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // vector, 0% at vector 0 (covered) — the nozzle carries the rest,
     // so the TOTAL is always throttle·thrustMax (hover stays 94%).
     // Hover pitch control: pull → more fan (forward) → nose up.
-    // The pitch coefficient is 0.25 (probe-vtol 3b). The fan share
-    // is NOT scaled by the vector angle: the old
+    // The pitch coefficient was 0.25 (probe-vtol 3b), but at a
+    // full pull that put -226 kN·m nose-up on the jet (fan share
+    // 0.72, centroid +1.18 m ahead of the CG) — more than the
+    // transition pitch-rate cap could manage, so a full pull in a
+    // hover drove the nose up at the capped 20 deg/s until the
+    // jet was vertical and fell tail-first (probe-vtol §3:
+    // pitch -90 deg, AoA -121 deg), because at near-zero
+    // airspeed the AoA reads 0 and the pilot's P-loop never
+    // releases the pull. 0.10 still gives -92 kN·m at a full
+    // pull (~9 deg/s rotation, damper-limited) — a sane hover
+    // pitch response — and the roll-post phantom moment that
+    // used to mask the excess is gone (pass 15, item 5). The
+    // fan share is NOT scaled by the vector angle: the old
     // clamp(vecAngle/(π/2)) factor dragged the share (and the
-    // thrust centroid) aft as the vector dropped (0.47 → 0.37 at
-    // 70 deg), and the vertical thrust then pitched the nose down
-    // faster than the pull could counter — the transition departed
-    // nose-down to 84 deg. With the share held at 0.47 the centroid
-    // stays at the CG through the transition and the thrust has no
-    // pitch moment; the tail + the pitch term control the pitch.
-    // (At vector 0 the fan's thrust points forward like the
-    // nozzle's, so the split is moment-neutral there too.)
+    // thrust centroid) aft as the vector dropped, and the
+    // vertical thrust then pitched the nose down faster than the
+    // pull could counter. With the share held at 0.47 the
+    // centroid stays at the CG through the transition and the
+    // thrust has no pitch moment at neutral stick.
     const hoverBlend = clamp((state.vectorDeg - 45) / 45, 0, 1);
-    const fanShare = 0.47 + -pitchIn * 0.25 * hoverBlend;
+    const fanShare = 0.47 + -pitchIn * 0.1 * hoverBlend;
     const addThrust = (r: THREE.Vector3, dir: THREE.Vector3, t: number): void => {
       // Moment r × (dir·t), body frame.
       const fx = dir.x * t;
@@ -1123,10 +1158,13 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // of clamping it, so the nose cannot dwell at a high rate.
     // It is NOT q-scaled — at low speed q ≈ 0 and the aero
     // damping vanishes, which is exactly when it is needed.
-    // Active only while any vector is up and the speed is below
-    // 40 m/s (the transition zone); the pilot can still rotate
-    // to 10 deg AoA, just not run away.
-    if (hoverBlend > 0 && v < 40) {
+    // Active while any vector is up and the speed is below
+    // 40 m/s (the transition zone), and at any speed while the
+    // vector is at hover (vector >= 70): a jet hovering over a
+    // carrier flies at ~40 m/s airspeed, and the old v < 40 gate
+    // left the vectored regime undamped there (pass 15, item 5).
+    // The pilot can still rotate to 10 deg AoA, just not run away.
+    if (hoverBlend > 0 && (v < 40 || state.vectorDeg >= 70)) {
       totalMoment.x += -1.5 * inertia.ix * omega.x;
     }
 
@@ -1157,9 +1195,6 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // stable reference and drifted off level. Same PD as the curve
     // solver — in a deep hover (vector >= 70 deg, slow) the lift-fan
     // FCS holds the jet level, capped so the pilot can overpower it.
-    // Euler YXZ x > 0 = nose down, z > 0 = right bank; the correction
-    // is the opposite sign on both axes. Switches off above 25 m/s,
-    // so the transition to forward flight is the pilot's.
     // PITCH YIELDS TO THE PILOT (probe-vtol 3b): the pitch
     // correction is scaled by (1 − |pitchIn|), so a pilot who is
     // pulling to rotate to 10 deg AoA is not fought by the
@@ -1168,13 +1203,77 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // the pent-up full pull over-rotated the jet to −88 deg.
     // The roll correction is unscaled (the pilot is not rolling
     // in the transition; hands-off hover still levels the bank).
-    if (hoverBlend > 0.5 && v < 25) {
+    //
+    // Pass 15 (item 5): the gate is the VECTOR, not the airspeed.
+    // A jet hovering over a carrier flies at ~40 m/s airspeed, so
+    // the old v < 25 gate switched the leveler off the moment it
+    // left the deck — and with the 1g trim also gated on vector <
+    // 70, NOTHING held the pitch in the vectored regime: the nose
+    // diverged down, the thrust tilted forward, the jet accelerated
+    // and the AoA ran to -28 deg (probe-vtol-live D2b). The pitch
+    // target is the FLIGHT-PATH angle, not level: at 40 m/s on a
+    // deck climbing at +15 m/s the flight path is +20 deg, and a
+    // level pitch reads AoA -20 with -0.2 g of wing downforce.
+    // Holding pitch to gamma holds AoA ~0, so the wing stays
+    // neutral and the thrust margin is spent climbing. Below
+    // 10 m/s gamma is noise (the air velocity is ~0), so the
+    // target blends back to level there.
+    // The roll hold keeps the old gate (vector mostly up, slow);
+    // the pitch hold runs wider — any vector up, below 75 m/s —
+    // because the mid-transition (vector 45-65 deg, speed 20-40
+    // m/s) is exactly where the old gate left the pitch to
+    // nobody (see pitchBlend note below).
+    const rollHold =
+      hoverBlend > 0.5 && (v < 25 || state.vectorDeg >= 70);
+    const pitchHold = state.vectorDeg > 0 && v < 75;
+    if (rollHold || pitchHold) {
       const euler = new THREE.Euler().setFromQuaternion(quat, 'YXZ');
       const bank = euler.z;
       const pitch = euler.x;
-      newOmega.z += clamp(-bank * 0.8, -0.3, 0.3) * hoverBlend;
-      newOmega.x +=
-        clamp(-pitch * 0.8, -0.3, 0.3) * hoverBlend * (1 - Math.abs(pitchIn));
+      const gamma = Math.atan2(vAir.y, Math.hypot(vAir.x, vAir.z));
+      const gammaW = clamp((v - 10) / 15, 0, 1);
+      // Pass 15 (item 5): in the vectored regime the leveler must
+      // hold AoA ~10 deg once the jet is moving, not AoA 0 — the
+      // main.ts vector floor lets the nozzle down on the wing's
+      // POTENTIAL lift at 10 deg AoA, and if the FCS holds AoA 0
+      // the wing never makes that lift: vertical thrust alone
+      // falls short (sin 53 deg x 1.066 = 0.85 g) and the jet
+      // sinks ~4 m/s through the whole transition (probe-vtol-live
+      // D4: 36.8 m lost hands-off). The target ramps in with
+      // airspeed so a true hover (v < 15 m/s) still sits level.
+      const aoaTarget = (10 * D2R) * clamp((v - 15) / 20, 0, 1);
+      const pitchDes = -(gamma * gammaW + aoaTarget);
+      if (rollHold) {
+        newOmega.z += clamp(-bank * 0.8, -0.3, 0.3) * hoverBlend;
+      }
+      // The pitch yield is SHARP (pass 15): any deliberate pull past
+      // ~1/3 stick releases the leveler entirely. The old linear
+      // (1 - |pitchIn|) still fought a pilot holding AoA 10 deg in
+      // the transition with 50-80% authority — the P-loop pilot in
+      // probe-vtol §3 lost 35.7 m to it — while a hands-off stick
+      // (pitchIn 0) keeps the full hold, which is what stops the
+      // D2b nose-down divergence.
+      //
+      // The pitch hold itself does NOT switch off with the vector:
+      // it fades with AIRSPEED (pitchBlend), because in the
+      // mid-transition the vector is already down to 45-65 deg
+      // (hoverBlend 0-0.4, too weak to hold anything) while the
+      // speed is still 20-40 m/s — too slow for the wing, too
+      // slow for the 1g trim (v > 30) — and in that gap NOTHING
+      // held the pitch: the tail's nose-up trim pulled it up at
+      // ~2 deg/s while the AoA sat at ~4 deg and the jet sank
+      // 36.8 m (D4). pitchBlend is full below 45 m/s and fades
+      // out by 75 m/s, where the wing flies the jet.
+      if (pitchHold) {
+        const pitchBlend = Math.max(
+          hoverBlend,
+          clamp((75 - v) / 30, 0, 1),
+        );
+        newOmega.x +=
+          clamp((pitchDes - pitch) * 0.8, -0.3, 0.3) *
+          pitchBlend *
+          Math.max(0, 1 - 3 * Math.abs(pitchIn));
+      }
     }
 
     // Transition pitch-rate cap (BET promotion, probe-vtol 3b):
@@ -1184,8 +1283,10 @@ export class BladeElementSolver implements IAerodynamicsSolver {
     // stop it. This caps the pitch rate at ±20 deg/s while any
     // vector is up (hoverBlend > 0) and the speed is below 40 m/s
     // — a RATE cap only, no leveling. Above 40 m/s the wing and
-    // tail have authority and the cap lifts.
-    if (hoverBlend > 0 && v < 40) {
+    // tail have authority and the cap lifts — except at hover
+    // vector (>= 70), where the wing is not flying the jet and
+    // the cap stays on at any speed (pass 15, item 5).
+    if (hoverBlend > 0 && (v < 40 || state.vectorDeg >= 70)) {
       newOmega.x = clamp(newOmega.x, -0.35, 0.35);
     }
 

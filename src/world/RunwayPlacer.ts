@@ -10,6 +10,7 @@
 // exclusion and as the flattenAt() query.
 
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { RUNWAY_TABLE, runwayBlend } from './PandoraTerrainWorker';
 
 export interface Runway {
@@ -138,35 +139,81 @@ export class RunwayPlacer {
       g.add(strip);
 
       // Centreline dashes ALONG the runway (local +X), not across it.
+      // Pass 15 (worker F, item 10): the strips were 143 draw calls
+      // for 4,346 tris — 71 visible from the Alpha deck, 49 from
+      // 3,000 m (one runway alone) — because every dash, edge light
+      // and approach bar was its own mesh. Same geometry, same
+      // materials, merged per material into one mesh each: 5 calls
+      // per runway (strip + dashes + green lights + red lights +
+      // approach bars) instead of 45-49. The merge is visual-only:
+      // the strip mesh, group position/rotation and materials are
+      // unchanged, and mergeGeometries needs identical attributes
+      // (position/normal/uv, all indexed) — true for PlaneGeometry
+      // and SphereGeometry alike.
       const dashMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-      for (let d = -r.len / 2 + 30; d < r.len / 2 - 10; d += 40) {
-        const dash = new THREE.Mesh(new THREE.PlaneGeometry(18, 2.4), dashMat);
-        dash.rotation.x = -Math.PI / 2;
-        dash.position.set(d, 0.55, 0);
-        g.add(dash);
-      }
-
-      // Edge lights: green on local -Z, red on local +Z, every 55 m.
       const lightMatG = new THREE.MeshBasicMaterial({ color: 0x7dff8a });
       const lightMatR = new THREE.MeshBasicMaterial({ color: 0xff5a5a });
+      const appMat = new THREE.MeshBasicMaterial({ color: 0xfff2b0 });
+      const dashGeos: THREE.BufferGeometry[] = [];
+      for (let d = -r.len / 2 + 30; d < r.len / 2 - 10; d += 40) {
+        const dash = new THREE.PlaneGeometry(18, 2.4);
+        dash.applyMatrix4(
+          new THREE.Matrix4()
+            .makeRotationX(-Math.PI / 2)
+            .setPosition(d, 0.55, 0),
+        );
+        dashGeos.push(dash);
+      }
+      const dashes = new THREE.Mesh(
+        mergeGeometries(dashGeos, false)!,
+        dashMat,
+      );
+      for (const dg of dashGeos) dg.dispose();
+      g.add(dashes);
+
+      // Edge lights: green on local -Z, red on local +Z, every 55 m.
+      // Merged per colour (two meshes, not ~24).
+      const lightGeos: Record<'g' | 'r', THREE.BufferGeometry[]> = {
+        g: [],
+        r: [],
+      };
       for (let s = -1; s <= 1; s += 2) {
         for (let d = -r.len / 2; d <= r.len / 2; d += 55) {
-          const l = new THREE.Mesh(new THREE.SphereGeometry(1.6, 6, 6), s < 0 ? lightMatG : lightMatR);
-          l.position.set(d, 0.8, s * (r.width / 2 + 3));
-          g.add(l);
+          const l = new THREE.SphereGeometry(1.6, 6, 6);
+          l.applyMatrix4(
+            new THREE.Matrix4().setPosition(d, 0.8, s * (r.width / 2 + 3)),
+          );
+          lightGeos[s < 0 ? 'g' : 'r'].push(l);
         }
+      }
+      for (const key of ['g', 'r'] as const) {
+        const merged = new THREE.Mesh(
+          mergeGeometries(lightGeos[key], false)!,
+          key === 'g' ? lightMatG : lightMatR,
+        );
+        for (const lg of lightGeos[key]) lg.dispose();
+        g.add(merged);
       }
 
-      // Approach lights: 4 white bars before each threshold.
-      const appMat = new THREE.MeshBasicMaterial({ color: 0xfff2b0 });
+      // Approach lights: 4 white bars before each threshold, merged.
+      const appGeos: THREE.BufferGeometry[] = [];
       for (const end of [-1, 1]) {
         for (let k = 1; k <= 4; k++) {
-          const a = new THREE.Mesh(new THREE.PlaneGeometry(2, 14), appMat);
-          a.rotation.x = -Math.PI / 2;
-          a.position.set(end * (r.len / 2 + k * 28), 0.6, 0);
-          g.add(a);
+          const a = new THREE.PlaneGeometry(2, 14);
+          a.applyMatrix4(
+            new THREE.Matrix4()
+              .makeRotationX(-Math.PI / 2)
+              .setPosition(end * (r.len / 2 + k * 28), 0.6, 0),
+          );
+          appGeos.push(a);
         }
       }
+      const approach = new THREE.Mesh(
+        mergeGeometries(appGeos, false)!,
+        appMat,
+      );
+      for (const ag of appGeos) ag.dispose();
+      g.add(approach);
 
       g.position.set(r.x, elev, r.z);
       g.rotation.y = (r.hdg - 90) * D2R;

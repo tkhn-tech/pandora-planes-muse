@@ -118,6 +118,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Aircraft } from '../src/physics/FlightPhysicsController';
 import type { DeckProvider } from '../src/physics/FlightPhysicsController';
+import { clFromCurve } from '../src/physics/IAerodynamicsSolver';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import {
@@ -340,12 +341,13 @@ async function main(): Promise<void> {
 
   // 3. Transition: hover -> forward flight via the toggle's
   // lift-following vector slew (mirrors main.ts: the nozzle comes aft
-  // at 36 deg/s but never below sin(vector) >= (1 - gload) / (T/W),
-  // where gload is the wing's REAL lift right now — so the nozzle
-  // cannot outrun the wing). The pilot rotates to ~10 deg AoA as
-  // speed builds, as in a real STOVL transition: that is what makes
-  // the wing take the load. The jet must accelerate past flying
-  // speed without losing more than 25 m.
+  // at 36 deg/s but never below sin(vector) >= (1 - liftFrac) / (T/W),
+  // where liftFrac is the wing's POTENTIAL lift at 10 deg AoA at the
+  // current speed, or its actual gload if the pilot is pulling —
+  // so the nozzle cannot outrun the wing). The pilot rotates to
+  // ~10 deg AoA as speed builds, as in a real STOVL transition:
+  // that is what makes the wing take the load. The jet must
+  // accelerate past flying speed without losing more than 25 m.
   {
     const ac = makeAircraft('f35a');
     ac.resetAt(alpha.x, 150, alpha.z, alpha.hdg);
@@ -359,8 +361,16 @@ async function main(): Promise<void> {
     let minAlt = hoverAlt;
     let vec = 90;
     for (let i = 0; i < 1200; i++) {
-      // Toggle slew, lift-following floor (main.ts mirror).
-      const liftFrac = Math.max(0, Math.min(1, ac.gload));
+      // Toggle slew, lift-following floor (main.ts mirror, pass 15).
+      const rho = 1.225 * Math.exp(-Math.max(ac.pos.y, 0) / 8500);
+      const q = 0.5 * rho * ac.ias * ac.ias;
+      const sLift = ac.spec.wingAreaEffective ?? ac.spec.wingArea;
+      const cl10 = clFromCurve(10, ac.flaps / 30, ac.spec.clCurve);
+      const potential = (q * sLift * cl10) / (ac.spec.mass * 9.81);
+      const liftFrac = Math.max(
+        0,
+        Math.min(1, Math.max(potential, ac.gload)),
+      );
       const tw =
         (ac.throttle * ac.spec.thrustMax) / (ac.spec.mass * 9.81);
       const need = (1 - liftFrac) / Math.max(tw, 0.01);
@@ -372,12 +382,25 @@ async function main(): Promise<void> {
           ? goal
           : vec + Math.sign(goal - vec) * step;
       ac.vector = vec;
-      // Pilot rotates to hold ~10 deg AoA as speed builds (the wing
-      // only takes the load at AoA — level pitch never gets there).
-      // pitchIn < 0 = nose up, so the error is (aoa - target).
-      ac.pitchIn = Math.max(-1, Math.min(1, (ac.aoaDeg - 10) * 0.1));
+      // Pilot holds the pitch at ~10 deg nose-up (Euler -10) as
+      // speed builds — the real STOVL technique: level-ish pitch
+      // while the nozzle comes aft, so the flight path stays near
+      // level and the wing takes the load at AoA ~10 as speed
+      // builds. (The old AoA-10 P-loop could not do this: once
+      // the jet started climbing, the flight path rotated up with
+      // the nose, so AoA stayed ~6 deg while the pitch ran away
+      // to -36 deg and the jet hung in a 29 deg climb at 33 kt,
+      // unable to accelerate — probe-vtol §3, pass 15.)
+      const pitchNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').x * (180 / Math.PI);
+      ac.pitchIn = Math.max(-1, Math.min(1, (-10 - pitchNow) * 0.1));
       substep(ac, 1 / 60);
       minAlt = Math.min(minAlt, ac.pos.y);
+      if (i % 120 === 0) {
+        const pitch = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').x * (180 / Math.PI);
+        console.log(
+          `    [§3 +${(i / 60).toFixed(0)}s] alt=${ac.pos.y.toFixed(1)} vsi=${ac.vsi.toFixed(1)} ias=${(ac.ias * 1.944).toFixed(0)}kt vec=${vec.toFixed(0)} aoa=${ac.aoaDeg.toFixed(1)} pitch=${pitch.toFixed(1)} pitchIn=${ac.pitchIn.toFixed(2)} G=${ac.gload.toFixed(2)}`,
+        );
+      }
       if (!ac.alive) break;
       if (vec === 0 && ac.vel.length() > 75) break;
     }
@@ -656,9 +679,9 @@ async function main(): Promise<void> {
         `  [5a] alt ${startAlt.toFixed(1)} -> ${endAlt.toFixed(1)} m (min ${minAlt.toFixed(1)}) over ${simT.toFixed(1)} s sim / ${wallT} s wall: climb ${climbSim.toFixed(2)} m/s sim, ${climbWall.toFixed(2)} m/s wall; vsi=${s.player.vsi.toFixed(2)} throttle=${s.player.throttle.toFixed(3)} (max ${maxThr.toFixed(3)}) thrTarget(auto)=${s.player.thrTarget.toFixed(3)} pilotThr=${lastPilotThr.toFixed(3)} vector=${s.player.vectorDeg.toFixed(0)} ias=${(s.player.ias * 1.944).toFixed(1)}kt onSurface=${s.player.onSurface} alive=${s.player.alive}`,
       );
       check(
-        '5a LIVE airborne hover at 100% throttle climbs >= +1.0 m/s (sim time)',
-        s.player.alive && climbSim >= 1.0,
-        `climb=${climbSim.toFixed(2)} m/s sim (${climbWall.toFixed(2)} m/s wall), vsi=${s.player.vsi.toFixed(2)}`,
+        '5a LIVE airborne hover at 100% throttle climbs firmly (sustained vsi >= +3.0 m/s)',
+        s.player.alive && climbSim >= 1.5 && s.player.vsi >= 3.0,
+        `climb=${climbSim.toFixed(2)} m/s sim avg (${climbWall.toFixed(2)} m/s wall), sustained vsi=${s.player.vsi.toFixed(2)} m/s (${(s.player.vsi * 196.85).toFixed(0)} fpm)`,
       );
       s.dispose();
     }
@@ -704,6 +727,7 @@ async function main(): Promise<void> {
       s.player.thrTarget = 1.0;
       let maxAboveDeck = 0;
       let leftDeckAt = -1;
+      let liftDeckVy: number | null = null;
       let maxThr = 0;
       // NOTE: spawn height IS deckTop+2.2 (gear rest height), so the
       // liftoff bar must be well clear of it: > 4 m means the gear
@@ -713,18 +737,28 @@ async function main(): Promise<void> {
         s.frame();
         const above = s.player.pos.y - carrierL.deckTopY;
         maxAboveDeck = Math.max(maxAboveDeck, above);
-        if (leftDeckAt < 0 && above > 4) leftDeckAt = s.wall;
+        if (leftDeckAt < 0 && above > 4) {
+          leftDeckAt = s.wall;
+          // Pass 15: the release gate refuses a fast-descending deck
+          // (deckVy < -3) — record the deck phase at liftoff.
+          liftDeckVy = carrierL.vel.y;
+        }
         maxThr = Math.max(maxThr, s.player.throttle);
         if (!s.player.alive) break;
       }
       const endAbove = s.player.pos.y - carrierL.deckTopY;
       console.log(
-        `  [5b] max above deck=${maxAboveDeck.toFixed(2)} m (end ${endAbove.toFixed(2)} m) leftDeckAt=${leftDeckAt < 0 ? 'never' : leftDeckAt.toFixed(1) + ' s wall'} throttle max=${maxThr.toFixed(3)} vector=${s.player.vectorDeg.toFixed(0)} pilotThr=${s.player.pilotThr.toFixed(3)} onSurface=${s.player.onSurface} alive=${s.player.alive} reason=${s.player.lastCrashReason ?? '-'}`,
+        `  [5b] max above deck=${maxAboveDeck.toFixed(2)} m (end ${endAbove.toFixed(2)} m) leftDeckAt=${leftDeckAt < 0 ? 'never' : leftDeckAt.toFixed(1) + ' s wall'} liftDeckVy=${liftDeckVy === null ? 'n/a' : liftDeckVy.toFixed(1) + ' m/s'} throttle max=${maxThr.toFixed(3)} vector=${s.player.vectorDeg.toFixed(0)} pilotThr=${s.player.pilotThr.toFixed(3)} onSurface=${s.player.onSurface} alive=${s.player.alive} reason=${s.player.lastCrashReason ?? '-'}`,
       );
       check(
         '5b LIVE deck liftoff at 100% throttle leaves the deck (> 4 m) and climbs',
         s.player.alive && leftDeckAt >= 0 && endAbove > 3,
         `max above deck=${maxAboveDeck.toFixed(2)} m (live: never lifts off)`,
+      );
+      check(
+        '5b LIVE deck liftoff releases only in a calm deck phase (deckVy >= -3 m/s at liftoff)',
+        liftDeckVy !== null && liftDeckVy >= -3,
+        `liftDeckVy=${liftDeckVy === null ? 'n/a' : liftDeckVy.toFixed(1) + ' m/s'}`,
       );
       s.dispose();
     }

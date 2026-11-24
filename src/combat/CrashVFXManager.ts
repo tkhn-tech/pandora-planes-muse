@@ -72,6 +72,83 @@ function radialTexture(stops: [number, string][]): THREE.CanvasTexture {
   return new THREE.CanvasTexture(c);
 }
 
+/** Torn wreckage panel (pass 15, worker F, item 8): a BoxGeometry
+ *  IS a rectangular slab — flat top face, rectangular footprint,
+ *  and a Rapier cuboid that settles on its largest face, so every
+ *  piece lay flat and read as a dark rectangle from the chase
+ *  camera above (the live "black/grey slabs at every crash site").
+ *  A torn panel is instead tapered (narrow end 55-75% of the wide
+ *  end), jittered (shared vertices move together, keyed by
+ *  position, so the faces do not crack apart) and folded 15-30 deg
+ *  at mid-length, so no face is flat, no outline is rectangular,
+ *  and the piece cannot lie flat. The geometry is re-centred on
+ *  its own bounding box (the debris mesh is synced straight from
+ *  its Rapier body, so a non-centred geometry would sit offset
+ *  from its collider) and the returned half-extents are the
+ *  post-deformation bounding box — the collider wraps the bent
+ *  panel, not the flat box it started as. */
+function tornPanelGeometry(
+  w: number,
+  t: number,
+  l: number,
+): { geometry: THREE.BufferGeometry; half: THREE.Vector3 } {
+  const geo = new THREE.BoxGeometry(w, t, l, 3, 1, 4);
+  const p = geo.getAttribute('position') as THREE.BufferAttribute;
+  const fold = ((15 + Math.random() * 15) * Math.PI) / 180;
+  const taper = 0.25 + Math.random() * 0.2;
+  const cosF = Math.cos(fold);
+  const sinF = Math.sin(fold);
+  // One jitter offset per distinct vertex POSITION (BoxGeometry
+  // duplicates vertices across faces — jittering per index would
+  // split the seams and leave see-through cracks).
+  const jitter = new Map<string, { x: number; y: number; z: number }>();
+  const jFor = (x: number, y: number, z: number): { x: number; y: number; z: number } => {
+    const key = `${x.toFixed(3)},${y.toFixed(3)},${z.toFixed(3)}`;
+    let j = jitter.get(key);
+    if (!j) {
+      j = {
+        x: (Math.random() - 0.5) * w * 0.06,
+        y: (Math.random() - 0.5) * t * 0.9,
+        z: (Math.random() - 0.5) * l * 0.03,
+      };
+      jitter.set(key, j);
+    }
+    return j;
+  };
+  const v = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    v.set(p.getX(i), p.getY(i), p.getZ(i));
+    const s = v.z / l + 0.5; // 0 at the -z end, 1 at the +z end
+    v.x *= 1 - taper * s;
+    const j = jFor(p.getX(i), p.getY(i), p.getZ(i));
+    v.x += j.x;
+    v.y += j.y;
+    v.z += j.z;
+    // Fold the +z half UP around the X axis at z = 0.
+    if (v.z > 0) {
+      const y2 = v.y * cosF + v.z * sinF;
+      const z2 = -v.y * sinF + v.z * cosF;
+      v.y = y2;
+      v.z = z2;
+    }
+    p.setXYZ(i, v.x, v.y, v.z);
+  }
+  geo.computeVertexNormals();
+  // The vertex data is no longer a box — label it honestly, so a
+  // later geometry-type check (or a reader) does not mistake a torn
+  // panel for a rectangular slab. (type is readonly in three's
+  // typings — a runtime instance property, so the cast is safe.)
+  (geo as unknown as { type: string }).type = 'TornPanelGeometry';
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox!;
+  const centre = new THREE.Vector3();
+  bb.getCenter(centre);
+  const size = new THREE.Vector3();
+  bb.getSize(size);
+  geo.translate(-centre.x, -centre.y, -centre.z);
+  return { geometry: geo, half: size.multiplyScalar(0.5) };
+}
+
 const BOOM_STOPS: [number, string][] = [
   [0, 'rgba(255,255,220,1)'],
   [0.35, 'rgba(255,140,40,0.9)'],
@@ -358,13 +435,27 @@ export class CrashVFXManager {
     if (segment) {
       mesh = segment;
       if (mesh.parent) mesh.parent.remove(mesh);
+      // Pass 15 (worker F, item 8): a torn wing/tail fallback is a
+      // flat BoxGeometry (F-22: 6.1 x 0.3 x 4.2 m) — the single
+      // biggest slab in the debris field. Reshape it into a torn
+      // panel (same bounding size, same name) before the collider
+      // is sized. A real GLB node is not a box and is left alone.
+      const segMesh = mesh as THREE.Mesh;
+      if (segMesh.isMesh && (segMesh.geometry as THREE.BufferGeometry)?.type === 'BoxGeometry') {
+        const sb = new THREE.Box3().setFromObject(mesh);
+        const ss = new THREE.Vector3();
+        sb.getSize(ss);
+        const torn = tornPanelGeometry(ss.x, ss.y, ss.z);
+        segMesh.geometry.dispose();
+        segMesh.geometry = torn.geometry;
+        half = torn.half;
+      } else {
+        const box = new THREE.Box3().setFromObject(mesh);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        half = size.multiplyScalar(0.5);
+      }
       const box = new THREE.Box3().setFromObject(mesh);
-      const size = new THREE.Vector3();
-      box.getSize(size);
-      half = size.multiplyScalar(0.5);
-      half.x = Math.max(half.x, 0.25);
-      half.y = Math.max(half.y, 0.25);
-      half.z = Math.max(half.z, 0.25);
       // Re-centre the mesh on its own origin so the body tracks it cleanly.
       const centre = new THREE.Vector3();
       box.getCenter(centre);
@@ -381,20 +472,31 @@ export class CrashVFXManager {
       // Pass 14 (worker D): two shapes — torn skin panels (wide,
       // thin) and chunky fragments — so the field does not read as
       // four same-sized boxes.
+      // Pass 15 (worker F, item 8): the pieces were still
+      // BoxGeometry boxes (flat top, rectangular footprint, lying
+      // flat on their largest face) — the live "black/grey slabs".
+      // Every piece is now a torn panel: tapered, jittered and
+      // folded, so no face is flat and no outline is rectangular.
       const panel = Math.random() < 0.5;
       const len = panel ? 3 + Math.random() * 2.5 : 2.5 + Math.random() * 2.5;
       const thick = panel ? 0.12 + Math.random() * 0.2 : 0.3 + Math.random() * 0.6;
       const wid = panel ? 1.8 + Math.random() * 1.6 : 1.2 + Math.random() * 1.6;
+      const torn = tornPanelGeometry(wid, thick, len);
       mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(wid, thick, len),
+        torn.geometry,
         new THREE.MeshLambertMaterial({
           color: CHARRED_COLORS[
             Math.floor(Math.random() * CHARRED_COLORS.length)
           ]!,
         }),
       );
-      half = new THREE.Vector3(wid / 2, thick / 2, len / 2);
+      half = torn.half;
     }
+    // A degenerate half-extent (a paper-thin GLB segment) makes a
+    // useless Rapier cuboid — floor it, as the old code did.
+    half.x = Math.max(half.x, 0.25);
+    half.y = Math.max(half.y, 0.25);
+    half.z = Math.max(half.z, 0.25);
     mesh.position.copy(pos);
     mesh.position.y += 0.5;
     this.scene.add(mesh);

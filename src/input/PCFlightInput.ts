@@ -111,6 +111,48 @@ const ROLL_SLEW_DOWN = 3;
  *  units). Bounds the tap impulse at low FPS: without it a 250 ms
  *  frame slews 8 * 0.1 = 0.8 in one call. */
 const ROLL_SLEW_STEP_MAX = 0.4;
+/** TOTAL sim-held time of a tap, in seconds of simulation
+ *  (pass 15, item 2). A real 100 ms tap at 4 fps lands entirely
+ *  BETWEEN two frames (frame period ~250 ms): keydown + keyup
+ *  both arrive before the next frame's substeps, so the `pressed`
+ *  latch made the key "held" for exactly ONE getControls() call
+ *  — one 0.05 s substep — and the stick moved 0.4 (roll) / 0.15
+ *  (pitch, PITCH_SLEW 3/s) and was already back to ~0 by the end
+ *  of the same frame (measured, probe-pass15 T1/T3: in-frame tap
+ *  peakRollIn 0.21 @223 kt / 0.06 @776 kt, stick integral 0.021 /
+ *  0.006 stick-s, bank 1.1 / 1.8 deg, and peakPitchIn 0.00 — the
+ *  pitch tap never reached the physics for more than one substep
+ *  at 0.15 deflection). Pass 14's probe never saw it because it
+ *  fired keydown in one frame and keyup in the next, holding the
+ *  key across a whole frame's substeps (stick integral 6x larger,
+ *  bank 5.4 / 7.3 deg). At 60 fps the same in-frame tap is just
+ *  as dead (peak bank 0.1 deg) — the latch is consumed after one
+ *  call at any frame rate. The fix normalises the tap to SIM time:
+ *  the key counts as held for TAP_MIN_SIM seconds of sim IN TOTAL
+ *  — the sim time it was physically down (heldSim, tracked in
+ *  getControls) PLUS the tap-hold tail on release — so a tap
+ *  slews the stick for the same sim duration at 4 fps and at
+ *  60 fps, in-frame or straddling (roll reaches full deflection
+ *  in 0.10 s at 10/s). A straddling tap must NOT get the full
+ *  tail on top of its real hold: the first version did exactly
+ *  that, and the straddle taps banked 14.6-17.8 deg, breaking
+ *  probe-roll's and probe-pass14's 12 deg bars (measured) — the
+ *  tail is only the REMAINDER to 0.12 s sim. The drain runs on
+ *  the sim dt getControls() is called with, so the hold is
+ *  frame-rate independent by construction. */
+const TAP_MIN_SIM = 0.12;
+/** A key press counts as a TAP (and arms the tap-hold above) when
+ *  the key was down for at most this long in WALL time. A 100 ms
+ *  tap at 4 fps is ~100 ms wall; a straddling tap ~170 ms. A
+ *  deliberate hold (seconds) must NOT arm the hold: the hold
+ *  already delivered its input, and a 0.12 s sim tail at FULL
+ *  deflection after every hold release measurably extends the
+ *  hold (probe-pass15 T5: a 1 s ArrowDown hold travelled a
+ *  further +27 deg after release with the hold armed, vs -4 deg
+ *  — recovering — for the direct-step control with the input cut
+ *  instantly). The wall clock is the right measure here: a tap
+ *  is a wall-time human gesture, and 250 ms is one slow frame. */
+const TAP_MAX_WALL_MS = 250;
 /** Keyboard roll authority vs indicated airspeed, pass 13 worker B.
  *  1.0 at/below 200 kt, falling as 200/ias above it, floored at 0.15.
  *  The 200 kt reference (not 150) is deliberate: the tap impulse is
@@ -128,13 +170,32 @@ export function kbRollScale(iasKt: number): number {
   if (!Number.isFinite(iasKt) || iasKt <= 200) return 1;
   return Math.max(0.15, Math.min(1, 200 / iasKt));
 }
-/** Keyboard PITCH slew rate (per second) — slower than roll (live
- *  finding 8): one ArrowUp tap at 5/s swung the vertical speed by
- *  5,000-13,000 fpm and the pitch persisted (enough to loop/stall),
- *  because the curve solver is a pure rate command (55 deg/s) with no
- *  damping. 3/s for pitch keeps a tap from over-rotating while a held
- *  pull still rotates the jet for takeoff. Roll stays at 5/s. */
-const PITCH_SLEW = 3;
+/** Keyboard PITCH slew rates (per second) — pass 15, item 2.
+ *  UP 5/s (was a symmetric 3/s), DOWN (return to centre) 2.5/s,
+ *  mirroring the roll slew's fast-up / slow-down shape. At 3/s a
+ *  100 ms tap (0.12 s of sim under the tap-hold) only reached
+ *  pitchIn 0.36, and most of its ramp sat BELOW the BET 1g-trim
+ *  gate (|pitchIn| < 0.25), so the trim fought the tap while it
+ *  was still ramping: measured, probe-pass15 T3, the ArrowDown
+ *  tap moved the pitch 0.0 deg (the ArrowUp tap 1.4 deg, VSI
+ *  +216 fpm — the live "tap does nothing" complaint in
+ *  miniature). At 5/s the first substep already reaches 0.25 —
+ *  the trim gate is off from the first substep — and the tap
+ *  peaks at 0.50-0.60. The slow 2.5/s return stretches the
+ *  tap's tail (the pitch rate has a ~0.2 s lag, so a triangular
+ *  0.12 s tap builds less pitch rate than a rectangular step of
+ *  the same integral — the direct-step probe T3b) without
+ *  touching a hold's peak: a held pull still reaches full
+ *  deflection in 0.2 s of sim. This is NOT the old 5/s failure
+ *  (live finding 8: a tap swung the VSI 5,000-13,000 fpm): that
+ *  one slewed on the WALL clock, so the tap jumped the stick to
+ *  full deflection in ONE call; the sim-time slew ramps over
+ *  0.12 s of sim, and the BET pitch response at 265 kt is ~9
+ *  deg/s at full pull (probe-pass15 T3b), so a tap peaks at a
+ *  few degrees and a held pull still rotates for takeoff without
+ *  looping. Verified by T3 (tap transients) and T5 (hold release). */
+const PITCH_SLEW_UP = 5;
+const PITCH_SLEW_DOWN = 2.5;
 
 const DEADZONE = 0.12;
 
@@ -173,6 +234,19 @@ export class PCFlightInput implements IFlightInputProvider {
    *  repeats but a tap steps exactly once. */
   private lastFlapUpMs = -1e9;
   private lastFlapDownMs = -1e9;
+  /** Remaining SIM seconds each released held-key still counts as
+   *  held (pass 15, item 2 — TAP_MIN_SIM, minus the sim time the
+   *  key was already down). Drained by the sim dt in getControls();
+   *  set by onKeyUp. */
+  private readonly tapHoldSim = new Map<string, number>();
+  /** SIM seconds each held-key has been physically down, counted
+   *  in getControls() while keys.has(code) (pass 15, item 2). On
+   *  release the tap-hold is only the remainder to TAP_MIN_SIM,
+   *  so a straddling tap is not stronger than an in-frame one. */
+  private readonly heldSim = new Map<string, number>();
+  /** Wall-clock keydown time (performance.now() ms) per held-key,
+   *  so onKeyUp can tell a tap from a hold (TAP_MAX_WALL_MS). */
+  private readonly keyDownMs = new Map<string, number>();
 
   // Mouse yoke: drag on the canvas steers in chase/cockpit cam (template
   // ~1750); in free-orbit the same drag orbits (main.ts owns that path).
@@ -252,6 +326,9 @@ export class PCFlightInput implements IFlightInputProvider {
     this.yoke.dy = 0;
     this.kbPitch = 0;
     this.kbRoll = 0;
+    this.tapHoldSim.clear();
+    this.heldSim.clear();
+    this.keyDownMs.clear();
   }
 
   get gamepadName(): string {
@@ -283,8 +360,29 @@ export class PCFlightInput implements IFlightInputProvider {
     // a tap still moves the stick / throttle by the frame's slew.
     // Single-shot edge keys are NOT consumed here — consumeEvents()
     // owns them.
+    // Pass 15 (item 2): the `pressed` latch alone held a tap for
+    // ONE getControls call (see TAP_MIN_SIM) — at 4 fps that is one
+    // 0.05 s substep, so the stick barely moved. A released key
+    // therefore also counts as held while its tap-hold sim time
+    // remains; the hold drains by the sim dt of each call, so the
+    // tap's stick-time is the same at 4 fps and at 60 fps.
+    for (const [code, remain] of this.tapHoldSim) {
+      const next = remain - dt;
+      if (next <= 0) this.tapHoldSim.delete(code);
+      else this.tapHoldSim.set(code, next);
+    }
+    // Pass 15 (item 2): count the sim time each held-key has been
+    // physically down, so onKeyUp can top a tap up to TAP_MIN_SIM
+    // total instead of adding a full tail on top of a real hold.
+    for (const code of PCFlightInput.TAP_HOLD_CODES) {
+      if (this.keys.has(code)) {
+        this.heldSim.set(code, (this.heldSim.get(code) ?? 0) + dt);
+      }
+    }
     const held = (code: string): boolean =>
-      this.keys.has(code) || this.pressed.has(code);
+      this.keys.has(code) ||
+      this.pressed.has(code) ||
+      (this.tapHoldSim.get(code) ?? 0) > 0;
 
     // Base: gamepad wins, else mouse yoke, else zero (keyboard adds below).
     let px = 0;
@@ -335,7 +433,15 @@ export class PCFlightInput implements IFlightInputProvider {
       const rising = Math.abs(target) > Math.abs(cur);
       return slew(cur, target, rising ? ROLL_SLEW_UP : ROLL_SLEW_DOWN);
     };
-    this.kbPitch = slew(this.kbPitch, clamp(kbPitchTarget, -1, 1), PITCH_SLEW);
+    // Pitch slews asymmetrically like roll (pass 15, item 2): fast
+    // toward the held key, slow back to centre — the slow tail is
+    // what makes a tap visible against the pitch-rate lag and the
+    // 1g trim (see PITCH_SLEW_UP / PITCH_SLEW_DOWN).
+    const slewPitch = (cur: number, target: number): number => {
+      const rising = Math.abs(target) > Math.abs(cur);
+      return slew(cur, target, rising ? PITCH_SLEW_UP : PITCH_SLEW_DOWN);
+    };
+    this.kbPitch = slewPitch(this.kbPitch, clamp(kbPitchTarget, -1, 1));
     this.kbRoll = slewRoll(this.kbRoll, clamp(kbRollTarget, -1, 1));
     // Speed-scaled keyboard roll (pass 13): the slewed stick is
     // multiplied by kbRollScale(ias) BEFORE shaping, so at high
@@ -473,9 +579,47 @@ export class PCFlightInput implements IFlightInputProvider {
     // frame must still reach consumeEvents() even if keyup already
     // removed the code from `keys`.
     this.pressed.add(e.code);
+    // Pass 15 (item 2): record the press time so onKeyUp can tell
+    // a tap from a hold (TAP_MAX_WALL_MS).
+    this.keyDownMs.set(e.code, performance.now());
   };
 
+  /** Held keys whose release starts a tap-hold (pass 15, item 2):
+   *  the stick/throttle keys getControls() reads as held. Edge keys
+   *  (M/F/G/...) are single-shot and are NOT here. */
+  private static readonly TAP_HOLD_CODES = new Set([
+    'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD',
+    'KeyQ', 'KeyE', 'KeyW', 'KeyS', 'ShiftLeft', 'ShiftRight',
+    'ControlLeft', 'ControlRight',
+  ]);
+
   private readonly onKeyUp = (e: KeyboardEvent): void => {
+    // Pass 15 (item 2): a tap that ends here must keep moving the
+    // stick for the REMAINDER to TAP_MIN_SIM seconds of sim in
+    // total (see the constant) — the key was genuinely down until
+    // now, and at 4 fps the next frame's substeps are the only
+    // place the sim can feel it.
+    // Only arm the hold if the key was actually down (a stray
+    // keyup with no keydown arms nothing) AND the press was a tap
+    // (down for <= TAP_MAX_WALL_MS): a long hold must not get a
+    // full-deflection tail on release (see TAP_MAX_WALL_MS).
+    const downMs = this.keyDownMs.get(e.code);
+    this.keyDownMs.delete(e.code);
+    // The tap-hold tops the tap up to TAP_MIN_SIM seconds of sim
+    // IN TOTAL (see the constant): a key already down for
+    // TAP_MIN_SIM or more gets no tail at all.
+    const alreadyHeldSim = this.heldSim.get(e.code) ?? 0;
+    this.heldSim.delete(e.code);
+    const remainder = TAP_MIN_SIM - alreadyHeldSim;
+    if (
+      PCFlightInput.TAP_HOLD_CODES.has(e.code) &&
+      (this.keys.has(e.code) || this.pressed.has(e.code)) &&
+      downMs !== undefined &&
+      performance.now() - downMs <= TAP_MAX_WALL_MS &&
+      remainder > 0
+    ) {
+      this.tapHoldSim.set(e.code, remainder);
+    }
     this.keys.delete(e.code);
   };
 

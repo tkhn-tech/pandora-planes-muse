@@ -318,7 +318,20 @@ async function main(): Promise<void> {
       const av = d.body.angvel();
       const gh = heightAt(p.x, p.z);
       if (p.y < gh - 0.5) belowGround++;
-      if (p.y - gh < 1 && Math.abs(lv.y) < 2) resting++;
+      // Pass 15 coordinator: a piece counts as resting when it is
+      // SETTLED (no linear/angular motion) within 3 m of the
+      // ground. The old bar (centre < 1 m above ground) assumed
+      // the pass-13 flat boxes; the pass-15 folded torn panels
+      // legitimately rest ON the wreck (centre 1–2.4 m up, bottom
+      // on the fuselage/wing) and a folded panel's centre sits
+      // ~0.8 m up even on flat ground. A floating piece cannot
+      // satisfy this — with no contact, gravity makes |lv| grow,
+      // so settled + low is a real rest, on the ground or on the
+      // wreck. (4/4 runs pre-fix: rest 2–5/6, worst settled at
+      // h=1.04–2.37 m, vy=spd=ang=0.)
+      const spd = Math.hypot(lv.x, lv.y, lv.z);
+      const ang = Math.hypot(av.x, av.y, av.z);
+      if (p.y - gh < 3 && Math.abs(lv.y) < 2 && spd < 1 && ang < 1) resting++;
       const h = p.y - gh;
       if (h > worstH) {
         worstH = h;
@@ -360,7 +373,7 @@ async function main(): Promise<void> {
   console.log(`piece distances from the wreck at +75 s: [${at(75).dists.map((d) => d.toFixed(0)).join(', ')}] m`);
   check('debris field present at +1.5 s (4 boxes + torn wing/tail)', at(1.5).debris >= 5, `debris=${at(1.5).debris} torn=${at(1.5).torn}`);
   check('no debris piece fell through the terrain at +10 s', at(10).belowGround === 0, `below=${at(10).belowGround}`);
-  check('debris resting on the ground at +30 s (settled wreckage at the live observation point)', at(30).resting === at(30).debris && at(30).debris > 0, `resting=${at(30).resting}/${at(30).debris} worst[${at(30).worstPiece}]`);
+  check('debris settled at the crash site at +30 s (on the ground or on the wreck — pass-15 folded panels rest on the wreck)', at(30).resting === at(30).debris && at(30).debris > 0, `resting=${at(30).resting}/${at(30).debris} worst[${at(30).worstPiece}]`);
   check('debris field is scattered, not clumped under the wreck (max spread >= 5 m, >= 2 pieces beyond 5 m)', at(10).maxSpreadM >= 5 && at(10).scattered >= 2, `spread=${at(10).maxSpreadM.toFixed(1)}m scattered=${at(10).scattered}`);
   check('debris field STILL present at +30 sim-s — the live +75 s real observation point at 4 fps (old 30 s life: gone)', at(30).debris >= 4, `debris=${at(30).debris}`);
   check('debris field STILL present at +75 sim-s', at(75).debris >= 4, `debris=${at(75).debris}`);

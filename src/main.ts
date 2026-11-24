@@ -76,10 +76,11 @@ import { SandboxMenu } from './ui/SandboxMenu';
 import type { SandboxConfig } from './ui/SandboxMenu';
 import { PCFlightInput } from './input/PCFlightInput';
 import { MobileFlightInput, touchStickScale, touchPitchScale, touchDeadzone } from './input/MobileFlightInput';
+import { clFromCurve } from './physics/IAerodynamicsSolver';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.9 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.10 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -243,7 +244,7 @@ const modelStatus: Record<string, { state: string; tris?: number; error?: string
 
 // ---- renderer / scene (template ~499–512) ----
 // Pass 14 (worker E — MEASUREMENT ONLY, defaults unchanged): the
-// v4.9 live check found FPS 4-9 everywhere and the render-side cost
+// v4.10 live check found FPS 4-9 everywhere and the render-side cost
 // is still unmeasured from Node, so the ?debug=1 panel now shows a
 // renderer.info readout (see updateDebugPanel) and these two URL
 // knobs let the live check A/B the prime suspect — fragment fill at
@@ -688,7 +689,7 @@ const joy = { x: 0, y: 0, active: false, id: -1 };
     // used to skip joySet below, leaving joy.active true with
     // joy.x/joy.y = 0, i.e. the merge took the touch branch with a
     // centred stick for the whole drag: a dead stick that looks
-    // exactly like the v4.9 live "joystick held full-right, bank 0".
+    // exactly like the v4.10 live "joystick held full-right, bank 0".
     // The drag still works without capture while the pointer stays
     // over the stick, so a failed capture must never lose the drag.
     try {
@@ -1070,6 +1071,14 @@ let pickerForStuck = false;
 let stuckHintActive = false;
 let stuckTime = 0;
 let stuckToastShown = false;
+/** Previous-frame player position for the unresponsive watchdog
+ *  (pass 15, worker E, item 6): a frozen jet's `vel` field is stale
+ *  (deck velocity ~40 m/s on a deck respawn, 0 kt on a runway spawn),
+ *  so the beached detector's `vel < 1` gate never fires for it and R
+ *  can never open the picker. Movement is measured from the position
+ *  instead — a jet that does not move is unresponsive whatever its
+ *  stale velocity says. */
+let prevWatchPos: THREE.Vector3 | null = null;
 
 /** Show the respawn picker: Alpha / Bravo / Charlie / Helicarrier
  *  deck, with the last choice highlighted. The carrier deck is hidden
@@ -1250,7 +1259,7 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   // persist into the new one.
   camDist = 30;
   camOrbit = spawnedOnDeck
-    ? { yaw: deckOrbitYaw(carrier.yaw), pitch: 0.32 }
+    ? { yaw: deckOrbitYaw(liveCarrier ? liveCarrier.yaw : carrier.yaw), pitch: 0.32 }
     : { yaw: 0, pitch: 0.32 };
   // Pass 14 (worker D, item 1): snap the camera onto the chase
   // want too — the mode/distance reset above is not enough, the
@@ -1299,7 +1308,6 @@ async function startRound(next: SandboxConfig): Promise<void> {
   cfg = next;
   menu.hide();
   $('pauseScreen')?.classList.add('hidden');
-  started = true;
   paused = false;
   score = 0;
   kills = 0;
@@ -1400,6 +1408,20 @@ async function startRound(next: SandboxConfig): Promise<void> {
     };
     console.warn(cfg.aircraftKey + ' model failed', e);
   }
+  // Pass 15 (worker E, standing item — during-load stale HUD): the
+  // HUD updated while the new jet's GLB was still loading, so a fresh
+  // Aircraft (identity quaternion, game heading 0 = true 180 deg)
+  // showed 180 deg until resetAt ran at spawn. started=true used to
+  // be set before the await, so animate() ran the HUD through the
+  // whole load. It is set here instead, after the player model
+  // loads: during the load the HUD holds the previous round's values
+  // (a real flown heading), and the first live HUD update after the
+  // spawn reads the spawned jet. The carrier reset and the spawn
+  // below run after this, so the player is placed before the first
+  // post-load frame steps it. (The enemy/traffic model loads later
+  // still await with started=true, but the player is spawned by
+  // then, so the HUD reads a live jet.)
+  started = true;
   tiltInput.setAircraftKind(
     player.spec.vtol ? 'vtol' : 'fixed-wing',
   );
@@ -1477,7 +1499,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // camera state here (respawnPlayer did), so a round that ended
   // spectating restarted in free orbit at a stale zoom, and the
   // chase camera lerped in from wherever the previous round left
-  // it: the v4.9 side-on, below-ground first frame after every
+  // it: the v4.10 side-on, below-ground first frame after every
   // Apply & Restart. Reset the mode/distance/orbit to the chase
   // defaults (deck orbit yaw on a deck spawn, world-south on a
   // runway spawn — the same defaults respawnPlayer uses) and snap
@@ -1753,7 +1775,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.9 · Vite + Rapier).
+// Footer version string (v4.10 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1824,6 +1846,26 @@ function snapCameraToChase(deckTopY: number | null): void {
   camera.lookAt(player.pos.clone());
 }
 
+/** Deck-top Y under the jet (pass 15, worker E, item 9): the deck
+ *  ceiling for the chase / free-orbit / spectate branches must come
+ *  from the carrier the jet is actually ON, not carriers[0].
+ *  respawnPlayer respawns onto the first LIVE carrier, and a jet can
+ *  land on any carrier — but updateCamera capped the camera to
+ *  carriers[0].deckTopY, so with carriers[0] dead (wreck on the
+ *  ground, deckTopY ~25 m) or at a different altitude than the
+ *  jet's carrier, the chase want sat hundreds of metres below the
+ *  jet: the v4.10 live front-on, below-deck view looking up at the
+ *  carrier underside. deckProvider.deckHeightAt resolves to the
+ *  carrier under the queried point (the same resolution respawnPlayer
+ *  uses for the spawn), so the ceiling follows the jet's own deck.
+ *  Returns null off a deck (or when no live deck is under the jet —
+ *  a wrong deck hundreds of metres below is worse than no ceiling). */
+function deckTopUnderJet(): number | null {
+  if (!player || !player.onDeck) return null;
+  const y = deckProvider.deckHeightAt(player.pos.x, player.pos.z);
+  return y === -Infinity ? null : y;
+}
+
 function updateCamera(dt: number): void {
   if (!player) return;
   const p = player;
@@ -1853,7 +1895,7 @@ function updateCamera(dt: number): void {
         camOrbit,
         camDist,
         heightfieldGroundHeight,
-        p.onDeck ? carrier.deckTopY : null,
+        deckTopUnderJet(),
       );
       camera.position.copy(orbitPos);
       camera.lookAt(p.pos.clone());
@@ -1896,7 +1938,7 @@ function updateCamera(dt: number): void {
     // clear not just the ground under the camera but the terrain
     // between it and the jet — the analytic heightAt() can sit ~13 m
     // below the rendered surface at plateau edges) lives in the helper.
-    const deckTopY = p.onDeck ? carrier.deckTopY : null;
+    const deckTopY = deckTopUnderJet();
     const want = chaseCameraPosition(
       p.pos,
       fwd,
@@ -1941,7 +1983,7 @@ function updateCamera(dt: number): void {
       camOrbit,
       camDist,
       heightfieldGroundHeight,
-      p.onDeck ? carrier.deckTopY : null,
+      deckTopUnderJet(),
     );
     camera.position.copy(orbitPos);
     camera.lookAt(p.pos);
@@ -1972,20 +2014,32 @@ function playerInput(dt: number): void {
   if (vtolTarget !== null && p.spec.vtol) {
     let goal = vtolTarget;
     if (vtolTarget === 0) {
-      // Pass 7 (item 8): above the stall speed the wing can fly the
-      // jet on its own, so the nozzle may come all the way down —
-      // the pilot pulls to catch the load. Below the stall speed
-      // the real lift (gload) governs, so the nozzle cannot outrun
-      // the wing. The old gload-only floor stalled the vector at
-      // ~73 deg at 200+ kt: the jet was descending unloaded
-      // (gload ~ 0), so the floor demanded sin(vector) >= 1 and
-      // the nozzle never came down — even though the wing could
-      // fly it at that speed. The jet then descended at −3,500 to
-      // −5,500 fpm and crashed into a hillside.
-      const liftFrac =
-        p.ias >= p.spec.stallSpeed
-          ? 1
-          : Math.max(0, Math.min(1, p.gload));
+      // Pass 15 (item 5): the floor is the wing's POTENTIAL lift at
+      // a sane AoA (10 deg), not the lift it is making right now and
+      // not a blanket "above stall speed the wing can fly it". The
+      // old floor said liftFrac = 1 once ias >= stallSpeed — but
+      // stall speed is where the wing CAN fly at CLmax, not where it
+      // IS flying at level pitch: a jet level at 134 kt makes ~0.1 g
+      // on the wing, the nozzle came all the way down, and the
+      // transition crashed at -6,512 fpm after the vector reached 0
+      // (v4.10 live; probe-vtol-live D4 reproduces it: 141.6 m lost
+      // hands-off, vsi -53.8 m/s). The gload-only floor before that
+      // had the opposite failure: it stalled the vector at ~73 deg
+      // at 200+ kt while the jet descended unloaded (gload ~ 0),
+      // even though the wing could fly it at that speed. The
+      // potential lift is the middle: the lift the wing WOULD make
+      // at 10 deg AoA at the current speed and altitude — if the
+      // pilot rotates, the wing takes the load and the nozzle
+      // follows; if the pilot stays level, the nozzle waits. The
+      // actual gload is still the floor when the pilot IS pulling
+      // (max of the two), so a flown AoA is credited immediately.
+      const rho = 1.225 * Math.exp(-Math.max(p.pos.y, 0) / 8500);
+      const q = 0.5 * rho * p.ias * p.ias;
+      const sLift = p.spec.wingAreaEffective ?? p.spec.wingArea;
+      const cl10 = clFromCurve(10, p.flaps / 30, p.spec.clCurve);
+      const potential =
+        (q * sLift * cl10) / (p.spec.mass * 9.81);
+      const liftFrac = Math.max(0, Math.min(1, Math.max(potential, p.gload)));
       const tw =
         (p.throttle * p.spec.thrustMax) / (p.spec.mass * 9.81);
       const need = (1 - liftFrac) / Math.max(tw, 0.01);
@@ -2052,7 +2106,7 @@ function playerInput(dt: number): void {
   // The old rule was "PC wins when nonzero" — but the PC stick is
   // nonzero for ~0.4 s after ANY arrow tap (the kbRoll return tail),
   // and a mouse yoke can sit a hair off zero, so a touch drag in
-  // that window was silently ignored: the v4.9 live check saw a
+  // that window was silently ignored: the v4.10 live check saw a
   // left drag do nothing at all while the bank kept rising the
   // wrong way (measured in probe-roll section F: rollIn stayed
   // +0.36..+0.08 for ~0.45 s after a tap while the stick dragged
@@ -2501,15 +2555,43 @@ function animate(): void {
   // exactly the beached signature. Gate it on being NEAR THE GROUND
   // (AGL < 10 m): a beached jet is on a slope at ground level, a
   // hovering jet is hundreds of metres up.
+  // Pass 15 (worker E, item 6): the FROZEN state — a live jet that
+  // does not move at 100% throttle (v4.10 live: F-35A hanging mid-air
+  // at 78 kt, 1,138 ft, surf=0, G 0.0, carrier receding; and once on
+  // an Alpha spawn at 0 kt). The beached gate cannot catch it: its
+  // `vel` field is stale at the deck velocity (~40 m/s) or at 0 with
+  // `grounded` still true from respawn, so `vel < 1` never fires and
+  // R does nothing — the only in-game recovery is dead. The second
+  // gate below measures MOVEMENT, not velocity: alive, not dying,
+  // not on a surface, throttle commanded past half, and the position
+  // moved < 0.1 m in the frame. It deliberately does NOT read vel or
+  // grounded (both are stale in exactly this state), and it does NOT
+  // use the AGL gate (a frozen jet hangs hundreds of metres up).
+  // False positives are narrow: a healthy jet at > 50% throttle
+  // moves > 0.1 m/frame from the second frame on, a VTOL hover is
+  // excluded by vector >= 70, and a parked/braked jet is on a
+  // surface. Any movement resets the timer, so the 2 s R gate needs
+  // 2 continuous sim-seconds of not moving.
   if (player) {
     const agl = player.pos.y - heightfieldGroundHeight(player.pos.x, player.pos.z);
-    const beached =
+    const moved = prevWatchPos ? player.pos.distanceTo(prevWatchPos) : Infinity;
+    if (prevWatchPos) prevWatchPos.copy(player.pos);
+    else prevWatchPos = player.pos.clone();
+    const unresponsive =
       player.alive &&
       !player.dying &&
-      !player.grounded &&
-      !player.onDeck &&
-      player.vel.length() < 1 &&
-      agl < 10;
+      !player.onSurface &&
+      player.thrTarget > 0.5 &&
+      player.vector < 70 &&
+      moved < 0.1;
+    const beached =
+      (player.alive &&
+        !player.dying &&
+        !player.grounded &&
+        !player.onDeck &&
+        player.vel.length() < 1 &&
+        agl < 10) ||
+      unresponsive;
     if (beached) {
       stuckTime += dt;
       if (stuckTime > 10 && !stuckToastShown) {
@@ -2719,7 +2801,7 @@ function updateDebugPanel(): void {
     ...modelLines,
     `origin shift: ${worldGen.originShift.x.toFixed(0)}, ${worldGen.originShift.z.toFixed(0)} · gamepad: ${pcInput.gamepadName || 'none'} · tilt: ${tiltInput.isEnabled ? 'on' : 'off'}`,
     // Pass 14 (worker A): this line used to show ONLY the sensitivity
-    // CONFIG (norm/INV + multiplier) — the v4.9 live check misread it
+    // CONFIG (norm/INV + multiplier) — the v4.10 live check misread it
     // as a stale stick readout. It now also shows the LIVE stick:
     // the merged pitchIn/rollIn the controller actually sees, and
     // the touch stick's live position (joy active? x/y). If the jet

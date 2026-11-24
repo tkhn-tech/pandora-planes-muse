@@ -913,6 +913,101 @@ async function main(): Promise<void> {
     dispose(ac);
   }
 
+  // ---- 6. F-22 150 kt with power, idle + airbrake (pass 15, item
+  // 11): the live claim is a stall AT ~150 kt with power. §2
+  // measures the power-off stall at 120 kt (idle, no airbrake);
+  // this is the live-path level-flight check the task asks for —
+  // decelerate through 150 kt on idle + full airbrake with the
+  // altitude-hold autopilot, and ask whether 150 kt itself stalls
+  // or holds. The jet must hold level flight (no stall flag, no
+  // sustained sink) while IAS >= 140 kt, and the stall — if it
+  // comes — must come near the §2 Vs (~120 kt), not at 150 kt.
+  // Dependency note (item 1, another worker): the v4.9 live game
+  // could not get the F-22 airborne at all (pitch dead from Alpha),
+  // so this flight-model check runs in the probe's live path
+  // (real Aircraft, variable dt, live wind, real GLB) — the
+  // hands-on browser reproduction still needs item 1's input fix.
+  console.log('--- 6. F-22 150 kt, idle + airbrake, level flight (BET, live path) ---');
+  {
+    const key = 'f22';
+    const spec = SPECS[key]!;
+    const ac = await makeAircraft(key, true);
+    ac.resetAt(alpha.x, 400, alpha.z, alpha.hdg);
+    ac.setAirspeed(200 * KT2MS);
+    ac.thrTarget = 0.05;
+    ac.throttle = 0.05;
+    ac.airbrake = 1;
+    const alt0 = ac.pos.y;
+    let simT = 0;
+    let stalledAtKt: number | null = null;
+    let sinkAtKt: number | null = null;
+    let sinkT = 0;
+    let inWindow = false;
+    let winMinAlt = Infinity;
+    let winMaxAlt = -Infinity;
+    let winMaxAoA = -90;
+    let ktAt150 = 0;
+    let crossed150 = false;
+    const rows: string[] = [];
+    while (simT < 90) {
+      const dt = nextDt();
+      simT += dt;
+      ac.pitchIn = levelPitchIn(ac, key, alt0, spec.clCurve.peakAoA + 1, 4, 0.03, 0.5, 0.3);
+      ac.thrTarget = 0.05;
+      ac.airbrake = 1;
+      ac.rollIn = 0;
+      ac.yawIn = 0;
+      substep(ac, dt);
+      if (!ac.alive) break;
+      const kt = ac.ias * MS2KT;
+      // The 150 kt window: from first crossing 155 kt until 140 kt.
+      if (!crossed150 && kt <= 155) {
+        crossed150 = true;
+        inWindow = true;
+        ktAt150 = kt;
+      }
+      if (inWindow && kt < 140) inWindow = false;
+      if (inWindow) {
+        winMinAlt = Math.min(winMinAlt, ac.pos.y);
+        winMaxAlt = Math.max(winMaxAlt, ac.pos.y);
+        winMaxAoA = Math.max(winMaxAoA, ac.aoaDeg);
+      }
+      if (ac.stalled && stalledAtKt === null) stalledAtKt = kt;
+      if (ac.vsi < -3) {
+        sinkT += dt;
+        if (sinkT > 2 && sinkAtKt === null) sinkAtKt = kt;
+      } else {
+        sinkT = 0;
+      }
+      if (Math.abs(simT % 5) < dt) {
+        rows.push(`t=${simT.toFixed(0)}s ${kt.toFixed(0)}kt alt=${ac.pos.y.toFixed(0)}m aoa=${ac.aoaDeg.toFixed(1)} stalled=${ac.stalled} vsi=${ac.vsi.toFixed(1)}`);
+      }
+      if (stalledAtKt !== null || sinkAtKt !== null) break;
+      if (ac.pos.y < 120) break;
+    }
+    const finalKt = ac.ias * MS2KT;
+    const winBand = winMaxAlt - winMinAlt;
+    console.log(`  [6 idle+airbrake] ${rows.join(' | ')} => crossed150=${crossed150} windowAltBand=${winBand.toFixed(1)}m winMaxAoA=${winMaxAoA.toFixed(1)}deg stalledAt=${stalledAtKt === null ? 'none' : stalledAtKt.toFixed(0) + 'kt'} sinkAt=${sinkAtKt === null ? 'none' : sinkAtKt.toFixed(0) + 'kt'} finalKt=${finalKt.toFixed(0)} alive=${ac.alive}`);
+    check(
+      'f22 150 kt idle+airbrake: holds level flight through 150 kt (no stall flag while IAS >= 140 kt)',
+      crossed150 && (stalledAtKt === null || stalledAtKt < 140) && (sinkAtKt === null || sinkAtKt < 140),
+      `crossed150=${crossed150} (at ${ktAt150.toFixed(0)} kt) stalledAt=${stalledAtKt === null ? 'none' : stalledAtKt.toFixed(0) + ' kt'} sinkAt=${sinkAtKt === null ? 'none' : sinkAtKt.toFixed(0) + ' kt'}`,
+    );
+    check(
+      'f22 150 kt idle+airbrake: altitude held in the 150 kt window (band < 100 m)',
+      crossed150 && winBand < 100,
+      `band=${winBand.toFixed(1)} m maxAoA=${winMaxAoA.toFixed(1)} deg`,
+    );
+    check(
+      'f22 150 kt idle+airbrake: the stall, when it comes, is near the 120 kt Vs — not at 150 kt',
+      (stalledAtKt !== null && stalledAtKt >= 109 && stalledAtKt <= 130) ||
+        (sinkAtKt !== null && sinkAtKt >= 109 && sinkAtKt <= 130) ||
+        (stalledAtKt === null && sinkAtKt === null && finalKt > 130),
+      `stalledAt=${stalledAtKt === null ? 'none' : stalledAtKt.toFixed(0) + ' kt'} sinkAt=${sinkAtKt === null ? 'none' : sinkAtKt.toFixed(0) + ' kt'} finalKt=${finalKt.toFixed(0)} kt (§2 band 109-125 kt)`,
+    );
+    dispose(ac);
+  }
+
   console.log(failures === 0 ? '\nALL STALL-SPEED CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

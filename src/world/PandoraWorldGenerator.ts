@@ -341,12 +341,13 @@ export class PandoraWorldGenerator {
     for (let i = 0; i < ISLAND_COUNT; i++) {
       const x0 = (rand() - 0.5) * (WORLD_SIZE * 0.8);
       const z0 = (rand() - 0.5) * (WORLD_SIZE * 0.8);
-      // Pass 14 (worker F, item 11): relocate the sampled centre
-      // clear of the carrier loop (see clearOfCarrierLoop below).
-      // Pure geometry — consumes NO rand, so the flora/cloud
-      // scatter after the islands keeps its exact v2 positions,
-      // and only the islands that violate the clearance move.
-      const { x, z } = clearOfCarrierLoop(x0, z0);
+      // Pass 14 (worker F, item 11) + pass 15 (worker F, item 12):
+      // relocate the sampled centre clear of the carrier loop AND
+      // of every runway (see clearIslandPosition below). Pure
+      // geometry — consumes NO rand, so the flora/cloud scatter
+      // after the islands keeps its exact v2 positions, and only
+      // the islands that violate a clearance move.
+      const { x, z } = clearIslandPosition(x0, z0);
       const y = 260 + rand() * 260;
       const R = 60 + rand() * 90;
       const g = new THREE.Group();
@@ -776,6 +777,54 @@ function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
 
+/** Minimum island-centre distance from any runway strip rectangle (m).
+ *  Pass 15 (worker F, item 12). Island-3 sat 1262 m from the Bravo
+ *  strip (and inside Bravo's extended centreline corridor) after
+ *  the pass-14 loop relocation — the brown cone at a runway edge in
+ *  the spawn views. */
+export const ISLAND_RUNWAY_STRIP_CLEARANCE_M = 1500;
+/** Minimum angular offset (deg) of an island from a runway's
+ *  centreline as seen from that runway's spawn chase camera.
+ *  Pass 15, item 12: island-4 sat 28.6 deg off Alpha's centreline
+ *  (3.0 deg across, at horizon height at the frame edge in the
+ *  landscape spawn view) and island-6 25.6 deg — both read as a
+ *  brown cone at the edge of the runway. 36 deg in the generator
+ *  leaves a 1 deg margin over the probe's 35 deg check (the probe
+ *  measures from the exact chase cam, 12 m behind the runway
+ *  centre, while the generator measures from the runway centre). */
+export const ISLAND_SPAWN_VIEW_MIN_OFF_AXIS_DEG = 36;
+/** A runway's extended centreline corridor: half-width (m) and how
+ *  far past each strip end it runs. An island inside a corridor
+ *  sits on the departure/approach line — the runway edge in the
+ *  spawn view — even when it clears the strip itself. */
+const ISLAND_CORRIDOR_HALF_WIDTH_M = 500;
+const ISLAND_CORRIDOR_PAST_END_M = 4000;
+
+/** Runway-local frame: lx along the heading vector, lz across it. */
+interface RunwayFrame {
+  cx: number;
+  cz: number;
+  sh: number;
+  ch: number;
+  len: number;
+  wid: number;
+}
+function runwayFrame(r: (typeof RUNWAY_TABLE)[number]): RunwayFrame {
+  const hdg = (r.hdg * Math.PI) / 180;
+  return { cx: r.x, cz: r.z, sh: Math.sin(hdg), ch: Math.cos(hdg), len: r.len, wid: r.width };
+}
+function toFrame(f: RunwayFrame, x: number, z: number): { lx: number; lz: number } {
+  const dx = x - f.cx;
+  const dz = z - f.cz;
+  return { lx: dx * f.sh + dz * f.ch, lz: dx * f.ch - dz * f.sh };
+}
+function fromFrame(f: RunwayFrame, lx: number, lz: number): { x: number; z: number } {
+  return { x: f.cx + lx * f.sh + lz * f.ch, z: f.cz + lx * f.ch - lz * f.sh };
+}
+function clampScatter(v: number): number {
+  return Math.max(-4800, Math.min(4800, v));
+}
+
 /**
  * Push an island centre clear of the carrier loop polyline — the
  * entry leg from the round-start position into waypoint 0, then the
@@ -834,6 +883,122 @@ function clearOfCarrierLoop(x: number, z: number): { x: number; z: number } {
     pz = bz + (dz / len) * (ISLAND_LOOP_CLEARANCE_M + 5);
     px = Math.max(-4800, Math.min(4800, px));
     pz = Math.max(-4800, Math.min(4800, pz));
+  }
+  return { x: px, z: pz };
+}
+
+/**
+ * Relocate an island centre clear of the carrier loop AND of every
+ * runway (pass 15, worker F, item 12). One push per iteration, then
+ * re-evaluate every constraint from the top — the pushes fight
+ * each other (a runway push can land near the loop, a spawn-view
+ * push can land near a strip), so the loop runs until all four
+ * hold or 24 iterations pass. The constraints, in check order:
+ *   1. carrier loop: centre >= 1000 m from every flown segment
+ *      (clearOfCarrierLoop's rule, via its own function);
+ *   2. runway strips: centre >= 1500 m from every strip rectangle
+ *      (radial push from the nearest rectangle point, +5 m margin);
+ *   3. runway corridors: outside every runway's extended
+ *      centreline corridor (+/-500 m across, 4000 m past each end);
+ *   4. spawn views: >= 36 deg off every runway's centreline as
+ *      seen from that runway's spawn chase camera (12 m behind the
+ *      jet, looking along the heading) — the push is across the
+ *      runway axis; when the scatter square (±4800 m) blocks the
+ *      across push, the island is instead pulled along the heading
+ *      toward the runway (a smaller along-distance at the same
+ *      across-distance is a larger off-axis angle).
+ * Consumes NO rand, so the flora/cloud scatter after the islands
+ * keeps its exact v2 positions.
+ */
+function clearIslandPosition(x0: number, z0: number): { x: number; z: number } {
+  let px = x0;
+  let pz = z0;
+  const tanView = Math.tan((ISLAND_SPAWN_VIEW_MIN_OFF_AXIS_DEG * Math.PI) / 180);
+  for (let iter = 0; iter < 24; iter++) {
+    let pushed: { x: number; z: number } | null = null;
+    // 1. Carrier loop (delegates to the pass-14 function; it returns
+    // the input unchanged when the clearance already holds).
+    const looped = clearOfCarrierLoop(px, pz);
+    if (looped.x !== px || looped.z !== pz) pushed = looped;
+    // 2. Runway strips.
+    if (!pushed) {
+      for (const r of RUNWAY_TABLE) {
+        const f = runwayFrame(r);
+        const { lx, lz } = toFrame(f, px, pz);
+        const cx = Math.max(-f.len / 2, Math.min(f.len / 2, lx));
+        const cz = Math.max(-f.wid / 2, Math.min(f.wid / 2, lz));
+        const nearest = fromFrame(f, cx, cz);
+        const d = Math.hypot(px - nearest.x, pz - nearest.z);
+        if (d < ISLAND_RUNWAY_STRIP_CLEARANCE_M) {
+          let dx = px - nearest.x;
+          let dz = pz - nearest.z;
+          if (dx === 0 && dz === 0) {
+            dx = 1;
+            dz = 0;
+          }
+          const len = Math.hypot(dx, dz);
+          // +25 m margin, not +5: a later spawn-view push in the
+          // same relocation can erode the strip clearance by a few
+          // metres (island-3 landed at 1502 m with a +5 margin).
+          pushed = {
+            x: clampScatter(nearest.x + (dx / len) * (ISLAND_RUNWAY_STRIP_CLEARANCE_M + 25)),
+            z: clampScatter(nearest.z + (dz / len) * (ISLAND_RUNWAY_STRIP_CLEARANCE_M + 25)),
+          };
+          break;
+        }
+      }
+    }
+    // 3. Runway corridors.
+    if (!pushed) {
+      for (const r of RUNWAY_TABLE) {
+        const f = runwayFrame(r);
+        const { lx, lz } = toFrame(f, px, pz);
+        if (
+          Math.abs(lx) > f.len / 2 &&
+          Math.abs(lx) <= f.len / 2 + ISLAND_CORRIDOR_PAST_END_M &&
+          Math.abs(lz) <= ISLAND_CORRIDOR_HALF_WIDTH_M
+        ) {
+          // +25 m margin, same erosion reason as the strip push.
+          const lzNew = (lz < 0 ? -1 : 1) * (ISLAND_CORRIDOR_HALF_WIDTH_M + 25);
+          const p = fromFrame(f, lx, lzNew);
+          pushed = { x: clampScatter(p.x), z: clampScatter(p.z) };
+          break;
+        }
+      }
+    }
+    // 4. Spawn views.
+    if (!pushed) {
+      for (const r of RUNWAY_TABLE) {
+        const f = runwayFrame(r);
+        const camX = r.x - f.sh * 12;
+        const camZ = r.z - f.ch * 12;
+        const vx = px - camX;
+        const vz = pz - camZ;
+        const dist = Math.hypot(vx, vz);
+        const ahead = vx * f.sh + vz * f.ch;
+        if (dist === 0 || ahead <= 0) continue;
+        const angle = Math.acos(Math.max(-1, Math.min(1, ahead / dist)));
+        if (angle < (ISLAND_SPAWN_VIEW_MIN_OFF_AXIS_DEG * Math.PI) / 180) {
+          const { lx, lz } = toFrame(f, px, pz);
+          const lzNew = (lz < 0 ? -1 : 1) * ((lx + 12) * tanView + 5);
+          const across = fromFrame(f, lx, lzNew);
+          if (Math.abs(across.x) <= 4800 && Math.abs(across.z) <= 4800) {
+            pushed = { x: across.x, z: across.z };
+          } else {
+            // Scatter square blocks the across push — pull along
+            // the heading toward the runway instead (same across
+            // distance at a shorter along distance = larger angle).
+            const lxNew = Math.abs(lz) / tanView;
+            const along = fromFrame(f, lxNew, lz);
+            pushed = { x: clampScatter(along.x), z: clampScatter(along.z) };
+          }
+          break;
+        }
+      }
+    }
+    if (!pushed) break;
+    px = pushed.x;
+    pz = pushed.z;
   }
   return { x: px, z: pz };
 }
