@@ -2,20 +2,22 @@
 //
 // Nicholas: "when watching the wreck, the camera should be the free
 // orbit." The old code returned the fixed 42 m velocity-chase from
-// the spectating branch BEFORE checking camMode, so camMode 2 never
+// the spectating branch BEFORE checking camMode, so camMode 1 never
 // applied while spectating despite the comment claiming it did. The
-// fix: spectate engages with camMode = 2 (framed at the 30 m /
+// fix: spectate engages with camMode = 1 (framed at the 30 m /
 // 0.32 pitch default), updateCamera's spectating branch runs the
-// free-orbit math around the wreck when camMode === 2, and
+// free-orbit math around the wreck when camMode === 1, and
 // skipSpectate restores the mode the player had before the wreck.
 // R / the Respawn button still skip (unchanged path).
+// (v4.11: the cockpit camera is gone, so the modes are 0 chase /
+// 1 free-orbit — the free-orbit mode number moved 2 -> 1.)
 //
 // This probe drives the pure orbit helpers (src/camera/OrbitCamera)
 // that updateCamera calls: orbit input (yaw) moves the camera around
 // the wreck, zoom input (dist) changes the distance, the camera
 // stays focused on the wreck, the terrain floor keeps the wreck
-// visible, and the main.ts wiring (spectate branch routes camMode 2
-// through the orbit helpers; engage sets camMode 2; skip restores)
+// visible, and the main.ts wiring (spectate branch routes camMode 1
+// through the orbit helpers; engage sets camMode 1; skip restores)
 // is present. A live visual check (parent's browser check) still
 // owns the rendered result.
 //
@@ -123,8 +125,8 @@ function main(): void {
     `y=${floored.y.toFixed(2)} wreck+2=${wreck.y + 2}`,
   );
 
-  // --- Wiring in main.ts: the spectating branch routes camMode 2
-  // through the orbit helpers, spectate engages with camMode 2, and
+  // --- Wiring in main.ts: the spectating branch routes camMode 1
+  // through the orbit helpers, spectate engages with camMode 1, and
   // skipSpectate restores the pre-spectate mode.
   let src = '';
   for (const p of ['src/main.ts', '/home/hatch/workspace/pandora-planes-vite/src/main.ts']) {
@@ -137,20 +139,20 @@ function main(): void {
   // floor AND the deck ceiling internally (the old inline
   // applyCameraFloor(orbitCameraPosition(...)) had no deck ceiling,
   // so the free-orbit camera sank into the carrier deck). Either
-  // form satisfies the check — the requirement is that camMode 2
+  // form satisfies the check — the requirement is that camMode 1
   // runs through an orbit helper with a floor, not the exact call.
   check(
-    'spectating branch runs the free orbit when camMode === 2',
-    spectateBlock.includes('camMode === 2') &&
+    'spectating branch runs the free orbit when camMode === 1',
+    spectateBlock.includes('camMode === 1') &&
       (spectateBlock.includes('orbitCameraPositionDeckAware') ||
         (spectateBlock.includes('orbitCameraPosition') &&
           spectateBlock.includes('applyCameraFloor'))),
-    'spectate block routes camMode 2 through the orbit helpers',
+    'spectate block routes camMode 1 through the orbit helpers',
   );
   check(
-    'spectate engages with camMode = 2 (wreck view IS the free orbit)',
-    (src.match(/preSpectateCamMode = camMode;\s*\n\s*camMode = 2;/g) ?? []).length >= 2,
-    'both engage sites (dying + instant crash) set camMode 2',
+    'spectate engages with camMode = 1 (wreck view IS the free orbit)',
+    (src.match(/preSpectateCamMode = camMode;\s*\n\s*camMode = 1;/g) ?? []).length >= 2,
+    'both engage sites (dying + instant crash) set camMode 1',
   );
   check(
     'skipSpectate restores the pre-spectate camera mode',

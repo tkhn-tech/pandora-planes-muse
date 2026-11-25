@@ -12,10 +12,11 @@
 // paths (real Aircraft resetAt, real terrain heightfield, real GLB,
 // variable frame dt):
 //   (a) STALE MODE: startRound never resets camMode / camDist /
-//       camOrbit, so a round that ended spectating (camMode 2,
+//       camOrbit, so a round that ended spectating (camMode 1,
 //       camDist up to 120 m, orbit yaw 0) restarts IN free orbit —
 //       a persistent side-on view until the camera button cycles the
-//       mode (2 -> 0). This is the persistent defect.
+//       mode (1 -> 0). This is the persistent defect. (v4.11: the
+//       cockpit camera is gone; free-orbit is camMode 1, was 2.)
 //   (b) STALE POSITION LERP: the chase camera lerps toward its want
 //       (1 - 0.001^rawDt per frame). At 4 fps that converges in ~1 s,
 //       but at 1 fps during a janky restart it takes 4-9 s, and the
@@ -199,7 +200,7 @@ async function main(): Promise<void> {
   );
 
   // --- (a) STALE MODE (the persistent defect): the previous round
-  // ended spectating — camMode 2, camDist 120, orbit yaw 0 — and the
+  // ended spectating — camMode 1, camDist 120, orbit yaw 0 — and the
   // old startRound resets none of it. The first frame after restart
   // is a 120 m free orbit south of the jet: the jet heads east
   // (Alpha hdg 90), so a camera due south sees it in profile.

@@ -87,7 +87,7 @@
 //        const shift = worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
 //        if (shift) { camera.position.x -= shift.x; camera.position.z -= shift.z; }
 //      (equivalently: floatingOrigin.registerObject(camera) once at boot.
-//      Cockpit / free-orbit modes position the camera absolutely, so
+//      Free-orbit mode positions the camera absolutely, so
 //      they never glitched — only chase (and spectate, same lerp) did.)
 //   5. KNOWN REMAINING GAP (not this module's file): WeaponSystem
 //      missiles/bombs are not registered with the FloatingOrigin either

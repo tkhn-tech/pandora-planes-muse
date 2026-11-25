@@ -49,12 +49,7 @@ import { Aircraft } from './physics/FlightPhysicsController';
 import type { DeckProvider } from './physics/FlightPhysicsController';
 import { AircraftAIController } from './entities/AircraftAIController';
 import { SPECS } from './aircraft/AircraftSpec';
-import {
-  buildCockpit,
-  cockpitCameraQuaternion,
-  cockpitEyeFor,
-  fixCanopyMaterials,
-} from './aircraft/CockpitBuilder';
+import { fixCanopyMaterials } from './aircraft/CanopyMaterials';
 import {
   applyCameraFloor,
   chaseCameraPosition,
@@ -80,7 +75,7 @@ import { clFromCurve } from './physics/IAerodynamicsSolver';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.10 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.11 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -624,7 +619,7 @@ let playerKey = '';
 const enemies: Aircraft[] = [];
 const traffic: Aircraft[] = [];
 const aiControllers = new Map<Aircraft, AircraftAIController>();
-let camMode = 0; // 0 chase, 1 cockpit, 2 free-orbit
+let camMode = 0; // 0 chase, 1 free-orbit
 let camDist = 30;
 let camOrbit = { yaw: 0, pitch: 0.32 };
 let paused = false;
@@ -643,7 +638,7 @@ let spectating = false;
 let prevPlayerDying = false;
 /** Pass 11 (wreck free orbit): the camera mode the player had before
  *  spectate engaged, restored by skipSpectate (and by the respawned
- *  safety net) so the player returns to their chase/cockpit view. */
+ *  safety net) so the player returns to their chase view. */
 let preSpectateCamMode = 0;
 /** Damage-visual timer: spawn a smoke/fire plume every 0.5 s per
  *  damaged aircraft (the plume lives 6 s, so this keeps a continuous
@@ -748,10 +743,10 @@ let orbitDrag: { x: number; y: number; id: number } | null = null;
 let pinchD = 0;
 canvas.addEventListener('pointerdown', (e) => {
   audio();
-  if (camMode === 2) orbitDrag = { x: e.clientX, y: e.clientY, id: e.pointerId };
+  if (camMode === 1) orbitDrag = { x: e.clientX, y: e.clientY, id: e.pointerId };
 });
 canvas.addEventListener('pointermove', (e) => {
-  if (orbitDrag && e.pointerId === orbitDrag.id && camMode === 2) {
+  if (orbitDrag && e.pointerId === orbitDrag.id && camMode === 1) {
     camOrbit.yaw -= (e.clientX - orbitDrag.x) * 0.005;
     camOrbit.pitch = clamp(
       camOrbit.pitch + (e.clientY - orbitDrag.y) * 0.004,
@@ -1034,7 +1029,7 @@ function skipSpectate(): void {
   }
   spectating = false;
   // Pass 11 (wreck free orbit): back to the view the player had
-  // before the wreck (chase or cockpit).
+  // before the wreck (chase).
   camMode = preSpectateCamMode;
   pcInput.setCameraMode(camMode);
   setSpectateBanner(false);
@@ -1397,10 +1392,13 @@ async function startRound(next: SandboxConfig): Promise<void> {
   try {
     await player.attachModel();
     modelStatus[cfg.aircraftKey] = { state: 'ok' };
-    // Pass 11 (cockpit parity): glass canopies + the procedural
-    // cockpit kit, built to the F-18's standard for every player jet.
+    // Pass 11: glass canopies (the GLB's own canopy meshes made
+    // transparent — the "Glass" material renders black otherwise).
+    // v4.11: the procedural cockpit kit is GONE (Nicholas: "remove
+    // the ugly extra additions on the nose. remove cockpit view") —
+    // no panel, dials, screens, HUD glass, seat or headrest on any
+    // jet; the GLB's own canopy stays.
     fixCanopyMaterials(player.group);
-    buildCockpit(player.group, player.spec.modelKey);
   } catch (e) {
     modelStatus[cfg.aircraftKey] = {
       state: 'FAILED',
@@ -1687,7 +1685,7 @@ function fmtTime(s: number): string {
 }
 
 function cycleCam(): void {
-  camMode = (camMode + 1) % 3;
+  camMode = (camMode + 1) % 2;
   pcInput.setCameraMode(camMode);
   hud.cameraToast(camMode);
 }
@@ -1775,7 +1773,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.10 · Vite + Rapier).
+// Footer version string (v4.11 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -1817,7 +1815,7 @@ function updateSky(dt: number): void {
   for (const m of worldGen.floraMaterials) m.emissiveIntensity = 0.25 + nightF * 2.4;
 }
 
-// ---- camera (chase / cockpit / free orbit) ----
+// ---- camera (chase / free orbit) ----
 /** Snap the camera to the chase position for the current spawn
  *  (pass 14, worker D, item 1): the first frame after a restart or
  *  respawn must already BE the chase view. The old code left
@@ -1876,7 +1874,7 @@ function updateCamera(dt: number): void {
   // wreck. Pass 11 (wreck free orbit): the wreck view IS the free
   // orbit — drag orbits (camOrbit), wheel/pinch zoom (camDist), the
   // camera stays focused on the wreck. The old code returned the
-  // fixed 42 m chase here before ever checking camMode, so camMode 2
+  // fixed 42 m chase here before ever checking camMode, so camMode 1
   // never applied while spectating despite the comment claiming it
   // did; the chase below is now only the non-orbit fallback (e.g. if
   // the player C-cycles away from orbit mid-spectate). The chase
@@ -1889,7 +1887,7 @@ function updateCamera(dt: number): void {
   // tumbling axis. When the wreck is nearly still (on the ground
   // after impact) the velocity is ~0, so fall back to the body fwd.
   if (spectating) {
-    if (camMode === 2) {
+    if (camMode === 1) {
       const orbitPos = orbitCameraPositionDeckAware(
         p.pos,
         camOrbit,
@@ -1958,26 +1956,13 @@ function updateCamera(dt: number): void {
     // camDist it was a speck at the edge. Centred, the framing is
     // consistent at every zoom.
     camera.lookAt(p.pos.clone());
-  } else if (camMode === 1) {
-    // Cockpit: per-jet eye from the GLB canopy bboxes (CockpitBuilder)
-    // — the old fixed (fwd x5, up x2.2) floated 0.66 m above the
-    // F-22's canopy and the F-35A has no canopy at all. The camera
-    // looks along the aircraft's forward: a three.js camera looks
-    // down its local -Z, so copying p.quat alone points it AFT and
-    // the v4.6 cockpit view showed the seat / headrest filling the
-    // frame (no panel, no HUD) — cockpitCameraQuaternion flips it
-    // 180° about Y so it looks forward.
-    const eye = cockpitEyeFor(p.spec.modelKey);
-    camera.position
-      .copy(p.pos)
-      .addScaledVector(fwd, eye.z)
-      .addScaledVector(up, eye.y);
-    camera.quaternion.copy(cockpitCameraQuaternion(p.quat));
   } else {
-    // Pass 12: the live inline orbit clamped only at the camera's own
-    // (x, z) and had no deck awareness. Orbit the JET (never the
-    // carrier), with the pass-8 floor (camera + midpoint + target + 2 m)
-    // and the deck ceiling.
+    // Free orbit (camMode 1 — v4.11: the cockpit camera is gone,
+    // so the cycle is chase / free-orbit only). Pass 12: the live
+    // inline orbit clamped only at the camera's own (x, z) and had
+    // no deck awareness. Orbit the JET (never the carrier), with
+    // the pass-8 floor (camera + midpoint + target + 2 m) and the
+    // deck ceiling.
     const orbitPos = orbitCameraPositionDeckAware(
       p.pos,
       camOrbit,
@@ -2317,8 +2302,8 @@ function handleDeaths(): void {
           // at the default 30 m / 0.32 pitch. The mode the player had
           // is restored by skipSpectate.
           preSpectateCamMode = camMode;
-          camMode = 2;
-          pcInput.setCameraMode(2);
+          camMode = 1;
+          pcInput.setCameraMode(1);
           camOrbit = { yaw: 0, pitch: 0.32 };
           camDist = 30;
           setSpectateBanner(true, a.lastCrashReason ?? undefined);
@@ -2448,8 +2433,8 @@ function animate(): void {
   // "glitch back" Nicholas felt every ~2 km of flight. The jet and
   // the terrain shift invisibly (original-frame jump 0.000 m over 21
   // shifts / 40 km); moving the camera with the world makes the shift
-  // invisible for the chase view too (cockpit / free-orbit position
-  // absolutely, so they never glitched). The streamer update runs
+  // invisible for the chase view too (free-orbit positions the camera
+  // absolutely, so it never glitched). The streamer update runs
   // right after the shift check, once per frame.
   const shift = worldGen.shiftOriginIfNeeded(player?.pos ?? new THREE.Vector3());
   if (shift) {
@@ -2527,8 +2512,8 @@ function animate(): void {
       // Pass 11 (wreck free orbit): see handleDeaths — the wreck view
       // starts as the free-orbit camera, framed at the default.
       preSpectateCamMode = camMode;
-      camMode = 2;
-      pcInput.setCameraMode(2);
+      camMode = 1;
+      pcInput.setCameraMode(1);
       camOrbit = { yaw: 0, pitch: 0.32 };
       camDist = 30;
       const killer =
@@ -2689,7 +2674,7 @@ function animate(): void {
       // the below-min-release-alt flag feeds the warn priority.
       // Pass 13 (worker C): the CCIP PIPPER itself is GONE — it was
       // the yellow/amber ⊕ crosshair at screen centre in the v4.7
-      // live check (F-18 776 kt, F-15E 666 kt, cockpit + chase;
+      // live check (F-18 776 kt, F-15E 666 kt, in the chase view;
       // never on the F-22/F-35A, which carry no bombs). Nicholas
       // asked for the reticle to be gone from all jets. The
       // computation stays ONLY for the PULL UP warning; nothing

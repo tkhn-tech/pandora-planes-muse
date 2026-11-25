@@ -219,7 +219,7 @@ export class PCFlightInput implements IFlightInputProvider {
    *  only the single-shot edge keys are latched. */
   private readonly pressed = new Set<string>();
   private throttle = 0;
-  private camMode = 0; // 0 chase, 1 cockpit, 2 free-orbit
+  private camMode = 0; // 0 chase, 1 free-orbit
   private lastPoll = performance.now();
   private shaping: StickShaping = { ...DEFAULT_SHAPING };
   /** Slewed keyboard stick (ramps toward the arrow-key target). */
@@ -248,7 +248,7 @@ export class PCFlightInput implements IFlightInputProvider {
    *  so onKeyUp can tell a tap from a hold (TAP_MAX_WALL_MS). */
   private readonly keyDownMs = new Map<string, number>();
 
-  // Mouse yoke: drag on the canvas steers in chase/cockpit cam (template
+  // Mouse yoke: drag on the canvas steers in chase cam (template
   // ~1750); in free-orbit the same drag orbits (main.ts owns that path).
   private readonly yoke = {
     active: false,
@@ -294,11 +294,11 @@ export class PCFlightInput implements IFlightInputProvider {
   }
 
   /** Free-orbit drag belongs to main.ts; tell this provider the mode so
-   *  the mouse yoke only steers in chase/cockpit (template: camMode 2
+   *  the mouse yoke only steers in chase (template: camMode 1
    *  keeps the orbit role). */
   setCameraMode(mode: number): void {
     this.camMode = mode;
-    if (mode === 2) {
+    if (mode === 1) {
       this.yoke.active = false;
       this.yoke.dx = 0;
       this.yoke.dy = 0;
@@ -390,7 +390,7 @@ export class PCFlightInput implements IFlightInputProvider {
     if (this.gpActive) {
       px = this.gpPitch;
       rx = this.gpRoll;
-    } else if (this.yoke.active && this.camMode !== 2) {
+    } else if (this.yoke.active && this.camMode !== 1) {
       px = clamp(this.yoke.dy / 60, -1, 1);
       rx = clamp(this.yoke.dx / 60, -1, 1); // pass 11: was -dx (inverted roll)
     }
@@ -624,7 +624,7 @@ export class PCFlightInput implements IFlightInputProvider {
   };
 
   private readonly onPointerDown = (e: PointerEvent): void => {
-    if (this.camMode === 2) return; // free-orbit drag is main.ts's job
+    if (this.camMode === 1) return; // free-orbit drag is main.ts's job
     this.yoke.active = true;
     this.yoke.id = e.pointerId;
     this.yoke.sx = e.clientX;

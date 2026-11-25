@@ -581,12 +581,12 @@ export class FlightHUD {
     d.scrollTop = d.scrollHeight;
   }
 
-  /** Camera-mode toast (C key / camBtn): Chase / Cockpit / Free orbit. */
+  /** Camera-mode toast (C key / camBtn): Chase / Free orbit. */
   cameraToast(mode: number): void {
-    const names = ['CHASE CAM', 'COCKPIT CAM', 'FREE ORBIT'];
+    const names = ['CHASE CAM', 'FREE ORBIT'];
     this.toast(
       names[mode] ?? 'CHASE CAM',
-      mode === 2 ? 'Drag to orbit · pinch to zoom' : '',
+      mode === 1 ? 'Drag to orbit · pinch to zoom' : '',
     );
   }
 
