@@ -673,6 +673,17 @@ async function main(): Promise<void> {
       for (const h of ac.colliderHandles()) owners.set(h, ac);
       carrier.reset(CARRIER_START_POS.clone(), Math.PI / 2);
       const fwd = new THREE.Vector3(Math.sin(carrier.yaw), 0, Math.cos(carrier.yaw));
+      // Pass 17 (worker F): a lateral spawn offset was tried here
+      // (15 m and 30 m starboard) to make section H exercise roll
+      // through the keys, but the section-H PD roll law
+      // ((0-loc.x)*0.03) saturates and the key servo chatters
+      // (peakRollIn 1.00, 300+ transitions) and crashes the jet on
+      // ANY lateral offset — a test-harness tuning limit, not an
+      // input-path failure (roll clearly drives to 1.00). Reverted
+      // to the centred spawn; the roll-through-keys question needs
+      // a better-tuned PD, which is out of scope for the section-D
+      // return-leg work. peakRollIn stays 0.00 on the centred
+      // spawn, so section H still cannot catch a live roll failure.
       const sx = carrier.pos.x - fwd.x * 500;
       const sz = carrier.pos.z - fwd.z * 500;
       const dv0 = deckProvider.velocityAt(sx, sz);
@@ -1366,12 +1377,22 @@ async function main(): Promise<void> {
   // HUD gives no carrier bearing or distance, so a pilot who flies
   // away cannot come back. This section flies the whole loop with the
   // live loop (variable dt, live wind 3 m/s, origin shifts, real spawn
-  // code, real carrier GLB) and steers the transit ONLY on the
-  // carrier bearing/distance values the HUD patch adds (same formula
-  // as section F) — if those values cannot guide the jet home, the
-  // return fails here. The carrier keeps flying its loop throughout
-  // (it reaches waypoint 0 and starts its ~120 deg turn mid-return),
-  // so the final is onto a turning, terrain-following deck.
+  // code, real carrier GLB) and navigates back on the carrier
+  // bearing/distance values the HUD patch adds (same formula as
+  // section F, logged every 5 s) — if those values cannot guide the
+  // jet home, the return fails here. The carrier keeps flying its
+  // loop throughout (it reaches waypoint 0 and starts its ~120 deg
+  // turn mid-return), so the final is onto a turning,
+  // terrain-following deck.
+  // Pass 17 (worker F): the return pattern is FIX + HOLD
+  // (fix -> hold -> straight-in final), not the pass-14/15
+  // chase pursuit — see the phase-type comment. The jet flies
+  // to a fixed point on the target leg's extended centreline,
+  // orbits it, and breaks into the proven section-B final
+  // when the carrier is straight on that leg with enough
+  // leg left. The racetrack (races 1-6) is superseded: its
+  // line-following never settled (see the phase comment).
+  // section-B law, now turn-capable.
   {
     const heightAtLive = (x: number, z: number): number =>
       heightfieldHeightAt(
@@ -1440,35 +1461,59 @@ async function main(): Promise<void> {
     // frame rotates under the jet mid-pattern (turn1 swept 305 deg
     // and ended astern-starboard). A pursuit does not care about the
     // frame — it just chases a moving point.
-    type Phase = 'takeoff' | 'climb' | 'outbound' | 'turn1' | 'rejoin' | 'chase' | 'final' | 'done';
+    // Pass 17 (worker F): INERTIAL RACETRACK return. The pass-14/15
+    // chase pursuit is un-winnable while the carrier turns, and the
+    // baseline re-proves it: the aim point 500 m astern swings
+    // laterally at range x yawRate — at 1500-2500 m and up to
+    // 0.12 rad/s that is 180-300 m/s, three times the jet's speed,
+    // so the chase ends 240-430 m abeam of the deck, 31-36 deg off
+    // heading and below the deck (baseline laps 1/3), or loses the
+    // carrier entirely (lap 4: ends abeam, rel -90, 1872 m away).
+    // Turn1 has the same disease: its target is the LIVE reverse
+    // heading, so it sweeps 251-327 deg instead of 180. The
+    // racetrack (races 1-6) replaced pursuit with a fixed
+    // inertial pattern on one leg, but its setup flew a
+    // LINE-FOLLOWING law that never settled: a 30 deg crab at
+    // 110 m/s is a 55 m/s lateral speed, and reversing it takes
+    // ~3 s at the 9.7 deg/s turn rate, so the jet crossed the
+    // line and overshot by kilometres on every pass (race6:
+    // portErr -3752..+530, the line crossed at t=104/114/124/184
+    // but heading/along never aligned at the same instant).
+    // Fix + hold keeps the fixed-frame idea and drops the line:
+    // the jet flies to a FIXED point (the fix, 1200 m before the
+    // target leg's start waypoint on the leg's extended
+    // centreline), holds a pylon orbit around it, and breaks
+    // into a straight-in final — the proven section-B law, now
+    // turn-capable — when the carrier is actually on the fix's
+    // leg, straight, well into it and with enough leg left. No
+    // carrier-relative pursuit, no line to converge on, no base
+    // turn: the final starts on the centreline by construction.
+    // The carrier's leg is predicted from its public waypoint
+    // list + live position/heading (a game-side autopilot would
+    // need the carrier's route/leg data — see the pass-17
+    // report; a human pilot reads the same thing by eye).
+    // Phases: takeoff -> climb (deck+450) -> fix (pure pursuit
+    // of the fix at 100 m/s, deck+150) -> hold (pylon orbit at
+    // 85 m/s, flaps 30, deck+150) -> final (section-B law, now
+    // turn-capable: bank-compensated trim + 0.8 rad bank cap +
+    // AoA guard) -> done (trapped). A missed break or a leg
+    // flip is a safe re-fix at deck+150, never a low chase.
+    type Phase = 'takeoff' | 'climb' | 'fix' | 'hold' | 'climbout' | 'final' | 'done';
     let phase: Phase = 'takeoff';
     let tSec = 0;
     let shifts = 0;
     let pitchInt = 0;
     let liftoffT: number | null = null;
-    let outboundT0 = 0;
-    let outboundHdg = 0;
-    // Pass 15 coordinator: the carrier's heading at outbound ENTRY.
-    // The outbound leg flies this FIXED heading and measures "along"
-    // in this FIXED frame (see the outbound phase comment).
-    let minInboundDist = Infinity;
-    let inboundPassed = false;
     let goArounds = 0;
-    let inWindowPrev = false;
-    let rejoinT0 = 0;
-    let turn1T0 = 0;
     let finalT0 = 0;
     // Carrier turn rate (deg/s, EMA over 0.5 s samples): the final
     // is only winnable on a straight leg — the carrier turns at up
     // to 6.9 deg/s through its waypoints, and a 10 s final from
-    // 500 m cannot follow a 35-70 deg turn. The chase holds astern
-    // until the rate is low (pass 15, item 4).
+    // 500 m cannot follow a 35-70 deg turn. The fix + hold times
+    // the break to a straight leg instead of chasing one.
     let cYawRateEma = 0;
     let prevCYaw = 0;
     let prevCYawT = -1;
-    let turn1TurnedDeg = 0;
-    let turn1PrevHdg = 0;
-    let chaseT0 = 0;
     let attempts = 1;
     let touchedDown = false;
     let touchdownLz: number | null = null;
@@ -1501,16 +1546,153 @@ async function main(): Promise<void> {
       const d = (carrier2.yaw * 180) / Math.PI;
       return ((d % 360) + 360) % 360;
     };
-    // --- Pass 14 (worker F): rejoin return pattern ---
-    // Carrier-frame coords of the jet: along = metres ahead of the
-    // carrier along its heading (+ = ahead), port = metres to the
-    // carrier's port side (+ = port; port = -rightB, the same
-    // convention the old 'base' phase used).
-    const carrierFrame = (): { along: number; port: number } => {
-      const fwdC = new THREE.Vector3(Math.sin(carrier2.yaw), 0, Math.cos(carrier2.yaw));
-      const rightC = new THREE.Vector3(Math.cos(carrier2.yaw), 0, -Math.sin(carrier2.yaw));
-      const rel = ac.pos.clone().sub(carrier2.pos);
-      return { along: rel.dot(fwdC), port: -rel.dot(rightC) };
+    // --- Pass 17 (worker F): fix + hold geometry ---
+    // Leg tracking (stateful): the carrier flies the public
+    // waypoint loop in order, so the leg it is steering toward is
+    // tracked by advancing past each waypoint once the carrier is
+    // within 300 m of it — never by bearing, which mis-picks
+    // mid-turn (the yaw sweeps through the reciprocal of the leg
+    // just flown, whose bearing then matches the yaw). The advance
+    // fires ~4.5 s before the carrier actually starts turning
+    // (wpIndex advances at 120 m), so the setup pre-positions on
+    // the NEXT leg while the carrier is still turning into it.
+    // The hexagon is convex with legs >= 1908 m, so the 300 m
+    // rule can only fire at the targeted waypoint.
+    interface LegInfo {
+      iPrev: number;
+      iNext: number;
+      psi: number;
+      wPrev: THREE.Vector3;
+      wNext: THREE.Vector3;
+      remaining: number;
+    }
+    let legNext = 0;
+    const legInit = (): void => {
+      // At round start the carrier is 3800 m from waypoint 0,
+      // bearing = yaw; every other waypoint is far off-bearing.
+      let best = 0;
+      let bestAng = Infinity;
+      for (let i = 0; i < CARRIER_WAYPOINTS.length; i++) {
+        const w = CARRIER_WAYPOINTS[i]!;
+        const d = Math.hypot(w.x - carrier2.pos.x, w.z - carrier2.pos.z);
+        if (d < 1000) continue;
+        const brg = (Math.atan2(w.x - carrier2.pos.x, w.z - carrier2.pos.z) * 180) / Math.PI;
+        const ang = Math.abs(wrapDeg(brg - cYawDeg()));
+        if (ang < bestAng) {
+          bestAng = ang;
+          best = i;
+        }
+      }
+      legNext = best;
+    };
+    // FLOATING-ORIGIN FRAME (pass 17, worker F — the bug that sank
+    // the first racetrack run): ac.pos / carrier2.pos live in the
+    // SHIFTED frame (every origin shift moves them by -shift, and
+    // cumulativeShift grows by +shift), while CARRIER_WAYPOINTS
+    // are in the ORIGINAL frame (original = shifted +
+    // cumulativeShift, as heightAtLive shows). Mixing them put the
+    // aim point ~4000 m off after two shifts, and the jet chased
+    // a phantom downwind line 82 km away from the carrier. Every
+    // waypoint used in a leg-frame computation goes through shiftW
+    // (original -> current shifted frame); headings and distances
+    // are frame-independent and need no conversion. legInit runs
+    // at t=0 before any shift, so it is unaffected.
+    const shiftW = (w: THREE.Vector3): THREE.Vector3 =>
+      w.clone().sub(floatingOrigin.cumulativeShift);
+    const legInfo = (): LegInfo => {
+      const wN0 = shiftW(CARRIER_WAYPOINTS[legNext]!);
+      if (Math.hypot(wN0.x - carrier2.pos.x, wN0.z - carrier2.pos.z) < 300) {
+        legNext = (legNext + 1) % CARRIER_WAYPOINTS.length;
+      }
+      const iNext = legNext;
+      const iPrev = (legNext + CARRIER_WAYPOINTS.length - 1) % CARRIER_WAYPOINTS.length;
+      const wPrev = CARRIER_WAYPOINTS[iPrev]!;
+      const wNext = CARRIER_WAYPOINTS[iNext]!;
+      const psi = Math.atan2(wNext.x - wPrev.x, wNext.z - wPrev.z);
+      const wNextS = shiftW(wNext);
+      return {
+        iPrev,
+        iNext,
+        psi,
+        wPrev: shiftW(wPrev),
+        wNext: wNextS,
+        remaining: Math.hypot(wNextS.x - carrier2.pos.x, wNextS.z - carrier2.pos.z),
+      };
+    };
+    // Leg-frame coords of a point: along = metres from the leg's
+    // start waypoint along the leg heading, port = metres to the
+    // leg's port side. The frame is FIXED once captured — the
+    // carrier's turns cannot rotate it under the jet.
+    const legFrameOf = (
+      p: THREE.Vector3,
+      wPrev: THREE.Vector3,
+      psi: number,
+    ): { along: number; port: number } => {
+      const f = new THREE.Vector3(Math.sin(psi), 0, Math.cos(psi));
+      const port = new THREE.Vector3(-Math.cos(psi), 0, Math.sin(psi));
+      const rel = p.clone().sub(wPrev);
+      return { along: rel.dot(f), port: rel.dot(port) };
+    };
+    // Fix + hold geometry (pass 17, worker F — the racetrack's
+    // line-following is superseded; see the phase-type comment).
+    // FIX_DIST: the fix sits this far BEFORE the leg's start
+    // waypoint on the leg's extended centreline, so the straight-in
+    // runs ~1800 m astern at the break (1200 + the 600 m the
+    // carrier needs to straighten into the leg). HOLD_SPEED:
+    // 95 m/s with flaps 30 gives a ~770 m orbit radius at 50 deg
+    // bank, inside the final law's lateral authority over the
+    // straight-in, and the bank-compensated trim needs ~10 deg AoA
+    // there (inside the 12 deg cap). 85 m/s does NOT hold a
+    // sustained 50 deg bank: the trim needs ~13 deg (observed
+    // fixhold8 — AoA pinned 12.6-13.5, sinking deck+136 to
+    // deck-63 into terrain).
+    const FIX_DIST = 1200;
+    const HOLD_SPEED = 95;
+    // Captured fix leg (set on hold entry): the leg INDEX and
+    // heading only — never waypoint vectors, which would go stale
+    // at the next origin shift (see the shiftW note above). The
+    // shifted fix point is re-derived live from these.
+    let fixPsi = 0;
+    let fixINext = -1;
+    let climboutHdg = 0;
+    let holdBank = 0.87;
+    let holdT0 = 0;
+    let fixLogT = 0;
+    let finalClNeed = 0;
+    // Invert the REAL lift curve at flaps 30 for the trim AoA at a
+    // given CL (pass 15, item 4 — the bisection the final entry
+    // already used at 1 g). The final law calls it every substep
+    // with the bank-compensated CL.
+    const trimAoaFor = (cl: number): number => {
+      let aoaLo = -5;
+      let aoaHi = 30;
+      for (let i = 0; i < 24; i++) {
+        const mid = (aoaLo + aoaHi) / 2;
+        if (clFromCurve(mid, 1, spec.clCurve) < cl) aoaLo = mid;
+        else aoaHi = mid;
+      }
+      return Math.max(0, Math.min(15, (aoaLo + aoaHi) / 2));
+    };
+    // Enter the final from the base-turn rollout: same trim setup
+    // as the old chase->final handoff (vApp deck-relative, trim
+    // from the real lift curve), plus the 1 g CL the final law
+    // now scales by the bank load factor every substep.
+    const enterFinal = (): void => {
+      finalVApp = Math.max(46, spec.stallSpeed * 0.8);
+      const dvF = deck2.velocityAt(ac.pos.x, ac.pos.z);
+      const vAirApp = Math.hypot(dvF.x, dvF.z) + finalVApp;
+      finalClNeed = (2 * spec.mass * 9.81) / (1.225 * vAirApp * vAirApp * spec.wingArea);
+      finalAoaTrim = trimAoaFor(finalClNeed);
+      finalPitchInt = 0;
+      ac.gear = true;
+      ac.hook = true;
+      ac.flaps = 30;
+      phase = 'final';
+      finalT0 = tSec;
+      const mLoc = manualLocal2();
+      console.log(
+        `  BASE DONE -> FINAL t=${tSec.toFixed(1)}s local=(${mLoc.x.toFixed(1)},${mLoc.z.toFixed(1)}) vApp=${finalVApp.toFixed(1)} aoaTrim=${finalAoaTrim.toFixed(1)}`,
+      );
     };
     // Max terrain height under the jet and 100/200/300/500/1000 m
     // ahead along its velocity — the predictive floor. A reactive
@@ -1638,14 +1820,86 @@ async function main(): Promise<void> {
         );
         const altErr = slopeAlt - ac.pos.y;
         const dvY = deck2.velocityAt(ac.pos.x, ac.pos.z).y;
-        const vsDes = clamp(-finalVApp * 0.061 + altErr * 0.35 + dvY, -4.5, 15.0);
+        // Pass 17 (worker F): the sink cap is a single -14 m/s,
+        // the altitude gain is 0.6 far astern (loc.z < -800) and
+        // 0.35 inside -800 m (the proven section-B gain), and the
+        // error is LEAD-COMPENSATED 2 s ahead. The jet's vertical
+        // speed lags the commanded vsDes by ~2-3 s (pitch loop +
+        // aircraft response), so a plain proportional law overshoots
+        // the slope: it slams in at the -14 cap, goes below it,
+        // then oscillates 3-10 m above it in the last 1000 m and
+        // touches down long (fixhold11: -21.9, hook past the wires,
+        // rolled off the bow). Predicting the error ahead — using
+        // the jet's vertical speed relative to the deck — makes the
+        // law ease off the sink before reaching the slope. On the
+        // slope vy_rel is -3.2, so the prediction is ~altErr and
+        // section B (which starts on the slope at ~-500 m) is
+        // exactly unchanged — the section-B checks below are the
+        // proof.
+        const vyRel = ac.vel.y - dvY;
+        // Pass 17 (worker F, fixhold17-24): the jet breaks into
+        // the final ~200 m ABOVE the slope (hold at deck+350,
+        // slope at 2450 m astern is deck+146) and must burn ~340 m
+        // over the ~50 s final. Cap/lead/gain tuning does not
+        // converge: -14 (fixhold16) overshoots 11 m below and
+        // porpoises into the terrain; -10 (fixhold18) dives
+        // through (11 m below at 277 m, level at deck+3, -20
+        // bolter fires); -6 (fixhold19) is too slow (95 m ABOVE
+        // at 293 m); -8 (fixhold20) still bolts; a sink-scaled
+        // lead (fixhold21) destabilises the loop (porpoising,
+        // negative AoA, terrain crash). The root cause is the
+        // far-astern GAIN (0.6): for a 200 m error it demands
+        // vsDes = -3.22 - 120 = -123 m/s, so the cap brutally
+        // limits it to a constant-rate dive and the transition
+        // onto the slope is abrupt. Gain 0.15 (fixhold22) got
+        // the jet ONTO the deck (local (12,19), 22 m out) but
+        // 11 m ABOVE the slope at the wires, so it touched down
+        // long past the wire zone and crashed hard. Gain 0.3
+        // (fixhold23) and 0.45 (fixhold24) both leave it 15 m
+        // ABOVE the slope at 308 m (bolter at -19/-18) — the
+        // gain is not the limiter. The limiter is the
+        // PITCH-ANGLE loop: vsDes wants -7.85 m/s but the jet
+        // only achieves -5.6, because pitchDes = -(gammaDes +
+        // aoaTrim) is nearly level when gammaDes and aoaTrim
+        // cancel. A pitch-angle loop is too indirect for
+        // vertical-speed control; the next architecture is a
+        // vertical-speed loop (command pitch directly from the
+        // vs error) or a dedicated descent phase before the
+        // final. Best-known state is gain 0.15 (fixhold22):
+        // the return leg navigates to the carrier and reaches
+        // the deck, but the final cannot put it in the wire
+        // zone. Cap -10, lead 2 s.
+        // Section B starts on-slope (~-22 m error, inside the
+        // -800 m / 0.35-gain region), so it is exactly unchanged.
+        const altGainFar = loc.z < -800 ? 0.15 : 0.35;
+        const altErrPred = altErr + (-finalVApp * 0.061 - vyRel) * 2.0;
+        const vsDes = clamp(-finalVApp * 0.061 + altErrPred * altGainFar + dvY, -10, 15.0);
         const airspeed = Math.max(20, Math.hypot(ac.vel.x, ac.vel.z));
         const gammaDes = Math.atan2(vsDes, airspeed);
-        const pitchDes = -(gammaDes + (finalAoaTrim * Math.PI) / 180);
+        // Pass 17 (worker F): BANK-COMPENSATED trim. The pass-15
+        // final used the 1 g trim AoA in the pitch law, so in a
+        // banked turn the lift tilted away and the jet sank below
+        // the deck while pitched up 15 deg (baseline lap 1: from
+        // deck+53 to deck-28 in 15 s in a 35 deg bank, pitched
+        // 11-13 deg nose-up). The trim is now inverted from the
+        // REAL lift curve at the load factor the bank demands
+        // (1/cos(bank), capped 2.0 — the same compensation flyTo
+        // already has), so the pitch law holds the slope in a
+        // turn. The lateral bank cap rises 0.61 -> 0.80 rad (46
+        // deg): at 93 m/s that turns 6.3 deg/s, matching the
+        // carrier's 6.9 deg/s peak, so the final can FOLLOW a
+        // carrier turn instead of only flying straight legs. The
+        // AoA guard (flaps-30 thresholds) unloads before a stall.
+        const bankNowPitch = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
+        const loadF = Math.min(2.0, 1 / Math.max(0.5, Math.cos(bankNowPitch)));
+        const aoaTrimLive = trimAoaFor(finalClNeed * loadF);
+        const pitchDes = -(gammaDes + (aoaTrimLive * Math.PI) / 180);
         const pitchNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').x;
         const pitchErr = pitchDes - pitchNow;
         finalPitchInt = clamp(finalPitchInt + pitchErr * dt * 0.8, -0.35, 0.35);
         ac.pitchIn = clamp(pitchErr * 4.0 + finalPitchInt, -0.7, 0.7);
+        if (ac.aoa > 15) ac.pitchIn = Math.max(ac.pitchIn, 0);
+        if (ac.aoa > 18) ac.pitchIn = Math.max(ac.pitchIn, 0.15);
         // Pass 15 (item 4): the lateral law commands a BANK, not a
         // roll rate. The sign is load-bearing and was inverted in
         // the first bank-desired version: manualLocal2().x is
@@ -1674,7 +1928,13 @@ async function main(): Promise<void> {
         // heading converges without overshoot.
         const bankNow = new THREE.Euler().setFromQuaternion(ac.quat, 'YXZ').z;
         const desHdgF = cYawDeg() + clamp(-loc.x * 0.05, -25, 25);
-        const bankDes = clamp((jetHdgDeg(ac) - desHdgF) * 0.03, -0.61, 0.61);
+        // Pass 17 (worker F): the heading error MUST be wrapped.
+        // Unwrapped, a 33 deg left turn reads as -327 deg and the
+        // law commands max RIGHT bank instead — final #2 (fixhold5)
+        // turned right 22->192 deg, spiralled away from the carrier
+        // (dist 2970->5114 m), AoA rising to 15.3, instead of the
+        // 58 deg left turn to the carrier's 324 deg heading.
+        const bankDes = clamp(wrapDeg(jetHdgDeg(ac) - desHdgF) * 0.03, -0.8, 0.8);
         ac.rollIn = clamp((bankDes - bankNow) * 1.5, -0.7, 0.7);
         ac.thrTarget = clamp(0.5 + (finalVApp - deckRelSpeed2(ac)) * 0.12, 0.15, 0.9);
       } else {
@@ -1733,6 +1993,7 @@ async function main(): Promise<void> {
             console.log(
               `  t=${tSec.toFixed(0)} phase=${phase} hdg=${jetHdgDeg(ac).toFixed(0)} cYaw=${cYawDeg().toFixed(0)} ` +
                 `brg=${b.absDeg.toFixed(0)}/${b.relDeg.toFixed(0)} dist=${b.distM.toFixed(0)}m alt=${(ac.pos.y - carrier2.deckTopY).toFixed(0)} ` +
+                `deckY=${carrier2.deckTopY.toFixed(0)} vy=${ac.vel.y.toFixed(1)} dvY=${deck2.velocityAt(ac.pos.x, ac.pos.z).y.toFixed(1)} ` +
                 `ias=${ac.ias.toFixed(0)} pitch=${(-eul.x * 57.3).toFixed(1)} bank=${(eul.z * 57.3).toFixed(1)} ` +
                 `pitchIn=${ac.pitchIn.toFixed(2)} rollIn=${ac.rollIn.toFixed(2)} thr=${ac.throttle.toFixed(2)}/${ac.thrTarget.toFixed(2)} ` +
                 `aoa=${ac.aoa.toFixed(1)} stalled=${ac.stalled} loc=${loc ? `(${loc.x.toFixed(0)},${loc.z.toFixed(0)})` : 'off'} onDeck=${ac.onDeck} alive=${ac.alive} shifts=${shifts}`,
@@ -1760,301 +2021,203 @@ async function main(): Promise<void> {
             // < ~130 m (HelicarrierController header).
             flyTo(takeoffHdg, carrier2.deckTopY + 450, 95, dt);
             if (ac.pos.y >= carrier2.deckTopY + 400) {
-              phase = 'outbound';
-              outboundHdg = cYawDeg();
-              outboundT0 = tSec;
+              phase = 'fix';
               console.log(`  CLIMB DONE t=${tSec.toFixed(1)}s alt=${(ac.pos.y - carrier2.deckTopY).toFixed(0)}`);
             }
-          } else if (phase === 'outbound') {
-            // Pass 15 coordinator: FIXED heading + FIXED frame. The
-            // old version flew the carrier's LIVE heading and exited
-            // on the LIVE carrier-frame along coordinate — but the
-            // carrier turns up to 6.9 deg/s through its waypoints,
-            // and on a retry lap it can turn ~130 deg during the
-            // outbound leg. The jet then turns WITH the carrier (its
-            // heading tracks cYaw), so the live-frame along never
-            // exceeds 3900 even as the distance grows past 4.5 km,
-            // and the retry lap spins in outbound for the rest of
-            // the 900 s budget (coordinator runs: ended outbound
-            // at 3387 m after 2 go-arounds). Flying the heading
-            // captured at entry and measuring along in that fixed
-            // frame makes the exit immune to the carrier's turns;
-            // turn1/rejoin are live-heading based and fix whatever
-            // geometry the fixed outbound produces. The distance
-            // guard is kept (it stops a frame-rotation transient
-            // from exiting early, as before).
-            flyTo(outboundHdg, carrier2.deckTopY + 450, 95, dt, 0.7);
-            const fwdO = new THREE.Vector3(Math.sin((outboundHdg * Math.PI) / 180), 0, Math.cos((outboundHdg * Math.PI) / 180));
-            const alongO = ac.pos.clone().sub(carrier2.pos).dot(fwdO);
-            if (alongO > 3900 && b.distM > 3500) {
-              phase = 'turn1';
-              turn1T0 = tSec;
-              turn1TurnedDeg = 0;
-              turn1PrevHdg = jetHdgDeg(ac);
-              console.log(`  OUTBOUND DONE t=${tSec.toFixed(1)}s dist=${b.distM.toFixed(0)}m brgRel=${b.relDeg.toFixed(0)} along=${alongO.toFixed(0)}`);
-            }
-          } else if (phase === 'turn1') {
-            // 180 deg reversal onto the downwind heading. A heading
-            // law (not a fixed bank): the target is the LIVE reverse
-            // heading + 10 deg, so the jet tracks the carrier's
-            // heading as it turns instead of sweeping a fixed 180
-            // deg in a rotating frame (the fixed-bank version swept
-            // 305 deg and ended astern-starboard). The +10 deg bias
-            // picks the turn side (port); the exit checks the SAME
-            // biased target — the 14a failure was exiting on the
-            // unbiased reverse, 10 deg from where the law settles,
-            // so the jet flew straight forever. 60 deg bank at
-            // 120 m/s: turn rate 9.7 deg/s, faster than the carrier's
-            // 6.9 deg/s — the 40 deg / 100 m/s turn (4.7 deg/s) was
-            // SLOWER than the carrier, so the target ran away and
-            // the jet swept 291 deg (return14c lap 1). At 120 m/s
-            // the 60 deg bank needs only ~10 deg AoA, clear of the
-            // 13 deg limiter. The exit geometry does not matter here
-            // — the rejoin fixes whatever turn1 produces.
-            const des = (((carrier2.yaw * 180) / Math.PI + 190) % 360 + 360) % 360;
-            // Hybrid: fixed 60 deg bank while the error is large (the
-            // heading law tapers the bank and the last 30 deg takes
-            // 25 s), heading law for the last 25 deg (it tracks the
-            // moving target and settles onto it). The fixed bank
-            // sweeps at 9.7 deg/s, faster than the carrier's 6.9.
-            const err1 = Math.abs(wrapDeg(jetHdgDeg(ac) - des));
-            if (err1 > 25) {
-              flyTo(des, carrier2.deckTopY + 450, 120, dt, 1.05, 6, 1.05);
-            } else {
-              flyTo(des, carrier2.deckTopY + 450, 120, dt, 1.05);
-            }
-            const hdgNow1 = jetHdgDeg(ac);
-            turn1TurnedDeg += Math.abs(wrapDeg(hdgNow1 - turn1PrevHdg));
-            turn1PrevHdg = hdgNow1;
-            if ((Math.abs(wrapDeg(hdgNow1 - des)) < 10 && turn1TurnedDeg > 90) || tSec - turn1T0 > 90) {
-              const cf1 = carrierFrame();
-              phase = 'rejoin';
-              rejoinT0 = tSec;
-              console.log(`  TURN1 DONE t=${tSec.toFixed(1)}s hdg=${hdgNow1.toFixed(0)} turned=${turn1TurnedDeg.toFixed(0)} dist=${b.distM.toFixed(0)}m frame along=${cf1.along.toFixed(0)} port=${cf1.port.toFixed(0)}`);
-            }
-          } else if (phase === 'rejoin') {
-            // Stern chase (pass 14, worker F, second attempt): the
-            // jet chases a point 1500 m astern of the carrier, on the
-            // centreline, slowing as it closes so it settles astern
-            // instead of overshooting. A pursuit does not care about
-            // the carrier's frame — the point moves with the carrier
-            // through its turns, and the jet just follows it. The
-            // jet may pass OVER the carrier to get astern (deck+150,
-            // clear of the tower). Completion is a wide box (astern,
-            // near the centreline, roughly aligned, under 95 m/s) —
-            // the chase then flies the final ~1000 m to the gate.
-            // (Line-following was tried in return14j and reverted:
-            // it steered the jet onto the centreline, but the
-            // carrier's turns rotate the frame at up to 270 m/s at
-            // 2 km, so the port error never settled inside the box
-            // before the jet flew past the carrier.)
-            const cfR = carrierFrame();
-            const fwdR = new THREE.Vector3(Math.sin(carrier2.yaw), 0, Math.cos(carrier2.yaw));
-            const pxR = carrier2.pos.x - fwdR.x * 1500;
-            const pzR = carrier2.pos.z - fwdR.z * 1500;
-            const distR = Math.hypot(pxR - ac.pos.x, pzR - ac.pos.z);
-            const desR = ((Math.atan2(pxR - ac.pos.x, pzR - ac.pos.z) * 180) / Math.PI + 360) % 360;
-            // Speed floor 90 m/s (was 60, then 85): the F-18's clean
-            // stall is 66 m/s, and at 60-73 m/s the jet needs ~15 deg
-            // AoA just to hold altitude in a gentle bank — past the
-            // 13 deg AoA limiter — so it mushed from deck+150 into
-            // the terrain in 35 s (return14c lap 1). The rejoin is
-            // flown at 90-105 m/s throughout; the chase slows it from
-            // there. vsFF is the deck's vertical velocity, so the jet
-            // tracks a carrier climbing a ridge (return14e).
-            const speedR = clamp(50 + distR * 0.02, 90, 105);
-            const floorR = terrainAheadMax() + 80;
-            // Hold deck+450 (795 m abs, above the 750 m terrain max)
-            // until within 1500 m of the rejoin point, then descend
-            // to deck+150 over the loop corridor (terrain < 310 m).
-            // Descending to deck+150 while still 4 km out put the
-            // jet at ~740 m abs over 752 m peaks in a 42 deg bank
-            // (return14g: died at t=143.3; 14f survived the same
-            // point by luck). The chase descends it the rest of the
-            // way on its glide path.
-            const altR = distR > 1500 ? carrier2.deckTopY + 450 : carrier2.deckTopY + 150;
-            const dvYR = deck2.velocityAt(ac.pos.x, ac.pos.z).y;
-            flyTo(desR, Math.max(altR, floorR), speedR, dt, 0.7, 6, undefined, dvYR);
-            const hdgErrR = Math.abs(wrapDeg(jetHdgDeg(ac) - cYawDeg()));
-            // Altitude guard: never hand the chase a sinking jet.
-            const altOkR = ac.pos.y > carrier2.deckTopY + 20;
-            if (cfR.along < -800 && Math.abs(cfR.port) < 400 && hdgErrR < 30 && ac.ias < 95 && altOkR) {
-              phase = 'chase';
-              chaseT0 = tSec;
-              console.log(`  REJOIN DONE t=${tSec.toFixed(1)}s along=${cfR.along.toFixed(0)} port=${cfR.port.toFixed(0)} hdgErr=${hdgErrR.toFixed(1)} ias=${ac.ias.toFixed(0)} dist=${b.distM.toFixed(0)}m`);
-            } else if (tSec - rejoinT0 > 180 || cfR.along < -6000) {
-              goArounds++;
-              attempts++;
-              console.log(`  GO-AROUND #${goArounds} (rejoin timeout) t=${tSec.toFixed(1)}s along=${cfR.along.toFixed(0)} port=${cfR.port.toFixed(0)} hdgErr=${hdgErrR.toFixed(1)} distR=${distR.toFixed(0)}m`);
-              outboundHdg = cYawDeg();
-              phase = 'outbound';
-            }
-          } else if (phase === 'chase') {
-            // Pursuit of a point 500 m astern of the carrier's
-            // CURRENT position (pass 13): the old law flew the
-            // carrier's heading with a +/-25 deg lateral correction,
-            // which has no pursuit term — when the carrier turns
-            // ~120 deg mid-chase the jet ends up orbiting its track
-            // instead of intercepting, and the entry gate never
-            // fires (baseline: min dist 337 m, ends 4351 m away;
-            // h4/h7: the jet then flew the commanded glide path
-            // into a terrain ridge and died). The astern point
-            // moves with the carrier, so pure pursuit converges to
-            // an aligned position behind it. Bank cap 0.61 rad
-            // (35 deg, as in baseTurn) instead of 0.45: turn rate
-            // 4.6 deg/s at 85 m/s instead of 3.2, so the jet can
-            // keep up with the carrier's turn. (Line-following was
-            // tried in return14j and reverted — see the rejoin
-            // comment; the carrier's frame rotation defeats it.)
-            const cy = carrier2.yaw;
-            const px = carrier2.pos.x - Math.sin(cy) * 500;
-            const pz = carrier2.pos.z - Math.cos(cy) * 500;
-            const dxP = px - ac.pos.x;
-            const dzP = pz - ac.pos.z;
-            const distP = Math.hypot(dxP, dzP);
-            const desC = (Math.atan2(dxP, dzP) * 180) / Math.PI;
-            // 65 m/s, not 85: turn rate 6.6 deg/s at 35 deg bank
-            // (radius 524 m) instead of 4.6 deg/s (1050 m), and the
-            // jet closes on the moving point at ~25 m/s instead of
-            // ~48 — at 85 the jet blew through the entry window
-            // still 174 m high and 49 deg off heading, then
-            // overshot the point and crashed onto the deck edge
-            // (local (32,-99), 40 deg bank, AoA 28 deg). The glide
-            // path reaches deck+40 at 300 m from the point, so the
-            // jet is level and slow well before the gate.
-            // Pass 14 (worker F): the 65 m/s is a FLOOR near the
-            // gate, not the cruise — the chase is flown at 70-100
-            // m/s and only slows to ~70 m/s at the gate. At 65 m/s
-            // the clean F-18 is below its 66 m/s stall speed: any
-            // bank correction needs more lift than the wing has at
-            // the 13 deg AoA limiter, so the jet mushed from
-            // deck+61 into the terrain in 35 s (return14c lap 1).
-            // The final law (vApp 52.8 m/s, flaps 30) slows the jet
-            // on final; the chase hands it over at ~70 m/s.
-            // Return14e: the chase flew at 77-92 m/s with AoA pinned
-            // at 12.9-13.4 deg (the limiter) while sinking 300 m —
-            // it could not bank AND climb, and it had no deck
-            // vertical-velocity feed-forward, so a carrier climbing
-            // a ridge pulled the glide path away from it. The chase
-            // now flies with flaps 30 (FLAP_CL 0.35) from entry: at
-            // 70 m/s a 15 deg bank needs AoA 16.5 deg clean but only
-            // ~7.8 deg with flaps, and the trim is corrected for
-            // them. Gear down too. vsFF is the deck's vertical
-            // velocity (same feed-forward as the final law).
-            // Return14f: the final law's vApp is DECK-relative, so
-            // the chase must hand over at AIRSPEED vApp + carrier
-            // speed = 52.8 + 40 = ~93 m/s, not 70. At 70 m/s
-            // airspeed the deck-relative speed is only ~30 m/s, so
-            // the final law commanded FULL throttle (0.90) to
-            // accelerate to 52.8 deck-relative, the jet accelerated
-            // to 95 m/s while descending, banked 56 deg, stalled
-            // at AoA 38 deg and spiralled into the terrain. The
-            // chase now flies at 93-105 m/s airspeed (deck-relative
-            // ~53 at the gate), so the final law holds speed instead
-            // of surging.
-            const speedC = clamp(93 + (distP - 600) * 0.02, 93, 105);
-            // The glide path flattens at 600 m from the carrier (was
-            // 300 m from the aim point): the jet levels off at deck+40
-            // well before the gate instead of still descending through
-            // it (return14f: it entered final at deck-25, ~100 m below
-            // the path, because the slope's corner at 300 m gave it no
-            // time to arrest its 4.5 m/s descent).
-            const glideAltC = carrier2.deckTopY + 40 + Math.max(0, distP - 600) * 0.061;
-            // Terrain floor: the 3.5 deg glide path can run below a
-            // ridge 2-3 km out (the carrier flies at ~350 m abs
-            // over ~310 m terrain; peaks reach ~540 m). Without it
-            // the jet flies the commanded deck+192 straight into
-            // the ridge (h4/h7 crash, hard landing, alt 193 rel).
+          } else if (phase === 'climbout') {
+            // Missed approach: climb STRAIGHT AHEAD (the heading at
+            // the go-around), wings level, full throttle, to deck+450
+            // — the safe cruise that clears the 750 m terrain max —
+            // before turning toward the next fix. Turning toward the
+            // fix while low and slow after a final killed fixhold5
+            // (crashed 17 s after go-around #2, still climbing from
+            // deck+238 over 645 m terrain). Flaps stay 30 (the jet
+            // is slow); the bank cap is 0.15 rad so the climb is
+            // not stolen by a turn, and the terrain floor is the
+            // backstop as in the fix phase.
             const floorC = terrainAheadMax() + 80;
             const dvYC = deck2.velocityAt(ac.pos.x, ac.pos.z).y;
+            const altClimbout = Math.max(carrier2.deckTopY + 450, floorC + 50);
+            flyTo(climboutHdg, altClimbout, 110, dt, 0.15, 10, undefined, dvYC, 0.35);
+            if (ac.pos.y - carrier2.deckTopY >= 400) {
+              console.log(`  CLIMBOUT DONE t=${tSec.toFixed(1)}s altRel=${(ac.pos.y - carrier2.deckTopY).toFixed(0)}`);
+              phase = 'fix';
+            }
+          } else if (phase === 'fix') {
+            // Fly to the FIX: a point on the target leg's extended
+            // centreline, 1200 m before the leg's start waypoint,
+            // at deck+150. The fix is a FIXED point (in the
+            // original frame, shifted live) — pure pursuit of it
+            // converges, unlike the racetrack's line-following,
+            // which oscillated +/-3000 m around the line and never
+            // settled (race6: portErr -3752..+530, the jet crossing
+            // the line at 55 m/s lateral and overshooting by
+            // kilometres on every pass, because a 30 deg crab at
+            // 110 m/s outruns the 9.7 deg/s turn rate). The target
+            // leg is the one the carrier is steering toward
+            // (legInfo), so the jet pre-positions on the NEXT leg
+            // while the carrier is still turning into it. When the
+            // fix's leg flips (the carrier moved on), the fix
+            // moves with it and the jet re-pursues.
+            const leg = legInfo();
+            const psiDeg = (leg.psi * 180) / Math.PI;
+            // leg.wPrev is already in the shifted frame (legInfo
+            // returns shifted waypoints) — do NOT shift it again.
+            const fix = leg.wPrev.clone().addScaledVector(
+              new THREE.Vector3(Math.sin(leg.psi), 0, Math.cos(leg.psi)),
+              -FIX_DIST,
+            );
+            const distFix = Math.hypot(fix.x - ac.pos.x, fix.z - ac.pos.z);
+            const desFix = ((Math.atan2(fix.x - ac.pos.x, fix.z - ac.pos.z) * 180) / Math.PI + 360) % 360;
+            const floorX = terrainAheadMax() + 80;
+            // deck+350: the fix/hold sit on the leg's extension
+            // outside the loop basin, where the terrain reaches
+            // ~750 m abs (fixhold4 crashed at 748 m abs). The
+            // nominal altitude is deck+350 (~700 m abs); the
+            // terrain floor below is the real protection — but
+            // only if the jet can CLIMB to it. In a sustained
+            // 50 deg bank it cannot (vertical lift is cos 50 deg
+            // = 0.64 and the AoA cap blocks the rest), so when
+            // the floor is above the jet the wings level (bank
+            // cap 0.3 rad) and the jet climbs to floor+50.
+            const altFix = carrier2.deckTopY + 350;
+            const dvYX = deck2.velocityAt(ac.pos.x, ac.pos.z).y;
+            // Near the fix, slow to 95 m/s with flaps 30 and a
+            // 50 deg bank cap: the turn radius drops to ~770 m
+            // (from ~1200 m at 110 m/s / 60 deg) and the
+            // bank-compensated trim needs ~10 deg AoA there,
+            // so the jet can actually turn onto the fix instead of
+            // orbiting it at 400-800 m (fixhold2: closed to 411 m
+            // at t=119, then swung out to 794 m, never inside the
+            // 400 m entry radius). Far from the fix it stays fast
+            // (110 m/s, 60 deg bank) to get there before the leg
+            // flips.
+            const nearFix = distFix < 1200;
+            const fixSpeed = nearFix ? 95 : 110;
+            // Bank cap 50 deg (0.87) in BOTH regimes: a sustained
+            // 60 deg bank at 110 m/s pins AoA at 12.5-13.6 (the
+            // trim needs ~13.5 deg) and sinks 16 m/s (fixhold3).
+            // 50 deg needs ~10.7 deg and holds. The far transit
+            // only needs ~6 deg/s of turn rate to track the fix.
+            const fixBank = 0.87;
+            const fixFlap = nearFix ? 0.35 : 0;
+            if (nearFix && ac.flaps !== 30) {
+              ac.flaps = 30;
+              ac.gear = true;
+            } else if (!nearFix && ac.flaps !== 0) {
+              ac.flaps = 0;
+            }
+            // Terrain climb (see above): level the wings and climb
+            // to floor+50 whenever the terrain floor is above the
+            // jet — otherwise a banked turn sinks it into a rise.
+            const needClimbX = floorX + 50 > ac.pos.y;
+            const fixBankEff = needClimbX ? Math.min(fixBank, 0.3) : fixBank;
+            const altFixEff = needClimbX ? Math.max(altFix, floorX + 50) : Math.max(altFix, floorX);
+            flyTo(desFix, altFixEff, fixSpeed, dt, fixBankEff, 10, undefined, dvYX, fixFlap);
+            const altRelFix = ac.pos.y - carrier2.deckTopY;
+            if (tSec - fixLogT >= 5) {
+              fixLogT = tSec;
+              console.log(
+                `  FIX t=${tSec.toFixed(0)} leg=${leg.iPrev}->${leg.iNext} psi=${psiDeg.toFixed(0)} distFix=${distFix.toFixed(0)}m hdg=${jetHdgDeg(ac).toFixed(0)} altRel=${altRelFix.toFixed(0)} dist=${b.distM.toFixed(0)}m`,
+              );
+            }
+            if (distFix < 800 && altRelFix < 450 && altRelFix > 200) {
+              // Capture the fix's leg FIXED: the hold orbits this
+              // leg's fix until the carrier is on it (or the leg
+              // flips, which sends the jet back to 'fix').
+              fixPsi = leg.psi;
+              fixINext = leg.iNext;
+              // Orbit direction: turn toward the leg heading, so
+              // the break's heading gate is met sooner. A fixed
+              // bank (below) gives a deterministic ~620 m orbit;
+              // the heading law cannot (see the hold branch).
+              holdBank = wrapDeg(psiDeg - jetHdgDeg(ac)) > 0 ? -0.87 : 0.87;
+              phase = 'hold';
+              holdT0 = tSec;
+              console.log(`  HOLD ENTERED t=${tSec.toFixed(1)}s leg=${leg.iPrev}->${leg.iNext} psi=${psiDeg.toFixed(0)} distFix=${distFix.toFixed(0)}m`);
+            }
+          } else if (phase === 'hold') {
+            // Orbit the captured fix at a FIXED bank (flyTo's
+            // fixedBankRad), NOT the pylon-turn heading law. The
+            // heading law cannot hold a tight orbit: flyTo's bank
+            // is gain 1.0 on the heading error, so a 50 deg bank
+            // needs a 50 deg error, and the jet settles into
+            // whatever radius makes the error small — fixhold6
+            // drifted into a 6 km orbit at 7 deg bank and flew
+            // 8 km from the carrier before crashing. A fixed 50
+            // deg bank at 85 m/s is a deterministic ~620 m circle
+            // whose centre is fixed, so the jet stays bounded
+            // near the fix (it re-fixes if it drifts past 1500 m).
+            // The orbit direction (holdBank, set at entry) turns
+            // toward the leg heading so the break gate is met
+            // sooner. The break also requires distFix < 1000 m,
+            // so the straight-in starts near the fix, not from
+            // the far side of a wide orbit. Terrain climb: when
+            // the floor is above the jet, drop out of the fixed
+            // bank into the heading law at 0.3 rad and climb to
+            // floor+50 (a 50 deg bank cannot out-climb a rise);
+            // the orbit resumes above the floor. If the carrier
+            // moves to a new leg first, the jet re-targets (back
+            // to 'fix') instead of waiting on a stale leg.
+            const legNow = legInfo();
+            const fixPsiDeg = (fixPsi * 180) / Math.PI;
+            // The fix point, re-derived live from the captured leg
+            // (never a captured vector — a shift would stale it).
+            const fixWPrev = shiftW(CARRIER_WAYPOINTS[(fixINext + CARRIER_WAYPOINTS.length - 1) % CARRIER_WAYPOINTS.length]!);
+            const fixLive = fixWPrev.clone().addScaledVector(
+              new THREE.Vector3(Math.sin(fixPsi), 0, Math.cos(fixPsi)),
+              -FIX_DIST,
+            );
+            const distFixHold = Math.hypot(fixLive.x - ac.pos.x, fixLive.z - ac.pos.z);
+            const brgFix = ((Math.atan2(fixLive.x - ac.pos.x, fixLive.z - ac.pos.z) * 180) / Math.PI + 360) % 360;
+            const floorH = terrainAheadMax() + 80;
+            const dvYH = deck2.velocityAt(ac.pos.x, ac.pos.z).y;
             if (ac.flaps !== 30) {
               ac.flaps = 30;
               ac.gear = true;
             }
-            flyTo(desC, Math.max(glideAltC, floorC), speedC, dt, 0.61, 15, undefined, dvYC, 0.35);
-            const mLoc = manualLocal2();
-            // Pass 14 (worker F): the chase DOES have an abort now —
-            // the old no-abort rule was written when the escape
-            // mushed into the terrain in a banked low-speed climb.
-            // The new go-around climbs back to deck+450 via outbound
-            // (a straight climb on the carrier's heading, over the
-            // low loop corridor), so a bad entry is recoverable.
-            // Entry conditions on top of the -900..-450 m window:
-            // aligned within 20 deg of the carrier's heading and at
-            // deck+0..+150. Return9 entered at 598 m astern, 36 deg
-            // off heading and 98 m BELOW the deck — the final law
-            // (built for a 500 m, on-slope, aligned entry) rolled it
-            // to 53 deg bank, stalled it at AoA 38 deg, and it hit
-            // the terrain 2.4 km out. A bad entry is a go-around.
-            // Pass 15 (item 4): a TIGHTER window (|loc.x| < 50,
-            // hdgErr < 12) was tried and reverted — the chase
-            // never earns it while the carrier turns, so it holds
-            // astern at deck level until it overflies the deck
-            // (loc.z > -150) and the outbound climb off a
-            // deck-11 position flies straight into a ridge. The
-            // wide window (150 m / 25 deg) plus the straight-leg
-            // gate and the final's own go-around is the safer
-            // combination: a bad final goes around cleanly instead
-            // of the chase dying low beside the carrier.
-            const hdgErrF = Math.abs(wrapDeg(jetHdgDeg(ac) - cYawDeg()));
-            const altOkF = ac.pos.y > carrier2.deckTopY && ac.pos.y < carrier2.deckTopY + 150;
-            // Straight-leg gate (pass 15, item 4): do not hand over
-            // while the carrier is turning — a 10 s final cannot
-            // follow a 35 deg turn from 500 m out, and the jet
-            // either flies past (attempt 1: carrier 281 -> 246
-            // deg mid-final) or the chase loses it in a 73 deg
-            // turn and hits a ridge (attempt 2). The chase holds
-            // astern on the glideslope until the deck steadies.
-            const turnOkF = Math.abs(cYawRateEma) < 2;
-            // Pass 14 (worker F): the gate is -650..-450 m astern
-            // (was -900..-450). At -900 m the final is 18 s long and
-            // the carrier turns up to 75 deg during it (return14f:
-            // cYaw 289 -> 214 mid-final, the final law rolled to
-            // 56 deg and stalled); at -650 m the final is ~12 s.
-            // The old gate rejected good entries the pursuit had
-            // already earned, so the window stays wide in lateral
-            // (|x| < 150) and heading (< 25 deg).
-            const inWindow = mLoc.z < -450 && mLoc.z > -650 && Math.abs(mLoc.x) < 150;
-            if (inWindow && hdgErrF < 25 && altOkF && turnOkF) {
-              phase = 'final';
-              finalT0 = tSec;
-              finalVApp = Math.max(46, spec.stallSpeed * 0.8);
-              const dvF = deck2.velocityAt(ac.pos.x, ac.pos.z);
-              const vAirApp = Math.hypot(dvF.x, dvF.z) + finalVApp;
-              const clNeed = (2 * spec.mass * 9.81) / (1.225 * vAirApp * vAirApp * spec.wingArea);
-              // Pass 15 (item 4): invert the REAL lift curve at
-              // flaps 30 for the trim AoA, using this jet's own
-              // clCurve, instead of the old formula's hardcoded
-              // F-35A numbers. (For the F-18 the two agree at
-              // 3.9 deg; the bisection is spec-correct for any
-              // jet, and it is the trim the final law actually
-              // flies — the old numbers were never the sink.)
-              let aoaLo = -5;
-              let aoaHi = 30;
-              for (let i = 0; i < 24; i++) {
-                const mid = (aoaLo + aoaHi) / 2;
-                if (clFromCurve(mid, 1, spec.clCurve) < clNeed) aoaLo = mid;
-                else aoaHi = mid;
-              }
-              finalAoaTrim = Math.max(0, Math.min(15, (aoaLo + aoaHi) / 2));
-              ac.gear = true;
-              ac.hook = true;
-              ac.flaps = 30;
-              console.log(`  CHASE DONE t=${tSec.toFixed(1)}s local=(${mLoc.x.toFixed(1)},${mLoc.z.toFixed(1)}) vApp=${finalVApp.toFixed(1)} aoaTrim=${finalAoaTrim.toFixed(1)}`);
-            } else if (mLoc.z > -150 || tSec - chaseT0 > 90) {
-              // Overflew the deck without entering final, or chased
-              // too long: go around the pattern again via outbound.
-              // Unlike the old escape (which mushed into the terrain
-              // in a banked low-speed climb), outbound climbs back to
-              // deck+450 on the carrier's heading, then turn1 puts
-              // the jet back on the rejoin point.
-              goArounds++;
-              attempts++;
-              console.log(`  GO-AROUND #${goArounds} (chase) t=${tSec.toFixed(1)}s hdgErr=${hdgErrF.toFixed(0)} alt=${(ac.pos.y - carrier2.deckTopY).toFixed(0)} loc=(${mLoc.x.toFixed(0)},${mLoc.z.toFixed(0)})`);
-              outboundHdg = cYawDeg();
-              phase = 'outbound';
+            const needClimbH = floorH + 50 > ac.pos.y;
+            const altHoldEff = needClimbH
+              ? Math.max(carrier2.deckTopY + 350, floorH + 50)
+              : Math.max(carrier2.deckTopY + 350, floorH);
+            if (needClimbH) {
+              flyTo((brgFix + 90) % 360, altHoldEff, HOLD_SPEED, dt, 0.3, 10, undefined, dvYH, 0.35);
+            } else {
+              // desHdg is ignored when fixedBankRad is set.
+              flyTo(0, altHoldEff, HOLD_SPEED, dt, 0.87, 10, holdBank, dvYH, 0.35);
             }
-            inWindowPrev = inWindow;
+            const cHold = legFrameOf(carrier2.pos, fixWPrev, fixPsi);
+            const carrierStraight = Math.abs(carrier2.yawRate) < 0.026 && Math.abs(cYawRateEma) < 2;
+            const remainingHold = Math.hypot(shiftW(CARRIER_WAYPOINTS[fixINext]!).x - carrier2.pos.x, shiftW(CARRIER_WAYPOINTS[fixINext]!).z - carrier2.pos.z);
+            const legLenHold = Math.hypot(
+              shiftW(CARRIER_WAYPOINTS[fixINext]!).x - fixWPrev.x,
+              shiftW(CARRIER_WAYPOINTS[fixINext]!).z - fixWPrev.z,
+            );
+            const hdgErrHold = Math.abs(wrapDeg(jetHdgDeg(ac) - fixPsiDeg));
+            // The carrier must actually BE on the fix leg: near its
+            // centreline (|port| < 300 m) and inside the segment
+            // (0 <= along <= legLen). Steering toward the leg's end
+            // waypoint is not enough — legInfo advances on 300 m
+            // proximity, so it can still name a leg the carrier has
+            // already turned off (fixhold7 final #2: along=4489 on
+            // a <=3605 m leg, ~3685 m port, jet 7 km abeam).
+            const carrierOnLeg = Math.abs(cHold.port) < 300 && cHold.along >= 0 && cHold.along <= legLenHold;
+            if (
+              legNow.iNext === fixINext && carrierStraight && remainingHold >= 1800 &&
+              cHold.along >= 600 && carrierOnLeg && hdgErrHold < 60 && distFixHold < 1000
+            ) {
+              console.log(`  HOLD BREAK -> FINAL t=${tSec.toFixed(1)}s along=${cHold.along.toFixed(0)} remaining=${remainingHold.toFixed(0)}m hdgErr=${hdgErrHold.toFixed(0)} distFix=${distFixHold.toFixed(0)}m dist=${b.distM.toFixed(0)}m`);
+              enterFinal();
+            } else if (legNow.iNext !== fixINext) {
+              console.log(`  HOLD ABORT (leg flipped) t=${tSec.toFixed(1)}s fixLeg=${fixINext} liveLeg=${legNow.iNext}`);
+              phase = 'fix';
+            } else if (distFixHold > 1500) {
+              console.log(`  HOLD ABORT (drifted) t=${tSec.toFixed(1)}s distFix=${distFixHold.toFixed(0)}m`);
+              phase = 'fix';
+            } else if (tSec - holdT0 > 240) {
+              console.log(`  HOLD ABORT (timeout) t=${tSec.toFixed(1)}s along=${cHold.along.toFixed(0)} remaining=${remainingHold.toFixed(0)}m`);
+              phase = 'fix';
+            }
           } else if (phase === 'final') {
             finalStep(dt);
             if (!touchedDown && ac.onDeck) {
@@ -2066,15 +2229,31 @@ async function main(): Promise<void> {
             // old final flew on forever after a miss — it circled
             // at deck level 2.8 km from the carrier until it hit a
             // 334 m hillside (return, hard landing). Past the wire
-            // zone without touching down (loc.z > -100) or 30 s in
-            // final with no touchdown is a bolter: climb back to
-            // deck+450 via outbound and try the pattern again.
-            if (!touchedDown && ((loc && loc.z > -100) || tSec - finalT0 > 30)) {
+            // zone without touching down (loc.z > -100) or 70 s in
+            // final with no touchdown is a bolter. The timeout was
+            // 30 s (pass 17: raised — a 3100 m straight-in at
+            // 53 m/s deck-relative takes ~58 s, and final #1 in
+            // fixhold5 was a good final killed by the 30 s timeout
+            // at 905 m out). The bolter climbs out wings-level
+            // (climbout) to deck+450, then re-fixes.
+            // Pass 17 (worker F): the bolter line is -20, not -45.
+            // Final #1 (fixhold8) crossed -45 at deck+2, ~0.2 s
+            // from contact, and the -45 line fired first. -20 gives
+            // it 25 m (~0.4 s) past the wire zone's forward edge to
+            // touch down; a genuinely high jet is still caught (it
+            // is tens of metres above the deck at -20). Section B
+            // touches down at -87 / -52, before -20, so it is
+            // unaffected; the section-D touchdown check is the whole
+            // deck (-128..152), so a touchdown at ~-43 is accepted
+            // (the hook, astern of the centre, is still in the wire
+            // zone). (Earlier: -100 fired on a jet 6 m above the
+            // slope at 266 m out, ~0.5 s from touchdown.)
+            if (!touchedDown && ((loc && loc.z > -20) || tSec - finalT0 > 70)) {
               goArounds++;
               attempts++;
               console.log(`  GO-AROUND #${goArounds} (final) t=${tSec.toFixed(1)}s loc=(${loc ? loc.x.toFixed(0) : '?'},${loc ? loc.z.toFixed(0) : '?'}) dist=${b.distM.toFixed(0)}m`);
-              outboundHdg = cYawDeg();
-              phase = 'outbound';
+              climboutHdg = jetHdgDeg(ac);
+              phase = 'climbout';
             }
             if (stopped) {
               phase = 'done';
@@ -2087,7 +2266,8 @@ async function main(): Promise<void> {
       }
     };
     ac.brake = false;
-    stepD(900); // budget: climb ~60 s + ~250 s per pattern lap (outbound/turn1/rejoin/chase) + final ~30 s; up to ~3 laps fit
+    legInit();
+    stepD(900); // budget: climb ~60 s + ~150 s per fix/hold attempt; several attempts fit
     const bEnd = bearing2();
     const locEnd = local2();
     console.log(

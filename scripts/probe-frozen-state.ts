@@ -771,16 +771,17 @@ async function main(): Promise<void> {
         const moved = prev ? s.pos.distanceTo(prev) : Infinity;
         prev = s.pos.clone();
         // Verbatim from main.ts (animate): the old beached gate and
-        // the pass-15 unresponsive gate. animate adds one substep
-        // dt (<= 0.05 s) per frame, so stuckTime advances 0.05/frame
-        // here and R (stuckTime > 2) is available after 41 frames.
+        // the unresponsive gate. Pass 17: the gate no longer
+        // requires thrTarget > 0.5 (see S7f), and stuckTime advances
+        // by the frame's simDt — in this replica each frame is one
+        // 0.05 s step, so simDt is 0.05 and R (stuckTime > 2) is
+        // available after 41 frames.
         const oldBeached =
           s.alive && !s.dying && !s.grounded && !s.onDeck && s.vel.length() < 1 && s.agl < 10;
         const unresponsive =
           s.alive &&
           !s.dying &&
           !s.onSurface &&
-          s.thrTarget > 0.5 &&
           s.vector < 70 &&
           moved < 0.1;
         if (oldBeached && oldFiredAt < 0) oldFiredAt = f;
@@ -948,13 +949,21 @@ async function main(): Promise<void> {
     }
 
     // S7f: wiring in main.ts (source checks).
+    // Pass 17 (worker E, item 1): the gate no longer requires
+    // thrTarget > 0.5 — in the frozen state W never reaches
+    // thrTarget, so the throttle term made the gate unreachable in
+    // exactly the state it guards (probe-pass17-frozen S4b). The
+    // gate is movement-based only now; the throttle term must NOT
+    // be back in it.
     const mainSrc = readFileSync('src/main.ts', 'utf8');
+    const gateText =
+      mainSrc.match(/const unresponsive =[\s\S]*?;/)?.[0] ?? '';
     check(
-      'S7f: main.ts has the unresponsive gate (movement-based, not vel-based)',
+      'S7f: main.ts has the unresponsive gate (movement-based, not vel-based, no throttle term)',
       mainSrc.includes('unresponsive') &&
         mainSrc.includes('moved < 0.1') &&
-        mainSrc.includes('thrTarget > 0.5'),
-      '',
+        !gateText.includes('thrTarget'),
+      gateText.replace(/\s+/g, ' '),
     );
     check(
       'S7f: the unresponsive gate excludes VTOL hover (vector < 70) and surfaces (!onSurface)',

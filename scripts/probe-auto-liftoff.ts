@@ -230,7 +230,7 @@ async function main(): Promise<void> {
   };
   // One live frame: substep at <= 50 ms (main.ts pattern), the
   // slider throttle merge, then the aircraft step; origin shift.
-  const frame = (ac: Aircraft, pc: PCFlightInput, rawDt: number): void => {
+  const frame = (ac: Aircraft, pc: PCFlightInput, rawDt: number, wind: THREE.Vector3 = WIND): void => {
     const sub = Math.max(1, Math.ceil(rawDt / 0.05));
     const dt = rawDt / sub;
     for (let s = 0; s < sub; s++) {
@@ -239,7 +239,7 @@ async function main(): Promise<void> {
       world.timestep = dt;
       world.step(eventQueue);
       drain(ac);
-      ac.step(dt, WIND, null);
+      ac.step(dt, wind, null);
     }
     const sh = origin.shiftIfNeeded(ac.pos);
     if (sh) origin.applyShift(sh);
@@ -547,6 +547,270 @@ async function main(): Promise<void> {
       `liftoff ${liftT < 0 ? 'never' : liftKt.toFixed(0) + 'kt/' + liftDist.toFixed(0) + 'm'} climb10s=${climb10s === null ? 'n/a' : climb10s.toFixed(0) + ' fpm'}`,
     );
     disposeAc(ac, pc);
+  }
+
+  // ---- D. Ground-roll veer (pass 17, worker E, item 2). ----
+  // v4.10 live: hands-off on the ground, the F-22 veered 090 -> 077
+  // deg with Bank 7 deg before crashing — uncommanded drift while
+  // rolling. The pass-15 gimbal-safe bank fix was a FLIGHT fix (the
+  // airborne auto-level spring); the ground roll has its own gates
+  // (onSurface roll spring + yaw zeroing). Measure, hands-off at
+  // 100% throttle on Alpha, live variable dt + live wind, vs the
+  // wind-0 and fixed-dt controls: heading/bank drift while the jet
+  // is still on a surface, the onSurface fraction during the roll
+  // (a flickering gate drops the yaw zeroing out), and the lateral
+  // offset from the centreline.
+  console.log('--- D. Ground-roll veer, F-22 Alpha, hands-off, 100% throttle ---');
+  const veerRun = async (
+    tag: string,
+    wind: THREE.Vector3,
+    useVariableDt: boolean,
+    residualRoll = 0,
+  ): Promise<{ maxHdgDrift: number; maxBank: number; onSurfFrac: number; latOff: number; outcome: string }> => {
+    origin.reset();
+    const { ac, pc } = await spawnAlpha('f22');
+    if (ac.modelStatus !== 'ok') {
+      console.log(`  [D/${tag}] modelStatus=${ac.modelStatus} (GLB failed — run invalid)`);
+    }
+    for (let f = 0; f < 60; f++) frame(ac, pc, 1 / 60);
+    ac.thrTarget = 1;
+    pc.setThrottle(1);
+    const hdg0 = Math.atan2(ac.fwd().x, ac.fwd().z) / D2R;
+    let t = 0;
+    let pi = 0;
+    let maxHdgDrift = 0;
+    let maxBank = 0;
+    let surfFrames = 0;
+    let totalFrames = 0;
+    let latOff = 0;
+    let logT = 0;
+    while (t < 40) {
+      const rawDt = useVariableDt ? DT_PATTERN[pi % DT_PATTERN.length]! : 1 / 60;
+      pi++;
+      ac.pitchIn = 0;
+      ac.rollIn = residualRoll;
+      ac.yawIn = 0;
+      frame(ac, pc, rawDt, wind);
+      t += rawDt;
+      totalFrames++;
+      if (ac.onSurface) surfFrames++;
+      const hdg = Math.atan2(ac.fwd().x, ac.fwd().z) / D2R;
+      let d = hdg - hdg0;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      if (ac.onSurface) {
+        maxHdgDrift = Math.max(maxHdgDrift, Math.abs(d));
+        maxBank = Math.max(maxBank, Math.abs(euler(ac).z / D2R));
+        // Lateral offset from the Alpha centreline (along-track x).
+        latOff = Math.max(latOff, Math.abs(ac.pos.z + origin.cumulativeShift.z - alpha.z));
+      }
+      if (t - logT >= 5) {
+        logT = t;
+        console.log(
+          `  [D/${tag} t=${t.toFixed(0)}s] ias=${(ac.ias * MS2KT).toFixed(0)}kt hdg=${hdg.toFixed(1)} (drift ${d.toFixed(1)}) ` +
+            `bank=${(euler(ac).z / D2R).toFixed(1)} onSurf=${ac.onSurface} latOff=${latOff.toFixed(1)}m alive=${ac.alive}`,
+        );
+      }
+      if (!ac.alive) break;
+      if (!ac.onSurface && ac.pos.y > alpha.elev + 2.25 + 10) break;
+    }
+    const outcome = ac.alive
+      ? `alive, airborne at t=${t.toFixed(1)}s`
+      : `CRASHED t=${t.toFixed(1)}s (${ac.lastCrashReason ?? '-'}) vs=${ac.lastCrashVs.toFixed(2)} bank=${ac.lastCrashBankDeg.toFixed(1)}`;
+    console.log(
+      `  [D/${tag}] maxHdgDriftOnGround=${maxHdgDrift.toFixed(1)}deg maxBankOnGround=${maxBank.toFixed(1)}deg ` +
+        `onSurfaceFrac=${totalFrames ? (surfFrames / totalFrames).toFixed(2) : 'n/a'} maxLatOff=${latOff.toFixed(1)}m — ${outcome}`,
+    );
+    disposeAc(ac, pc);
+    return { maxHdgDrift, maxBank, onSurfFrac: totalFrames ? surfFrames / totalFrames : 0, latOff, outcome };
+  };
+  {
+    const live = await veerRun('live-dt+wind', WIND, true);
+    const fixed = await veerRun('fixed-dt+wind', WIND, false);
+    const noWind = await veerRun('live-dt+nowind', new THREE.Vector3(0, 0, 0), true);
+    check(
+      'D/live: hands-off F-22 holds heading on the ground (drift < 5 deg) at live dt + wind',
+      live.maxHdgDrift < 5,
+      `drift=${live.maxHdgDrift.toFixed(1)}deg bank=${live.maxBank.toFixed(1)}deg latOff=${live.latOff.toFixed(1)}m onSurfFrac=${live.onSurfFrac.toFixed(2)}`,
+    );
+    check(
+      'D/live: hands-off F-22 stays wings-level on the ground (|bank| < 5 deg) at live dt + wind',
+      live.maxBank < 5,
+      `bank=${live.maxBank.toFixed(1)}deg drift=${live.maxHdgDrift.toFixed(1)}deg`,
+    );
+    check(
+      'D/fixed: hands-off F-22 holds heading on the ground (drift < 5 deg) at fixed dt + wind',
+      fixed.maxHdgDrift < 5,
+      `drift=${fixed.maxHdgDrift.toFixed(1)}deg bank=${fixed.maxBank.toFixed(1)}deg onSurfFrac=${fixed.onSurfFrac.toFixed(2)}`,
+    );
+    check(
+      'D/nowind: hands-off F-22 holds heading on the ground (drift < 5 deg) at live dt, no wind',
+      noWind.maxHdgDrift < 5,
+      `drift=${noWind.maxHdgDrift.toFixed(1)}deg bank=${noWind.maxBank.toFixed(1)}deg onSurfFrac=${noWind.onSurfFrac.toFixed(2)}`,
+    );
+    // D2: the residual-input variant — a small constant roll input
+    // (0.08, e.g. a stick/yoke not quite centred, or a keyboard
+    // tail) during the same roll. The airborne auto-level gate is
+    // rollIn === 0 EXACTLY, and the onSurface yaw zeroing needs
+    // |rollIn| <= 0.1, so a 0.08 residual disables the auto-level
+    // in the airborne half of each bounce while adding no steering.
+    // If this veers, the live veer was a residual input, not wind
+    // or the ground gates — and the fix belongs in the input merge
+    // (Worker A), not here.
+    const resid = await veerRun('live-dt+wind+roll0.08', WIND, true, 0.08);
+    console.log(
+      `  [D2/residual] drift=${resid.maxHdgDrift.toFixed(1)}deg bank=${resid.maxBank.toFixed(1)}deg ` +
+        `latOff=${resid.latOff.toFixed(1)}m onSurfFrac=${resid.onSurfFrac.toFixed(2)} — ${resid.outcome}`,
+    );
+    check(
+      'D2/residual: a 0.08 residual roll input does NOT bank the jet > 5 deg on the ground (live veer was Bank 7 deg)',
+      resid.maxBank < 5 && resid.maxHdgDrift < 5,
+      `bank=${resid.maxBank.toFixed(1)}deg drift=${resid.maxHdgDrift.toFixed(1)}deg`,
+    );
+  }
+
+  // ---- E. Alpha liftoff timing (pass 17, worker E, item 3). ----
+  // v4.10 live: Alpha liftoff is timing-critical — short runway,
+  // terrain east drops (crash y 41.9-49.0 m vs spawn 52.1 m), pulls
+  // below ~150 kt or late ended in crashes (vs -9.5 to -16.7 m/s);
+  // the v4.9 re-measurement also saw crashes at vs -2.59 to -4.83
+  // m/s while rolling. Two suspects: (a) the runway is genuinely
+  // too short at the rotation speeds, (b) the crash judge is too
+  // sensitive on the downslope. Measure both: liftoff distance from
+  // the strip centre (flat top ends 485 m out, skirt ends 835 m),
+  // terrain clearance east of Alpha, and — for every crash — the
+  // vertical speed, the impact-NORMAL speed (the slope term the
+  // judge actually uses), and the Rapier velocity jump across the
+  // fatal world step (the dv > 20 guard fires 'terrain').
+  // The clearance bar is 2.5 m, not 5 m: at liftoff the jet's
+  // centre is one gear height (2.2 m) above the surface by
+  // construction, so the minimum clearance over a healthy
+  // climb-out is ~3 m — demanding > 5 m would fail a perfect
+  // liftoff. 2.5 m means the gear itself clears the terrain by
+  // >= 0.3 m at every moment after liftoff: a genuine no-graze bar.
+  console.log('--- E. Alpha liftoff timing: pull at 130/140/150/160 kt + late pull ---');
+  const liftoffRun = async (
+    key: (typeof JETS)[number],
+    pullKt: number,
+    pullAtDist: number | null,
+  ): Promise<{
+    liftDist: number;
+    liftKt: number;
+    minClear: number;
+    outcome: string;
+    crashVs: number;
+    crashBank: number;
+    crashY: number;
+    maxDv: number;
+  }> => {
+    origin.reset();
+    const { ac, pc } = await spawnAlpha(key);
+    for (let f = 0; f < 60; f++) frame(ac, pc, 1 / 60);
+    ac.thrTarget = 1;
+    pc.setThrottle(1);
+    const startY = ac.pos.y;
+    let t = 0;
+    let pi = 0;
+    let liftDist = -1;
+    let liftKt = 0;
+    let minClear = Infinity;
+    let maxDv = 0;
+    let pulling = false;
+    let logT = 0;
+    while (t < 40) {
+      const rawDt = DT_PATTERN[pi % DT_PATTERN.length]!;
+      pi++;
+      const dist = ac.pos.x + origin.cumulativeShift.x - alpha.x;
+      const kt = ac.ias * MS2KT;
+      if (!pulling && ((pullAtDist === null && kt >= pullKt) || (pullAtDist !== null && dist >= pullAtDist))) {
+        pulling = true;
+      }
+      if (pulling && ac.onSurface) ac.pitchIn = -1;
+      else if (!ac.onSurface && ac.pos.y < startY + 200) ac.pitchIn = -0.3;
+      else if (!ac.onSurface) ac.pitchIn = 0;
+      else ac.pitchIn = 0;
+      // Rapier velocity jump across this frame's world steps (the
+      // dv > 20 guard's input): sample the body linvel around the
+      // frame() call — frame() steps the world internally, so read
+      // the pre/post linvel here (one frame's worth of steps).
+      const bv0 = ac.body.linvel();
+      frame(ac, pc, rawDt);
+      const bv1 = ac.body.linvel();
+      const dvStep = Math.hypot(bv1.x - bv0.x, bv1.y - bv0.y, bv1.z - bv0.z);
+      if (ac.alive) maxDv = Math.max(maxDv, dvStep);
+      t += rawDt;
+      if (liftDist < 0 && !ac.onSurface && ac.pos.y > startY + 1) {
+        liftDist = dist;
+        liftKt = kt;
+      }
+      if (liftDist >= 0) {
+        minClear = Math.min(minClear, ac.pos.y - ac.floorY);
+      }
+      if (t - logT >= 5) {
+        logT = t;
+        console.log(
+          `  [E/${key}@${pullAtDist === null ? pullKt + 'kt' : 'dist' + pullAtDist} t=${t.toFixed(0)}s] ias=${kt.toFixed(0)}kt ` +
+            `dist=${dist.toFixed(0)}m y=${ac.pos.y.toFixed(1)} floorY=${ac.floorY.toFixed(1)} clear=${(ac.pos.y - ac.floorY).toFixed(1)} ` +
+            `onSurf=${ac.onSurface} alive=${ac.alive}`,
+        );
+      }
+      if (!ac.alive) break;
+      if (liftDist >= 0 && t > 0 && ac.pos.y - ac.floorY > 100) break;
+    }
+    const outcome = ac.alive
+      ? `alive t=${t.toFixed(1)}s y=${ac.pos.y.toFixed(0)} ias=${(ac.ias * MS2KT).toFixed(0)}kt`
+      : `CRASHED t=${t.toFixed(1)}s (${ac.lastCrashReason ?? '-'}) vs=${ac.lastCrashVs.toFixed(2)} bank=${ac.lastCrashBankDeg.toFixed(1)} y=${ac.pos.y.toFixed(1)}`;
+    console.log(
+      `  [E/${key}@${pullAtDist === null ? pullKt + 'kt' : 'dist' + pullAtDist}] liftoff=${liftDist < 0 ? 'NONE' : `${liftDist.toFixed(0)}m @ ${liftKt.toFixed(0)}kt`} ` +
+        `minClearAfterLiftoff=${minClear === Infinity ? 'n/a' : minClear.toFixed(1) + 'm'} maxDv=${maxDv.toFixed(1)}m/s — ${outcome}`,
+    );
+    const crashVs = ac.lastCrashVs;
+    const crashBank = ac.lastCrashBankDeg;
+    const crashY = ac.pos.y;
+    disposeAc(ac, pc);
+    return { liftDist, liftKt, minClear, outcome, crashVs, crashBank, crashY, maxDv };
+  };
+  for (const key of ['f22', 'f15e', 'fa18', 'f35a'] as const) {
+    // Pull at 150 kt (the live "below ~150 kt crashes" boundary) and
+    // at 140 kt (just below it): does the jet lift inside the flat
+    // top (485 m from the strip centre) and stay clear of the slope?
+    const r150 = await liftoffRun(key, 150, null);
+    const r140 = await liftoffRun(key, 140, null);
+    check(
+      `E/${key}@150kt: pull at 150 kt lifts off inside the flat top (< 485 m) and stays clear (never closer than 2.5 m to the terrain)`,
+      r150.liftDist >= 0 && r150.liftDist < 485 && r150.minClear > 2.5,
+      `liftoff=${r150.liftDist < 0 ? 'NONE' : r150.liftDist.toFixed(0) + 'm @ ' + r150.liftKt.toFixed(0) + 'kt'} minClear=${r150.minClear === Infinity ? 'n/a' : r150.minClear.toFixed(1) + 'm'} — ${r150.outcome}`,
+    );
+    check(
+      `E/${key}@140kt: pull at 140 kt lifts off inside the flat top (< 485 m) and stays clear (never closer than 2.5 m to the terrain)`,
+      r140.liftDist >= 0 && r140.liftDist < 485 && r140.minClear > 2.5,
+      `liftoff=${r140.liftDist < 0 ? 'NONE' : r140.liftDist.toFixed(0) + 'm @ ' + r140.liftKt.toFixed(0) + 'kt'} minClear=${r140.minClear === Infinity ? 'n/a' : r140.minClear.toFixed(1) + 'm'} — ${r140.outcome}`,
+    );
+  }
+  {
+    // Late pull: F-22 holds the pull until the strip end (325 m
+    // from the centre) — the live "late" case. And a 130 kt pull
+    // (well below the live boundary) for the same jet.
+    const late = await liftoffRun('f22', 0, 325);
+    const r130 = await liftoffRun('f22', 130, null);
+    console.log(
+      `  [E/f22-late] liftoff=${late.liftDist < 0 ? 'NONE' : late.liftDist.toFixed(0) + 'm @ ' + late.liftKt.toFixed(0) + 'kt'} ` +
+        `minClear=${late.minClear === Infinity ? 'n/a' : late.minClear.toFixed(1) + 'm'} maxDv=${late.maxDv.toFixed(1)} — ${late.outcome}`,
+    );
+    console.log(
+      `  [E/f22@130kt] liftoff=${r130.liftDist < 0 ? 'NONE' : r130.liftDist.toFixed(0) + 'm @ ' + r130.liftKt.toFixed(0) + 'kt'} ` +
+        `minClear=${r130.minClear === Infinity ? 'n/a' : r130.minClear.toFixed(1) + 'm'} maxDv=${r130.maxDv.toFixed(1)} — ${r130.outcome}`,
+    );
+    check(
+      'E/f22-late: a pull at the strip end still lifts off inside the skirt (< 835 m) without crashing',
+      late.liftDist >= 0 && late.liftDist < 835,
+      `liftoff=${late.liftDist < 0 ? 'NONE' : late.liftDist.toFixed(0) + 'm'} — ${late.outcome}`,
+    );
+    check(
+      'E/f22@130kt: a pull at 130 kt lifts off inside the flat top (< 485 m) and stays clear (never closer than 2.5 m to the terrain)',
+      r130.liftDist >= 0 && r130.liftDist < 485 && r130.minClear > 2.5,
+      `liftoff=${r130.liftDist < 0 ? 'NONE' : r130.liftDist.toFixed(0) + 'm @ ' + r130.liftKt.toFixed(0) + 'kt'} minClear=${r130.minClear === Infinity ? 'n/a' : r130.minClear.toFixed(1) + 'm'} — ${r130.outcome}`,
+    );
   }
 
   console.log(failures === 0 ? '\nALL AUTO-LIFTOFF CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

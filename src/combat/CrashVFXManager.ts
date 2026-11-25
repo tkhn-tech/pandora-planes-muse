@@ -77,11 +77,11 @@ function radialTexture(stops: [number, string][]): THREE.CanvasTexture {
  *  and a Rapier cuboid that settles on its largest face, so every
  *  piece lay flat and read as a dark rectangle from the chase
  *  camera above (the live "black/grey slabs at every crash site").
- *  A torn panel is instead tapered (narrow end 55-75% of the wide
+ *  A torn panel is instead tapered (narrow end 50-70% of the wide
  *  end), jittered (shared vertices move together, keyed by
- *  position, so the faces do not crack apart) and folded 15-30 deg
- *  at mid-length, so no face is flat, no outline is rectangular,
- *  and the piece cannot lie flat. The geometry is re-centred on
+ *  position, so the faces do not crack apart) and folded 30-45 deg
+ *  around a diagonal axis through its centre, so no face is flat, no
+ *  outline is rectangular, and the piece cannot lie flat. The geometry is re-centred on
  *  its own bounding box (the debris mesh is synced straight from
  *  its Rapier body, so a non-centred geometry would sit offset
  *  from its collider) and the returned half-extents are the
@@ -94,10 +94,26 @@ function tornPanelGeometry(
 ): { geometry: THREE.BufferGeometry; half: THREE.Vector3 } {
   const geo = new THREE.BoxGeometry(w, t, l, 3, 1, 4);
   const p = geo.getAttribute('position') as THREE.BufferAttribute;
-  const fold = ((15 + Math.random() * 15) * Math.PI) / 180;
-  const taper = 0.25 + Math.random() * 0.2;
+  // Pass 17 (worker D): the fold is what makes a panel read as TORN
+  // from the chase camera — but the pass-15 fold (15-30 deg around the
+  // panel's X axis, i.e. straight across its width) was invisible in
+  // rendered frames: the ridge ran parallel to the panel's short axis,
+  // so from above the silhouette stayed a rectangle, and the
+  // near-black charred material crushed what little shading the fold
+  // produced. The fold is now 30-45 deg around a DIAGONAL axis (25-50
+  // deg off the X axis), so the ridge cuts diagonally across the panel
+  // — from any camera yaw some component of the ridge reads as a
+  // height step — and the taper is stronger (30-50%).
+  const fold = ((30 + Math.random() * 15) * Math.PI) / 180;
+  const foldAxis = ((25 + Math.random() * 25) * (Math.random() < 0.5 ? -1 : 1) * Math.PI) / 180;
+  const taper = 0.3 + Math.random() * 0.2;
   const cosF = Math.cos(fold);
   const sinF = Math.sin(fold);
+  const cosA = Math.cos(foldAxis);
+  const sinA = Math.sin(foldAxis);
+  // In-plane unit vectors: d along the fold axis, n normal to it.
+  const nx = -sinA;
+  const nz = cosA;
   // One jitter offset per distinct vertex POSITION (BoxGeometry
   // duplicates vertices across faces — jittering per index would
   // split the seams and leave see-through cracks).
@@ -118,18 +134,23 @@ function tornPanelGeometry(
   const v = new THREE.Vector3();
   for (let i = 0; i < p.count; i++) {
     v.set(p.getX(i), p.getY(i), p.getZ(i));
-    const s = v.z / l + 0.5; // 0 at the -z end, 1 at the +z end
-    v.x *= 1 - taper * s;
+    const ts = v.z / l + 0.5; // 0 at the -z end, 1 at the +z end
+    v.x *= 1 - taper * ts;
     const j = jFor(p.getX(i), p.getY(i), p.getZ(i));
     v.x += j.x;
     v.y += j.y;
     v.z += j.z;
-    // Fold the +z half UP around the X axis at z = 0.
-    if (v.z > 0) {
-      const y2 = v.y * cosF + v.z * sinF;
-      const z2 = -v.y * sinF + v.z * cosF;
+    // Fold the half on the +n side of the diagonal fold line UP around
+    // the fold axis. In the (n, y) frame this is the same rotation as
+    // the old X-axis fold; u (the along-axis component) is unchanged.
+    const s = v.x * nx + v.z * nz;
+    if (s > 0) {
+      const u = v.x * cosA + v.z * sinA;
+      const y2 = v.y * cosF + s * sinF;
+      const s2 = -v.y * sinF + s * cosF;
+      v.x = u * cosA + s2 * nx;
+      v.z = u * sinA + s2 * nz;
       v.y = y2;
-      v.z = z2;
     }
     p.setXYZ(i, v.x, v.y, v.z);
   }
@@ -158,6 +179,19 @@ const SMOKE_STOPS: [number, string][] = [
   [0, 'rgba(255,255,255,0.85)'],
   [0.6, 'rgba(255,255,255,0.35)'],
   [1, 'rgba(255,255,255,0)'],
+];
+/** Fire texture (pass 17): the wreck-fire plume used the white smoke
+ *  texture tinted orange, so it rendered as a soft orange wash with
+ *  no bright core (0 bright-orange pixels in rendered frames at +30
+ *  and +75 s) — a glow, not a flame. A flame has a hot white-yellow
+ *  core: this gradient carries one, so the fire reads as burning
+ *  wreckage instead of a sunset haze. */
+const FIRE_STOPS: [number, string][] = [
+  [0, 'rgba(255,250,220,1)'],
+  [0.12, 'rgba(255,190,60,0.95)'],
+  [0.4, 'rgba(255,110,20,0.55)'],
+  [0.85, 'rgba(120,20,0,0)'],
+  [1, 'rgba(120,20,0,0)'],
 ];
 
 /** Irregular scorch blotch texture (pass 13): a perfect dark circle
@@ -188,10 +222,17 @@ function irregularScorchTexture(): THREE.CanvasTexture {
   }
   g.closePath();
   const grd = g.createRadialGradient(cx, cy, 8, cx, cy, 118);
+  // Pass 17: the dark core used to end at r 0.55 and the annulus
+  // faded to a pale 0.45 alpha — but the wreck itself covers the
+  // disc's centre (19 m fuselage over a 22 m decal), so from the
+  // chase camera only the annulus is visible, and it read as a pale
+  // stain (diffs 12-22 vs grass, darkest-quarter luminance ~100).
+  // The mark stays dark out to r 0.90 and feathers only at the rim:
+  // the visible ring around the wreck is a burn, not a stain.
   grd.addColorStop(0, 'rgba(12,9,7,0.95)');
-  grd.addColorStop(0.55, 'rgba(42,36,30,0.85)');
-  grd.addColorStop(0.85, 'rgba(58,50,42,0.45)');
-  grd.addColorStop(1, 'rgba(58,50,42,0)');
+  grd.addColorStop(0.7, 'rgba(16,13,10,0.95)');
+  grd.addColorStop(0.9, 'rgba(28,23,18,0.85)');
+  grd.addColorStop(1, 'rgba(28,23,18,0)');
   g.fillStyle = grd;
   g.fill();
   // Mottled darker blotches inside, so the mark is not flat.
@@ -213,14 +254,29 @@ function irregularScorchTexture(): THREE.CanvasTexture {
   return scorchTex;
 }
 
-/** Charred wreckage colours (pass 13): the old generic debris was a
+/** Charred wreckage colours (pass 13, revised pass 17): the old generic debris was a
  *  light grey (0x8a97a3) that read on grass as "grey rectangular
  *  slabs". Wreckage is near-black charred metal with brown/grey
- *  variation — one piece per spawn, picked at random. */
-const CHARRED_COLORS = [0x17171a, 0x23211e, 0x2e2a24, 0x1c1c20, 0x201d1a];
+ *  variation — one piece per spawn, picked at random.
+ *  Pass 17: the pass-13 palette (0x17-0x2e sRGB, ~0.01-0.03 linear)
+ *  rendered at luminance 3-9 under ACES — a pure black silhouette in
+ *  which the fold, taper and jitter were invisible and every piece
+ *  read as a "flat black slab" in rendered frames. Charred wreckage
+ *  is dark brown-grey, not black: these carry enough albedo (sRGB
+ *  0.24-0.35) for the sun to model the fold — the face toward the
+ *  sun reads ~2x the face turned away — while still reading as
+ *  burnt. */
+const CHARRED_COLORS = [0x4a4038, 0x5a4f42, 0x3d3831, 0x54483a, 0x453e33];
 const MAX_SCORCH = 12;
-/** Scorch decal lifetime (s): fades out over the last 30 s. */
+/** Scorch decal lifetime (s): fades out over the last SCORCH_FADE_S. */
 const SCORCH_LIFE = 90;
+/** Scorch fade-out (s). Pass 17: was 30 s — at +75 s the scorch was
+ *  at 0.2 opacity, below the visible threshold in rendered frames
+ *  (0 px from the chase camera at +75 s, and 0 px even at +30 s
+ *  because the 10 m decal hid under the 19 m wreck). The scorch now
+ *  holds full opacity until its last 15 s, and is bigger (see
+ *  scorchDecal) so it reads around the wreck instead of under it. */
+const SCORCH_FADE_S = 15;
 /** Explosion sprite lifetime (s). Pass 11 (stall-impact VFX): was
  *  0.9 s — the fireball started at ~12 m, ballooned to ~110 m while
  *  fading linearly to transparent, and was gone in under a second, so
@@ -280,6 +336,7 @@ export class CrashVFXManager {
   private readonly opts: CrashVFXOptions;
   private readonly boomTex: THREE.CanvasTexture;
   private readonly smokeTex: THREE.CanvasTexture;
+  private readonly fireTex: THREE.CanvasTexture;
   private readonly booms: Boom[] = [];
   private readonly plumes: Plume[] = [];
   private readonly debris: DebrisPiece[] = [];
@@ -296,6 +353,7 @@ export class CrashVFXManager {
     this.opts = opts;
     this.boomTex = radialTexture(BOOM_STOPS);
     this.smokeTex = radialTexture(SMOKE_STOPS);
+    this.fireTex = radialTexture(FIRE_STOPS);
     scene.add(this.flash);
     // Pass 13: the flash is a scene object at the crash site — shift
     // it with the world like every other VFX object (see
@@ -369,16 +427,43 @@ export class CrashVFXManager {
     for (let i = 0; i < 5; i++) {
       const s = new THREE.Sprite(
         new THREE.SpriteMaterial({
-          map: this.smokeTex,
+          map: isFire ? this.fireTex : this.smokeTex,
           color: colour,
           transparent: true,
           opacity: baseOpacity,
           depthWrite: false,
         }),
       );
-      const size = isFire ? 8 + i * 2.5 : 6 + i * 2;
+      // Pass 17: a wreck fire is a concentrated flame, not a big soft
+      // wash — the old 8-18 m smoke-textured sprites spread a faint
+      // orange haze around the wreck with no bright core. Fire sprites
+      // are small (3-7 m) with a hot-core texture, clustered on the
+      // wreck so they read as flames licking the fuselage: the first
+      // attempt (5-12 m sprites) merged into one giant orange disc
+      // that hid the wreck entirely.
+      const size = isFire ? 4 + i * 1.0 : 6 + i * 2;
       s.scale.set(size, size, 1);
-      s.position.set((Math.random() - 0.5) * 2, -i * 1.2, -4 - i * 1.5);
+      // Pass 17: render order — the dark smoke plume's big sprites
+      // otherwise paint over the smaller fire sprites from some
+      // angles (transparent sorting is by distance, and the two
+      // plumes share an origin), so the fire vanished from the
+      // spectate side while reading fine from chase. Fire draws last.
+      s.renderOrder = isFire ? 2 : 1;
+      if (attachTo) {
+        // Attached (a wreck fire, or a dying jet's fire): the flame
+        // rises FROM the wreck, it does not trail behind/below it.
+        // The old trail offsets (-i*1.2 y, -4-i*1.5 z) put the fire
+        // under and behind the jet, where the wreck occludes it from
+        // the chase camera — the only visible fire was the soft wash
+        // spilling around the silhouette. The sprites sit ABOVE the
+        // fuselage spine (local y +1.2 and up): centred on the jet's
+        // centreline they sit inside the fuselage volume and the
+        // depth test hides them (the second attempt read 0 fire px
+        // from chase).
+        s.position.set((Math.random() - 0.5) * 3, 1.2 + i * 0.9, (Math.random() - 0.5) * 3 - i * 0.6);
+      } else {
+        s.position.set((Math.random() - 0.5) * 2, -i * 1.2, -4 - i * 1.5);
+      }
       group.add(s);
     }
     const life = attachTo ? ATTACHED_PLUME_LIFE : 6;
@@ -455,6 +540,26 @@ export class CrashVFXManager {
         box.getSize(size);
         half = size.multiplyScalar(0.5);
       }
+      // Pass 17: the detached segment keeps its own material — the
+      // procedural torn wing/tail arrives in the spec tint x0.3, a
+      // real GLB segment in its factory paint — so the two torn
+      // pieces read as painted spares next to the charred generic
+      // field. A torn-off piece is burnt wreckage: recolour it to
+      // the charred palette (the material is cloned per aircraft,
+      // and the piece is detached for good, so this is safe).
+      const charred =
+        CHARRED_COLORS[
+          Math.floor(Math.random() * CHARRED_COLORS.length)
+        ]!;
+      mesh.traverse((o) => {
+        const mm = o as THREE.Mesh;
+        if (!mm.isMesh) return;
+        const mats = Array.isArray(mm.material) ? mm.material : [mm.material];
+        for (const mat of mats) {
+          const lm = mat as THREE.MeshLambertMaterial;
+          if (lm.color) lm.color.setHex(charred);
+        }
+      });
       const box = new THREE.Box3().setFromObject(mesh);
       // Re-centre the mesh on its own origin so the body tracks it cleanly.
       const centre = new THREE.Vector3();
@@ -534,8 +639,25 @@ export class CrashVFXManager {
         }),
     );
     this.opts.origin?.registerBody(body);
+    // Pass 17 (worker D): the collider is a FLAT slab at the BOTTOM
+    // of the piece's bounding box, not the full bbox. The torn
+    // panel's 30-45 deg diagonal fold makes the bbox ~1.8 m tall,
+    // and a full-bbox cuboid lets the piece balance on a corner
+    // with its centre ~2.9 m up — dead still (vy/spd/ang all 0),
+    // but above the 2.5 m resting window, so probe-crash-vfx's
+    // debris-resting check failed 4/6 and 5/6 at +10 s (the
+    // pre-fix 15-30 deg fold's bbox was short enough to stay under
+    // the window). A flat collider rests the piece on its flat half
+    // (centre ~half.y, well inside the window) with the folded half
+    // kicked up into the air — the torn read, reliably settled.
+    // The collider is centred on the bbox bottom, so the mesh's
+    // lowest point still touches the ground; its footprint is the
+    // full bbox (it overhangs the diagonal fold's corners by up to
+    // ~0.8 m, invisible at crash-site viewing distance).
+    const collHalfY = Math.max(0.12, Math.min(half.y, 0.3));
     world.createCollider(
-      RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z)
+      RAPIER.ColliderDesc.cuboid(half.x, collHalfY, half.z)
+        .setTranslation(0, -half.y + collHalfY, 0)
         .setFriction(0.8)
         .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max),
       body,
@@ -551,27 +673,35 @@ export class CrashVFXManager {
    *  a growing black disc the stuck jet sits on, which is what the
    *  v2 play-test read as a "black disc in the sky". Oldest decals
    *  are removed from the scene and disposed; the rest fade in
-   *  update() over their last 30 s.
+   *  update() over their last SCORCH_FADE_S.
    *  Pass 6 (item 2): the v4.1 ground was still covered in huge
    *  dark discs — the repeated spawn-crash scorches (radius 8 = 16 m
    *  across, at 0.45 opacity) read as black discs on the green
    *  terrain, and they are not registered with the floating origin
    *  so a shift leaves them at the wrong place. An aircraft crash
-   *  now leaves a smaller, fainter mark (radius 5, 0.35); the
+   *  now leaves a smaller, fainter mark (radius 11, 0.8 — pass 17:
+   *  the radius-5 mark hid entirely under the 19 m wreck from the
+   *  chase camera, 0 px at +30 s, and even radius 8 only read 11 px
+   *  from chase; radius 11 = 22 m across reads around the 13 m
+   *  wingspan and past the 19 m fuselage instead of under it. The
+   *  0.5 opacity rendered as a pale stain — pixel diffs vs grass
+   *  were 12-22, under any visible threshold — so the mark is 0.8
+   *  now: a fresh fuel-fire scorch is dark, and it still fades out
+   *  over SCORCH_FADE_S and is capped at 12); the
    *  carrier impact scorch still passes its own radius (30). */
-  scorchDecal(pos: THREE.Vector3, radius = 5): THREE.Mesh {
+  scorchDecal(pos: THREE.Vector3, radius = 11): THREE.Mesh {
     const gh = this.opts.groundHeight
       ? this.opts.groundHeight(pos.x, pos.z)
       : pos.y;
     const decal = new THREE.Mesh(
-      new THREE.CircleGeometry(radius, 24),
+      new THREE.CircleGeometry(radius, 48),
       new THREE.MeshBasicMaterial({
         // Pass 13: the colour lives in the irregular blotch texture
         // now (see irregularScorchTexture) — a flat dark circle
         // read as a shadow/disc on the grass.
         map: irregularScorchTexture(),
         transparent: true,
-        opacity: 0.4,
+        opacity: 0.8,
         depthWrite: false,
       }),
     );
@@ -641,10 +771,18 @@ export class CrashVFXManager {
       // (the probe only passed there before because leftover debris
       // from an earlier scenario had perturbed the crash site).
       // Bake the tilt into the geometry and drop every vertex
-      // vertically onto the terrain (+0.12 m), so the mark drapes
+      // vertically onto the terrain (+0.30 m), so the mark drapes
       // over the slope instead of floating above it or burying
       // under it. The mesh quaternion is identity afterwards and
       // the vertices are relative to the mesh position.
+      // Pass 17: the offset was +0.12 m — on rolling ground the
+      // flat fan triangles between the snapped vertices cut through
+      // terrain bumps and buried most of the decal (rendered frames:
+      // a radius-8 scorch read only 331 px from the side, 11 px
+      // from chase, although ~1400 px of crescent is exposed in plan
+      // view). +0.30 m clears the bumps; at 30-42 m the float is
+      // ~4 px and invisible, and the texture feathers to transparent
+      // at the rim anyway.
       const geo = decal.geometry as THREE.CircleGeometry;
       const centre = decal.position.clone();
       const p = geo.getAttribute('position') as THREE.BufferAttribute;
@@ -653,7 +791,7 @@ export class CrashVFXManager {
         v.set(p.getX(i), p.getY(i), p.getZ(i)).applyQuaternion(q);
         const wx = centre.x + v.x;
         const wz = centre.z + v.z;
-        v.y = this.opts.groundHeight(wx, wz) + 0.12 - centre.y;
+        v.y = this.opts.groundHeight(wx, wz) + 0.3 - centre.y;
         p.setXYZ(i, v.x, v.y, v.z);
       }
       p.needsUpdate = true;
@@ -758,7 +896,8 @@ export class CrashVFXManager {
       }
     }
     // Scorch decals: age and fade out over SCORCH_LIFE (full opacity
-    // for the first 60 s, then a linear fade to 0 over the last 30 s).
+    // for the first SCORCH_LIFE - SCORCH_FADE_S, then a linear fade
+    // to 0 over the last SCORCH_FADE_S).
     for (let i = this.scorches.length - 1; i >= 0; i--) {
       const s = this.scorches[i]!;
       s.age += dt;
@@ -768,13 +907,13 @@ export class CrashVFXManager {
         s.mesh.geometry.dispose();
         (s.mesh.material as THREE.Material).dispose();
         this.scorches.splice(i, 1);
-      } else if (s.age > SCORCH_LIFE - 30) {
-        const fade = 1 - (s.age - (SCORCH_LIFE - 30)) / 30;
+      } else if (s.age > SCORCH_LIFE - SCORCH_FADE_S) {
+        const fade = 1 - (s.age - (SCORCH_LIFE - SCORCH_FADE_S)) / SCORCH_FADE_S;
         // Pass 6: the fade used 0.55 while the decal starts at 0.35,
         // so a scorch got MORE opaque when it started fading. Use the
-        // same base opacity as the decal is created with (0.40 since
-        // pass 11).
-        (s.mesh.material as THREE.MeshBasicMaterial).opacity = 0.4 * fade;
+        // same base opacity as the decal is created with (0.80 since
+        // pass 17).
+        (s.mesh.material as THREE.MeshBasicMaterial).opacity = 0.8 * fade;
       }
     }
   }

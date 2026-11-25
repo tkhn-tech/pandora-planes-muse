@@ -90,21 +90,50 @@ export function gameToTrueHdg(gameDeg: number): number {
  *  (speed >= 60 m/s, dive angle >= 20 deg — a landing flare, a
  *  runway bounce and a VTOL hover-descent all fall outside it) the
  *  warning fires while the ballistic time to the ground is still
- *  less than the pull-out time plus a 2 s reaction margin, or under
+ *  less than the pull-out time plus a reaction margin, or under
  *  5 s outright. The pull-out time is tPull = theta * V / (g * 3):
  *  the time to rotate the velocity vector through the dive angle at
  *  the 4 g turn rate (g * (4 - 1) / V). Pure (no DOM) so a probe can
- *  drive it from a real stepped Aircraft. */
-export const PULL_UP_REACT_S = 2.0;
+ *  drive it from a real stepped Aircraft.
+ *
+ *  Pass 17 (worker C): the v4.10 live dive exposed TWO gaps in the
+ *  pass-14 criterion, both reproduced in probe-pullup-diag before
+ *  this fix —
+ *  (1) the dive-angle gate blinded the warning to the shallow fast
+ *  descent that actually killed the jet live: the v4.10 crash came
+ *  at vs −45 m/s with the flight-path angle at ~10–15 deg (a
+ *  re-descent after the trim auto-recovered the first steep dive),
+ *  so theta < 20 deg and the warning NEVER fired, at any altitude
+ *  (staged: vy −45 m/s, V 175–260 m/s, 600 m AGL, tImpact 7.4 s —
+ *  silent). A fast SINK is a terrain warning regardless of angle:
+ *  no legitimate regime sinks at 25 m/s (approach ~4, trap ~4,
+ *  VTOL hover-descent <= 8 m/s), so a second arm fires on sink
+ *  rate alone (vy <= −25 m/s) with its own 8 s floor.
+ *  (2) the reaction margin was too thin for the fastest dives: at
+ *  ~400 m/s the warning first crossed only at ~6,000 ft, already
+ *  unrecoverable (tImpact 6.6 s < tPull 8.8 s) — the ideal-rotation
+ *  tPull ignores pitch-slew / AoA build-up lag, so the margin is
+ *  now 4 s, not 2 s. */
+export const PULL_UP_REACT_S = 4.0;
 /** Absolute time-to-impact floor (s): warn below this in a steep
  *  fast dive even when the pull-out itself would be quick. */
 export const PULL_UP_MIN_WARN_S = 5.0;
+/** Time-to-impact floor (s) for the fast-sink arm: a jet sinking
+ *  at 25+ m/s gets the warning while ~8 sim-s out, i.e. ~600 m AGL
+ *  at vy −45 m/s — seconds before impact, at altitude, instead of
+ *  never (the v4.10 live crash profile). */
+export const PULL_UP_SINK_WARN_S = 8.0;
 /** Minimum dive angle (deg) for the time-based warning: shallower
  *  descents (approach, flare, bounce) never trigger it. */
 export const PULL_UP_MIN_DIVE_DEG = 20;
 /** Minimum speed (m/s) for the time-based warning: a VTOL hover or
  *  a slow vertical sink has no wing-borne pull-out to warn about. */
 export const PULL_UP_MIN_SPEED_MS = 60;
+/** Minimum sink rate (m/s, vertical speed <= −this) for the
+ *  fast-sink arm: below the dive-angle gate's reach, the warning
+ *  fires on sink rate + time to impact alone. 25 m/s (≈ −4,900 fpm)
+ *  is ~6x any normal approach/trap/VTOL sink rate. */
+export const PULL_UP_MIN_SINK_MS = 25;
 
 export interface PullUpTimeState {
   warn: boolean;
@@ -127,12 +156,27 @@ export function pullUpTimeBased(ac: Aircraft): PullUpTimeState {
   const tImpact =
     agl > 0 ? (vy + Math.sqrt(vy * vy + 2 * g * agl)) / g : 0;
   const tPull = (theta * V) / (g * 3);
+  // Pass 17 (worker C): two arms, one time threshold. The steep arm
+  // is the pass-14 criterion (fast + steep). The sink arm fires on
+  // sink rate alone — a fast descent at a shallow flight-path angle
+  // (the v4.10 live crash: vy −45 m/s, theta ~10–15 deg) has a small
+  // tPull, so without its own floor it would warn only ~3 s out or
+  // never; the 8 s floor warns while ~8 sim-s out. A slow sink
+  // (VTOL hover-descent, approach) meets neither arm.
+  const steepFast =
+    V >= PULL_UP_MIN_SPEED_MS &&
+    theta >= (PULL_UP_MIN_DIVE_DEG * Math.PI) / 180;
+  const fastSink = vy <= -PULL_UP_MIN_SINK_MS;
+  const threshold = Math.max(
+    PULL_UP_MIN_WARN_S,
+    tPull + PULL_UP_REACT_S,
+    fastSink ? PULL_UP_SINK_WARN_S : 0,
+  );
   const warn =
     !ac.grounded &&
     agl > 0 &&
-    V >= PULL_UP_MIN_SPEED_MS &&
-    theta >= (PULL_UP_MIN_DIVE_DEG * Math.PI) / 180 &&
-    tImpact < Math.max(PULL_UP_MIN_WARN_S, tPull + PULL_UP_REACT_S);
+    (steepFast || fastSink) &&
+    tImpact < threshold;
   return {
     warn,
     tImpact,
@@ -348,13 +392,22 @@ export class FlightHUD {
             ? '🔥 FUEL FIRE — DIVE FAST TO BLOW IT OUT'
             : '🔥 ENGINE FIRE — CUT THROTTLE TO STARVE IT';
         w.classList.add('show');
-      } else if (ac.stalled && ac.alive) {
-        w.textContent = '⚠ STALL — NOSE DOWN, FULL POWER';
-        w.classList.add('show');
       } else if (ac.alive && (pullUp.warn || game.belowMinReleaseAlt)) {
+        // Pass 17 (worker C): PULL UP outranks STALL. A hard pull-up
+        // out of a steep dive drives AoA past peakAoA, so the stall
+        // flag latches exactly while the terrain warning is live —
+        // and STALL's text ("NOSE DOWN, FULL POWER") orders the
+        // opposite of the terrain recovery. Measured in
+        // probe-pullup-diag leg F: 1.7 sim-s after the pull-up the
+        // banner flipped from PULL UP to STALL while tImpact was
+        // still 10.5 s. Terrain kills in seconds; the stall text can
+        // wait until the terrain warning clears.
         w.textContent = pullUp.warn
           ? '⚠ PULL UP — TERRAIN'
           : '⚠ PULL UP — BELOW MIN RELEASE ALT';
+        w.classList.add('show');
+      } else if (ac.stalled && ac.alive) {
+        w.textContent = '⚠ STALL — NOSE DOWN, FULL POWER';
         w.classList.add('show');
       } else if (ac.fuel < 0.15 && ac.alive) {
         // 0.15 on the 0..1 fuel scale — the old `ac.fuel < 15` compared a
