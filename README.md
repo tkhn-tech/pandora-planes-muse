@@ -70,3 +70,11 @@ Pushes to `main` deploy automatically via `.github/workflows/deploy.yml`
 **One-time repo step (already done by Nicholas, 16 Nov 2026):**
 Settings → Pages → Source: **GitHub Actions**. The first Actions deploy
 goes live once the workflow is pushed to `main`.
+
+## Deploy status
+
+- v4.10.0 is in the repo (head `bb9a664e`) but the live site still serves
+  v4.9: Pages deploy runs #26, #27 and #28 all failed at the deploy step
+  ("No artifacts named github-pages were found" / "Fetching artifact
+  metadata failed") even though the artifact uploads. Re-trigger commit
+  2026-11-25 to start a fresh deploy run.
