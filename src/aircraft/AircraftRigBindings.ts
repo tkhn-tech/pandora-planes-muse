@@ -492,7 +492,7 @@ export class AircraftRigBindings {
       // bellyY came out ~599 and every procedural leg was built with
       // strutTop ~599.5: a ~600 m spike from the nose gear up
       // through the jet (visible whenever the gear is down, and it
-      // crossed the F-35A's cockpit sightline at 0.53 m). Convert
+      // crossed the F-35A's forward sightline at 0.53 m). Convert
       // the world bbox back into the model's own frame before
       // reading it.
       const inv = group.matrixWorld.clone().invert();

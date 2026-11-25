@@ -1,7 +1,7 @@
 // OrbitCamera.ts — pass 11 (wreck free orbit), pass 12 (carrier deck
 // camera + free-orbit terrain floor).
 //
-// Pure helpers for the free-orbit camera (camMode 2), shared by the
+// Pure helpers for the free-orbit camera (camMode 1), shared by the
 // normal free-orbit view and the wreck-spectate view. Kept pure so a
 // probe can drive them without the game: the camera orbits a target,
 // zooms by distance, and stays focused on it.

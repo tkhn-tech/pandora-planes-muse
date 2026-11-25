@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.10, 24 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.11, 25 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -377,7 +377,7 @@
         <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v4.10 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.11 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 
@@ -388,9 +388,9 @@
       <b>Stick</b> (bottom-left) — pitch / roll. Drag up to climb, down to descend; drag left / right to bank. Release to centre.<br>
       <b>Throttle</b> (left slider) — W / S, or Shift / Ctrl.<br>
       <b>Flaps / Airbrake / Vector</b> — right panel sliders. Vector only on the F-35A: at 90° the throttle becomes lift — hover, then descend under 4 m/s onto a VTOL pad.<br>
-      <b>Keyboard —</b> <b>Stick</b> arrow keys (pitch / roll) · <b>Rudder</b> Q / E · <b>Throttle</b> W / S (or Shift / Ctrl) · <b>Flaps</b> [ / ] (±10°) · <b>Airbrake</b> X (toggle) · <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only) · <b>Camera</b> C · <b>Camera reset</b> R · <b>Pause</b> P. Mouse: drag on the canvas steers (mouse yoke) in Chase / Cockpit cam. Tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
+      <b>Keyboard —</b> <b>Stick</b> arrow keys (pitch / roll) · <b>Rudder</b> Q / E · <b>Throttle</b> W / S (or Shift / Ctrl) · <b>Flaps</b> [ / ] (±10°) · <b>Airbrake</b> X (toggle) · <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only) · <b>Camera</b> C · <b>Camera reset</b> R · <b>Pause</b> P. Mouse: drag on the canvas steers (mouse yoke) in Chase cam. Tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
       <b>Stick feel:</b> the keyboard stick ramps like a real stick, not a switch — pitch slews at 3/s, roll snaps over at 12/s and returns at 2.5/s, so a tap banks the jet. The touch stick's authority falls with speed, so a full drag stays gentle at high speed. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
-      <b>Camera</b> C — Chase / Cockpit / Free orbit (drag to orbit, pinch to zoom in Free). R resets the camera.<br>
+      <b>Camera</b> C — Chase / Free orbit (drag to orbit, pinch to zoom in Free). R resets the camera.<br>
       <b>Pause</b> P · <b>Restart</b> ↻ button · <b>Setup</b> (pause menu) — change the sandbox settings mid-flight and Apply &amp; Restart, or Resume with the old settings.<br>
       <b>Spawn:</b> Alpha, Bravo or Charlie runway, or the Helicarrier deck (setup menu) — the jet starts on the deck at the carrier's heading and speed, ready to roll off the bow.<br>
       <b>Carrier trap:</b> hook down, under 140 kt over one of the three stern wires — the wire catches you and hauls you to a stop. Over that speed it snaps.<br>

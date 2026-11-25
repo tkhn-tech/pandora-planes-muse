@@ -1138,7 +1138,7 @@ async function main(): Promise<void> {
   }
 
   // --- (G) Free-orbit ground view: does the legacy camera go under the terrain? ---
-  // The live free-orbit branch (main.ts updateCamera, camMode 2) sets
+  // The live free-orbit branch (main.ts updateCamera, camMode 1) sets
   // the camera from orbit angles/dist and clamps ONLY at the camera's
   // own (x, z): Math.max(cy, groundHeight(cx, cz) + 3). It never checks
   // the ground under the MIDPOINT to the target, or along the

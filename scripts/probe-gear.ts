@@ -146,7 +146,6 @@ import { Aircraft } from '../src/physics/FlightPhysicsController';
 import type { DeckProvider } from '../src/physics/FlightPhysicsController';
 import { SPECS } from '../src/aircraft/AircraftSpec';
 import { AircraftRigBindings } from '../src/aircraft/AircraftRigBindings';
-import { buildCockpit } from '../src/aircraft/CockpitBuilder';
 import { FloatingOrigin } from '../src/world/FloatingOrigin';
 import {
   HelicarrierController,
@@ -453,32 +452,6 @@ async function main(): Promise<void> {
           helmet ? `visible=${helmet.visible}` : 'helmet002 not found',
         );
       }
-    }
-
-    // --- F-35A cockpit measurement (open item, pass 12 — INFO only,
-    // not a check: the fix lives in CockpitBuilder, which this probe
-    // does not own). buildCockpit() is what main.ts calls after
-    // attachModel; on the canopy-less F-35A the headrest / helmet
-    // tops must sit at or below the fuselage top, or they read as a
-    // black box on the spine from outside.
-    if (key === 'f35a') {
-      buildCockpit(ac.group, key);
-      const topOf = (name: string): number => {
-        const o = ac.group.getObjectByName(name);
-        return o ? new THREE.Box3().setFromObject(o).max.y : NaN;
-      };
-      let fusTop = -Infinity;
-      ac.model!.traverse((o) => {
-        const m = o as THREE.Mesh;
-        if (!m.isMesh) return;
-        if (o.name.startsWith('cockpit_') || o.name.startsWith('gear_')) return;
-        const bb = new THREE.Box3().setFromObject(m);
-        const cz = (bb.min.z + bb.max.z) / 2;
-        if (cz >= 3 && cz <= 7) fusTop = Math.max(fusTop, bb.max.y);
-      });
-      console.log(
-        `INFO  f35a cockpit (open item): headrestTop=${topOf('cockpit_headrest').toFixed(2)} helmetTop=${topOf('cockpit_helmet').toFixed(2)} fuselageTop=${fusTop.toFixed(2)} — headrest/helmet above the fuselage top poke through the spine (no canopy)`,
-      );
     }
 
     // --- Spawn on Alpha: gear down, visible, belly on the physics belly.
