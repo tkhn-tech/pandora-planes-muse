@@ -78,3 +78,9 @@ goes live once the workflow is pushed to `main`.
   ("No artifacts named github-pages were found" / "Fetching artifact
   metadata failed") even though the artifact uploads. Re-trigger commit
   2026-11-25 to start a fresh deploy run.
+
+## Deploy status
+- 2026-11-25 ~17:21 SGT: v4.11 deploys #30/#31/#32 all failed at the deploy step
+  ("No artifacts named \"github-pages\" were found" / "Fetching artifact metadata
+  failed") even though the artifact uploads. Re-trigger commit 2026-11-25 to
+  start a fresh deploy run (run #33 expected). Game code byte-identical to v4.11.
