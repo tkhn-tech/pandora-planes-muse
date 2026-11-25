@@ -281,11 +281,17 @@ async function main(): Promise<void> {
     let ey: number;
     let ez: number;
     if (i < 2) {
+      // Pass 17 (Worker B): dead-ahead, synced with the main.ts
+      // startRound fix — the old offsets (side 120/-150, up
+      // 120/180) put both enemies ~21 deg off the nose, OUTSIDE
+      // the 15 deg lock cone from frame one, so the 1-enemy cruise
+      // lock measured 0.00 s. Dead-ahead (side 0, up 30/60) the
+      // same scan locks in 1.70 s (probe-pass17-lock).
       const fwd = player.fwd();
       const rgt = new THREE.Vector3(fwd.z, 0, -fwd.x);
       const along = 450 + i * 150;
-      const side = i === 0 ? 120 : -150;
-      const up = 120 + i * 60;
+      const side = 0;
+      const up = 30 + i * 30;
       ex = player.pos.x + fwd.x * along + rgt.x * side;
       ey = player.pos.y + up;
       ez = player.pos.z + fwd.z * along + rgt.z * side;

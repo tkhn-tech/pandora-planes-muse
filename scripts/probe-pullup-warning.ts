@@ -1,5 +1,5 @@
 // probe-pullup-warning.ts — pass 14, worker D (item 2: PULL UP
-// warning too late).
+// warning too late); reworked pass 17, worker C.
 //
 // v4.8 live finding: the F-18's "PULL UP — BELOW MIN RELEASE ALT"
 // warning only appeared at 123 ft in a −42,131 fpm (−214 m/s) dive.
@@ -13,7 +13,25 @@
 // outside it) warn while the ballistic time to the ground is under
 // max(5 s, pull-out time + 2 s reaction margin).
 //
-// This probe flies the SAME steep dive twice through the live path
+// Pass 17 rework: the v4.10 live dive showed the pass-14 criterion
+// still fails live in two ways, both reproduced in
+// probe-pullup-diag (deleted after use) and now covered here:
+// (1) SHALLOW FAST DESCENT — the v4.10 crash came at vs −45 m/s
+// with the flight-path angle at ~10–15 deg (a re-descent after the
+// trim auto-recovered the first steep dive), so the 20 deg gate
+// kept the warning silent at every altitude (staged: vy −45 m/s,
+// V 175–260 m/s, 600 m AGL, tImpact 7.4 s — silent). Fix: a second
+// arm fires on sink rate alone (vy <= −25 m/s) with an 8 s floor,
+// and the reaction margin is 4 s (the ideal-rotation tPull ignores
+// pitch-slew / AoA build-up lag, so at ~400 m/s the old margin
+// first warned at ~6,000 ft, already unrecoverable).
+// (2) STALL MASKING — a hard pull-up out of a steep dive drives AoA
+// past peakAoA, so the stall flag latched exactly while the terrain
+// warning was live and the HUD showed STALL ("NOSE DOWN, FULL
+// POWER") instead of PULL UP. Fix: the #warn priority now puts
+// PULL UP above STALL (spin/fire stay above it).
+//
+// This probe flies steep AND shallow dives through the live path
 // (real fa18, real GLB, variable frame dt, live 3 m/s wind, origin
 // shift, Rapier stepping) and reads BOTH flags off it: the old CCIP
 // flag (WeaponSystem.computeCcip, the pre-fix code) and the new HUD
@@ -222,6 +240,7 @@ async function main(): Promise<void> {
     const player = makePlayer('fa18');
     const drain = drainFor(player);
     await player.attachModel();
+    check('flown dive uses the real F-18 GLB (modelStatus ok)', player.modelStatus === 'ok', `modelStatus=${player.modelStatus} tris=${player.modelTris}`);
     // Origin shift before the flight (live path: the jet flies in the
     // shifted frame, exactly like probe-crash-vfx scenario C).
     origin.applyShift(new THREE.Vector3(2500, 0, -1200));
@@ -332,6 +351,143 @@ async function main(): Promise<void> {
     player.dispose();
   }
 
+  // ---------- Flown shallow descent (the v4.10 live crash) ----------
+  // Pass 17 (worker C): level at 600 m AGL, then a MODERATE
+  // nose-down hold (pitchIn +0.5, not the full +1.0 of the steep
+  // dive) — the jet settles into a shallow fast descent, the
+  // profile that killed the jet live (vs −45 m/s, theta ~10–15 deg)
+  // with the warning silent pre-fix. 600 m (not 800 m): from 800 m
+  // the descent steepens past 20 deg before the sink arm's 8 s
+  // floor is reached, so the steep arm fires first; from 600 m the
+  // 8 s floor is crossed while the flight path is still shallow.
+  // Post-fix the sink arm must warn seconds before impact, at
+  // altitude.
+  {
+    const player = makePlayer('fa18');
+    const drain = drainFor(player);
+    await player.attachModel();
+    check('shallow leg uses the real F-18 GLB (modelStatus ok)', player.modelStatus === 'ok', `modelStatus=${player.modelStatus}`);
+    const g2 = heightAt(baseX, baseZ);
+    player.resetAt(baseX, g2 + 600, baseZ, 90);
+    player.setAirspeed(150);
+    player.gear = false;
+    player.grounded = false;
+    player.thrTarget = 0.6;
+    player.throttle = 0.6;
+    player.pitchIn = 0;
+    const sim = { t: 0, rawIdx: 0 };
+    let firstNew: { simT: number; aglFt: number; tImpact: number; vsiFpm: number; theta: number; V: number } | null = null;
+    let maxSinkFpm = 0;
+    let warnedInLevel = false;
+    let minAgl = Infinity;
+    let frames = 0;
+    while (sim.t < 60 && frames < 400) {
+      frames++;
+      if (sim.t > 2) player.pitchIn = 0.5;
+      liveFrame(player, drain, sim, (simT) => {
+        const agl = player.pos.y - heightAt(player.pos.x, player.pos.z);
+        if (agl < minAgl) minAgl = agl;
+        const vsiFpm = player.vel.y * M2FT * 60;
+        if (vsiFpm < maxSinkFpm) maxSinkFpm = vsiFpm;
+        const warned = warnEl.classList.contains('show') && warnEl.textContent.includes('PULL UP');
+        if (simT <= 2 && warned) warnedInLevel = true;
+        if (!firstNew && warned) {
+          const pu = pullUpTimeBased(player);
+          firstNew = { simT, aglFt: agl * M2FT, tImpact: ballisticTImpact(agl, player.vel.y), vsiFpm, theta: pu.thetaDeg, V: player.vel.length() };
+        }
+      });
+      if (!player.alive) break;
+      // Stop once the jet has bottomed out and is climbing away
+      // above 1000 m AGL (recovered) — the warning leg is over.
+      if (sim.t > 5 && player.vel.y > 0 && player.pos.y - heightAt(player.pos.x, player.pos.z) > 1000) break;
+    }
+    console.log(`shallow descent: max sink ${maxSinkFpm.toFixed(0)} fpm, closest approach ${minAgl.toFixed(0)}m AGL, alive=${player.alive}`);
+    console.log(`shallow first warning: ${firstNew ? `t=${firstNew.simT.toFixed(2)}s agl=${firstNew.aglFt.toFixed(0)}ft tImpact=${firstNew.tImpact.toFixed(2)}s vsi=${firstNew.vsiFpm.toFixed(0)}fpm theta=${firstNew.theta.toFixed(1)}deg V=${firstNew.V.toFixed(0)}` : 'NEVER'}`);
+    check('shallow descent develops a fast sink (<= -25 m/s, the sink-arm gate)', maxSinkFpm <= -25 * M2FT * 60, `max sink=${maxSinkFpm.toFixed(0)} fpm`);
+    check('shallow descent: no warning during the level entry (no false positive)', !warnedInLevel, `warnedInLevel=${warnedInLevel}`);
+    check(
+      'shallow descent warns with >= 6 s of time-to-impact left (the sink arm, seconds before impact)',
+      !!firstNew && firstNew.tImpact >= 6.0,
+      firstNew ? `tImpact=${firstNew.tImpact.toFixed(2)}s agl=${firstNew.aglFt.toFixed(0)}ft` : 'no warning',
+    );
+    check(
+      'shallow descent warns high (AGL >= 1500 ft at first appearance)',
+      !!firstNew && firstNew.aglFt >= 1500,
+      firstNew ? `agl=${firstNew.aglFt.toFixed(0)}ft` : 'no warning',
+    );
+    check(
+      'shallow descent warning fires on the SINK arm, not the steep arm (theta < 20 deg at first warning)',
+      !!firstNew && firstNew.theta < 20,
+      firstNew ? `theta=${firstNew.theta.toFixed(1)}deg` : 'no warning',
+    );
+    origin.unregisterBody(player.body);
+    player.dispose();
+  }
+
+  // ---------- Stall masking: full pull-up at first warn ----------
+  // Pass 17 (worker C): fly the natural steep dive from 13,515 ft
+  // (as in probe-pullup-diag leg F) and pull full up the moment the
+  // HUD first shows PULL UP. The pull drives AoA past peakAoA, so
+  // the stall flag latches while the terrain warning is still live
+  // — pre-fix the banner flipped to STALL ("NOSE DOWN, FULL POWER")
+  // 1.7 sim-s into the pull-up; post-fix PULL UP must stay up
+  // until the terrain warning itself clears.
+  {
+    const player = makePlayer('fa18');
+    const drain = drainFor(player);
+    await player.attachModel();
+    check('masking leg uses the real F-18 GLB (modelStatus ok)', player.modelStatus === 'ok', `modelStatus=${player.modelStatus}`);
+    const g2 = heightAt(baseX, baseZ);
+    player.resetAt(baseX, g2 + 4119, baseZ, 90);
+    player.setAirspeed(150);
+    player.gear = false;
+    player.grounded = false;
+    player.thrTarget = 0.4;
+    player.throttle = 0.4;
+    player.pitchIn = 0;
+    const sim = { t: 0, rawIdx: 0 };
+    let pulling = false;
+    let firstWarnSimT = -1;
+    let masked = 0;
+    let warnSamples = 0;
+    let minAgl = Infinity;
+    let frames = 0;
+    while (sim.t < 120 && frames < 600) {
+      frames++;
+      if (sim.t > 3 && !pulling) player.pitchIn = 1.0;
+      liveFrame(player, drain, sim, (simT) => {
+        const agl = player.pos.y - heightAt(player.pos.x, player.pos.z);
+        if (agl < minAgl) minAgl = agl;
+        const pu = pullUpTimeBased(player);
+        const warned = warnEl.classList.contains('show') && warnEl.textContent.includes('PULL UP');
+        if (!pulling && warned) {
+          pulling = true;
+          firstWarnSimT = simT;
+        }
+        if (pulling && pu.warn) {
+          warnSamples++;
+          if (!warned) masked++;
+        }
+      });
+      if (pulling) player.pitchIn = -1.0;
+      if (!player.alive) break;
+      if (pulling && sim.t > firstWarnSimT + 15) break;
+    }
+    console.log(`masking leg: first warn t=${firstWarnSimT.toFixed(2)}s, terrain-warn samples after pull-up=${warnSamples}, masked=${masked}, minAgl=${minAgl.toFixed(0)}m alive=${player.alive}`);
+    check(
+      'pull-up at first warn: PULL UP is never masked by STALL while the terrain warning is live',
+      warnSamples >= 1 && masked === 0,
+      `masked=${masked} of ${warnSamples} terrain-warn samples`,
+    );
+    check(
+      'pull-up at first warn: jet survives with >= 1000 m to spare (warning is early enough to recover from)',
+      player.alive && minAgl >= 1000,
+      `minAgl=${minAgl.toFixed(0)}m alive=${player.alive}`,
+    );
+    origin.unregisterBody(player.body);
+    player.dispose();
+  }
+
   // ---------- Staged-state checks on the real helper ----------
   {
     const ac = makePlayer('f22');
@@ -347,10 +503,31 @@ async function main(): Promise<void> {
     ac.vel.set(0, -8, 0);
     s = pullUpTimeBased(ac);
     check('staged VTOL hover descent does NOT warn (V=8 m/s)', !s.warn, `V=8 theta=${s.thetaDeg.toFixed(0)}deg`);
-    // Slow vertical sink: 40 m/s straight down.
+    // Slow vertical sink: 40 m/s straight down. Pass 17 (worker C):
+    // the pass-14 probe asserted this must NOT warn (below the
+    // 60 m/s gate) — but that gate is the defect the v4.10 live
+    // crash exposed: the live jet died sinking at −45 m/s, nearly
+    // identical to this case. A 40 m/s sink at 500 m AGL hits the
+    // ground in ~7 s; a terrain warning IS correct here. A
+    // genuinely slow sink (15 m/s, below) still stays silent.
     ac.vel.set(0, -40, 0);
     s = pullUpTimeBased(ac);
-    check('staged slow vertical sink does NOT warn (V=40 m/s, below the 60 m/s gate)', !s.warn, `V=40`);
+    check('staged 40 m/s vertical sink DOES warn (fast-sink arm; the v4.10 live crash profile)', s.warn, `tImpact=${s.tImpact.toFixed(2)}s`);
+    // Genuinely slow vertical sink: 15 m/s straight down.
+    ac.vel.set(0, -15, 0);
+    s = pullUpTimeBased(ac);
+    check('staged slow vertical sink does NOT warn (vy −15 m/s, below the 25 m/s sink gate)', !s.warn, `vy=-15 tImpact=${s.tImpact.toFixed(2)}s`);
+    // Shallow fast descent (the v4.10 live crash profile, staged):
+    // vy −45 m/s at 175 m/s, theta 15 deg, 600 m AGL — silent
+    // pre-fix (theta gate), must warn post-fix.
+    ac.vel.set(169, -45, 0);
+    ac.pos.set(baseX, g + 600, baseZ);
+    s = pullUpTimeBased(ac);
+    check('staged shallow fast descent DOES warn (vy −45 m/s, theta 15 deg, 600 m AGL — the live crash)', s.warn, `tImpact=${s.tImpact.toFixed(2)}s theta=${s.thetaDeg.toFixed(1)}deg`);
+    // Same sink rate, even shallower: vy −45 m/s at 260 m/s, theta 10 deg.
+    ac.vel.set(256, -45, 0);
+    s = pullUpTimeBased(ac);
+    check('staged shallow fast descent DOES warn (vy −45 m/s, theta 10 deg, 600 m AGL)', s.warn, `tImpact=${s.tImpact.toFixed(2)}s theta=${s.thetaDeg.toFixed(1)}deg`);
     // 3-deg approach at 70 m/s.
     ac.vel.set(69.9, -3.7, 0);
     s = pullUpTimeBased(ac);

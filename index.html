@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a1622">
 <title>Pandora Planes — Vite + TypeScript + Rapier</title>
 <!--
-  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.11, 25 Nov 2026).
+  PANDORA PLANES — Vite + TypeScript + Rapier3D port (v4.12, 25 Nov 2026).
   Ported from the single-file HTML v2.0 (../pandora-planes-html/).
   The start menu + HUD DOM shell and CSS below are ported verbatim from
   pandora-template.html — every element id matches the template's $()
@@ -215,11 +215,33 @@
      panel now lives on the RIGHT, below the minimap (144px tall),
      with a max-height so it never reaches #ctlPanel, and it scrolls
      (pointer-events:auto + auto-scroll in setDebug) so the newest
-     spawn-trace / warning lines stay visible when it overflows. */
-  #debug{position:fixed;right:8px;top:calc(164px + env(safe-area-inset-top));z-index:30;pointer-events:auto;
+     spawn-trace / warning lines stay visible when it overflows.
+     Pass 17 (worker C): the RIGHT position still covered the
+     CENTRED dialogs live (v4.10: the panel spans x ~54–382, y
+     ~128–612 on a 390x844 phone, over the respawn picker's Bravo /
+     Helicarrier buttons at y ~273–357 and the pause card's Setup /
+     Restart buttons; same overlap at 1280x720). The panel sat at
+     z-index 30 with pointer-events:auto, above the picker (z 7)
+     and the pause overlay (z 10), so the buttons were both hidden
+     and untappable (Tab+Enter workaround). Fix: the panel now sits
+     at z-index 4 — below every interactive layer (HUD z 5, controls
+     z 6, picker z 7, overlays z 10) — and takes pointer-events:none,
+     so taps always reach the buttons underneath; a dialog open on
+     top of it paints over it instead of under it. Trade-off: the
+     panel can no longer be scrolled by hand; setDebug's auto-scroll
+     to the newest lines still works. */
+  #debug{position:fixed;right:8px;top:calc(164px + env(safe-area-inset-top));z-index:4;pointer-events:none;
     font-family:ui-monospace,Menlo,monospace;font-size:10.5px;line-height:1.5;color:#bfe8c8;white-space:pre-wrap;
     background:rgba(4,14,10,.8);border:1px solid rgba(120,255,160,.35);border-radius:10px;padding:6px 8px;max-width:84vw;
     max-height:calc(100dvh - 400px);overflow-y:auto}
+  /* Pass 17 (worker C): hide the ?debug=1 panel entirely while a
+     dialog is open — respawn picker (.show) or any overlay (start /
+     help / pause, i.e. not .hidden) — so the panel can never cover,
+     sit behind, or intercept a dialog button. The panel returns
+     automatically when the dialog closes (setDebug owns its hidden
+     class; this rule only adds display:none while a dialog is up). */
+  body:has(#respawnPicker.show) #debug,
+  body:has(.overlay:not(.hidden)) #debug{display:none}
   .hidden{display:none!important}
   @media (max-width:560px){
     .hud{gap:5px;padding-left:8px;padding-right:calc(130px + env(safe-area-inset-right))}
@@ -377,7 +399,7 @@
         <button data-d="-1">−</button><span class="stepVal" id="stepHeliVal">1</span><button data-d="1">+</button></div><span class="lab" style="font-size:11px;opacity:.75">SHIELD · 0–3, each on its own loop</span></div>
     </div>
     <div class="btnRow"><button class="bigBtn" id="startBtn">Take Off 🛫</button><button class="ghostBtn hidden" id="menuResumeBtn">Resume</button><button class="ghostBtn" id="helpBtn" title="Help — controls" aria-label="Help — controls">?</button></div>
-    <div class="ver">v4.11 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
+    <div class="ver">v4.12 · Vite + TypeScript + Rapier3D · real F-22 / F-15E / F-35A meshes · bombs · floating origin · tilt + gamepad · carrier wires &amp; VTOL pads · all v2.0 systems carried forward</div>
   </div>
 </div>
 
@@ -389,7 +411,7 @@
       <b>Throttle</b> (left slider) — W / S, or Shift / Ctrl.<br>
       <b>Flaps / Airbrake / Vector</b> — right panel sliders. Vector only on the F-35A: at 90° the throttle becomes lift — hover, then descend under 4 m/s onto a VTOL pad.<br>
       <b>Keyboard —</b> <b>Stick</b> arrow keys (pitch / roll) · <b>Rudder</b> Q / E · <b>Throttle</b> W / S (or Shift / Ctrl) · <b>Flaps</b> [ / ] (±10°) · <b>Airbrake</b> X (toggle) · <b>Gear</b> G · <b>Hook</b> H · <b>Brake</b> hold B · <b>Flare</b> F · <b>Fire gun</b> hold Space · <b>Missile</b> M (needs lock — hold the target in the 15° cone, listen for the tone) · <b>Bomb</b> N (F-18 / F-15E only) · <b>Camera</b> C · <b>Camera reset</b> R · <b>Pause</b> P. Mouse: drag on the canvas steers (mouse yoke) in Chase cam. Tilt your phone (📱 Tilt button — iOS asks permission first, tap again to re-centre). Gamepad: left stick, triggers throttle, A fire, B missile, X flare, Y gear, Start pause.<br>
-      <b>Stick feel:</b> the keyboard stick ramps like a real stick, not a switch — pitch slews at 3/s, roll snaps over at 12/s and returns at 2.5/s, so a tap banks the jet. The touch stick's authority falls with speed, so a full drag stays gentle at high speed. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
+      <b>Stick feel:</b> the keyboard stick ramps like a real stick, not a switch — pitch slews at 5/s, roll snaps over at 10/s and returns at 3/s, so a tap banks the jet. The touch stick's authority falls with speed, so a full drag stays gentle at high speed. Pitch / roll inversion and the 0.5×–2.0× sensitivity exponents are set in the setup menu (🎮 Controls) and apply to the keyboard arrows.<br>
       <b>Camera</b> C — Chase / Free orbit (drag to orbit, pinch to zoom in Free). R resets the camera.<br>
       <b>Pause</b> P · <b>Restart</b> ↻ button · <b>Setup</b> (pause menu) — change the sandbox settings mid-flight and Apply &amp; Restart, or Resume with the old settings.<br>
       <b>Spawn:</b> Alpha, Bravo or Charlie runway, or the Helicarrier deck (setup menu) — the jet starts on the deck at the carrier's heading and speed, ready to roll off the bow.<br>

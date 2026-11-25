@@ -147,6 +147,7 @@ interface Flare {
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
+const R2D = 180 / Math.PI;
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
@@ -575,6 +576,62 @@ export class WeaponSystem {
   /** Lock-tone hook passthrough (main.ts calls this from its lock scan). */
   setLockTone(on: boolean, rate: number): void {
     this.hooks.lockTone?.(on, clamp(rate, 0, 1));
+  }
+
+  /** Missile lock scan (G6), moved here from main.ts playerInput()
+   *  (pass 17, Worker B) so the production scan is a real method a
+   *  probe can call instead of a copy — the lock previously existed
+   *  only as an inline block in main.ts, and every probe replicated
+   *  it, so a drift between the copy and the game was invisible.
+   *
+   *  Semantics are EXACTLY the main.ts scan this replaces (nothing
+   *  about the lock itself changes): the nearest live, non-dying
+   *  target inside the 15 deg cone and < 2500 m is the lock target;
+   *  lockT += dt while held, decays at 2x out of cone; full lock at
+   *  lockT > LOCK_TIME (1.2 s). A dying (falling) jet is untargetable
+   *  — the lock breaks. Returns the lock target (null when no target
+   *  is in the cone); main.ts uses the return for the lock beep.
+   *
+   *  Why the scan itself is NOT the 1-enemy bug (probe-pass17-lock):
+   *  in a 240 s 1-enemy pursuit the nose was NEVER inside the cone
+   *  (0 in-cone substeps, min nose angle 20.7 deg — the spawn angle),
+   *  so no decay or threshold tweak can create a lock; the fix was
+   *  the spawn geometry in main.ts startRound (the lead enemies
+   *  spawned ~21 deg off the nose, outside the cone from frame one).
+   *  With them dead-ahead the same scan locks in 1.70 s continuous
+   *  and the missile fires and kills. */
+  updateLock(
+    shooter: Aircraft,
+    targets: Aircraft[],
+    dt: number,
+  ): Aircraft | null {
+    if (!shooter.alive || shooter.dying) {
+      shooter.lockTarget = null;
+      shooter.lockT = 0;
+      this.setLockTone(false, 0);
+      return null;
+    }
+    let best: Aircraft | null = null;
+    let bd = LOCK_RANGE;
+    for (const e of targets) {
+      if (!e.alive || e.dying) continue;
+      const to = e.pos.clone().sub(shooter.pos);
+      const d = to.length();
+      if (d < bd && shooter.fwd().angleTo(to.normalize()) * R2D < LOCK_CONE_DEG) {
+        bd = d;
+        best = e;
+      }
+    }
+    if (best) {
+      shooter.lockTarget = best;
+      shooter.lockT += dt;
+      this.setLockTone(true, clamp(shooter.lockT / LOCK_TIME, 0, 1));
+    } else {
+      shooter.lockTarget = null;
+      shooter.lockT = Math.max(0, shooter.lockT - dt * 2);
+      this.setLockTone(false, 0);
+    }
+    return best;
   }
 
   // ---- flares --------------------------------------------------------

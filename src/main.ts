@@ -75,7 +75,7 @@ import { clFromCurve } from './physics/IAerodynamicsSolver';
 
 await RAPIER.init();
 
-const VERSION_FOOTER = 'v4.11 · Vite + Rapier';
+const VERSION_FOOTER = 'v4.12 · Vite + Rapier';
 const D2R = Math.PI / 180;
 const R2D = 180 / Math.PI;
 const VTOL_PADS: [number, number][] = [
@@ -1074,6 +1074,18 @@ let stuckToastShown = false;
  *  instead — a jet that does not move is unresponsive whatever its
  *  stale velocity says. */
 let prevWatchPos: THREE.Vector3 | null = null;
+/** Pass 17 (worker E, item 1): a fresh life starts with a fresh stuck
+ *  detector — a stuckTime carried over from the previous life would
+ *  let R open the picker on a healthy jet in its first seconds, and
+ *  a stale prevWatchPos would read the respawn teleport as movement
+ *  (or mask the first frames of a real freeze). Called from
+ *  respawnPlayer and startRound. */
+function resetStuckDetector(): void {
+  stuckTime = 0;
+  stuckHintActive = false;
+  stuckToastShown = false;
+  prevWatchPos = null;
+}
 
 /** Show the respawn picker: Alpha / Bravo / Charlie / Helicarrier
  *  deck, with the last choice highlighted. The carrier deck is hidden
@@ -1189,7 +1201,13 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   // wreck's deck position, on the ground with no deck under it, and
   // arrived dead/frozen with the HUD stuck on stale values. Fall
   // back to Alpha when no active carrier is alive.
-  const liveCarrier = carriers.find((c) => c.active && c.alive) ?? null;
+  // Pass 17 (worker E, item 1): a DYING carrier is still alive, so
+  // it also passes the test above — but its deck is already going
+  // (deckHeightAt reads -Infinity once the wreck is written off,
+  // and the deck is sinking under the jet until then), so a deck
+  // respawn onto it strands the jet over a vanishing deck.
+  // A dying carrier is not a live carrier: fall back to Alpha.
+  const liveCarrier = carriers.find((c) => c.active && c.alive && !c.dying) ?? null;
   if (choice === 'carrier' && liveCarrier) {
     // Deck respawn (issue 4): the carrier's CURRENT position
     // and yaw, DECK_SPAWN_AFT_M aft of the deck centre, with the deck
@@ -1265,6 +1283,7 @@ function respawnPlayer(target?: RespawnTargetId, force = false): void {
   // with no deck ceiling.
   snapCameraToChase(spawnedOnDeck && liveCarrier ? liveCarrier.deckTopY : null);
   clearTransientUI();
+  resetStuckDetector();
 }
 
 function clearAircraftList(list: Aircraft[]): void {
@@ -1339,6 +1358,7 @@ async function startRound(next: SandboxConfig): Promise<void> {
   // STALL survive three restarts — the solver reset on respawn clears
   // the state, this clears the banners).
   clearTransientUI();
+  resetStuckDetector();
   // Pass 5 (item 6): the spectate banner ("WENT DOWN / SHOT DOWN —
   // watching the wreck") was NOT cleared by clearTransientUI, so it
   // survived a full round restart (Apply & Restart) and showed at
@@ -1540,13 +1560,19 @@ async function startRound(next: SandboxConfig): Promise<void> {
     let ez: number;
     if (i < 2) {
       // v1.1: first two enemies start in the player's forward view,
-      // 450–600 m out and 120–180 m up. Forward is the player's own
-      // heading, so this holds for a deck spawn too.
+      // 450-600 m out and 30-60 m up, dead-ahead. Forward is the
+      // player's own heading, so this holds for a deck spawn too.
+      // Pass 17 (Worker B): dead-ahead, not offset - the old offsets
+      // (side 120/-150, up 120/180) put both enemies ~21 deg off the
+      // nose, OUTSIDE the 15 deg lock cone from frame one, so the
+      // designed head-on intercept could never lock (probe-pass17-lock
+      // 1-enemy: maxLockT 0.00 s, 0 in-cone substeps in 240 s;
+      // dead-ahead: lock 1.70 s, missile fired, enemy shot down).
       const fwd = player.fwd();
       const rgt = new THREE.Vector3(fwd.z, 0, -fwd.x);
       const along = 450 + i * 150;
-      const side = i === 0 ? 120 : -150;
-      const up = 120 + i * 60;
+      const side = 0;
+      const up = 30 + i * 30;
       ex = player.pos.x + fwd.x * along + rgt.x * side;
       ey = player.pos.y + up;
       ez = player.pos.z + fwd.z * along + rgt.z * side;
@@ -1773,7 +1799,7 @@ $('helpScreen')?.addEventListener('click', (e) => {
   if (e.target === $('helpScreen')) $('helpScreen')?.classList.add('hidden');
 });
 
-// Footer version string (v4.11 · Vite + Rapier).
+// Footer version string (v4.12 · Vite + Rapier).
 {
   const ver = document.querySelector('#startScreen .ver');
   if (ver) ver.textContent = VERSION_FOOTER;
@@ -2071,6 +2097,18 @@ function playerInput(dt: number): void {
       // beached for > 2 s (stuckTime accumulates only while beached
       // and resets the moment the jet moves / takes off).
       showRespawnPicker(true);
+    } else if (p.dying) {
+      // Pass 17 (worker E, item 1 — the v4.10 frozen state): a DYING
+      // jet whose spectate was already dismissed (R / Respawn once,
+      // then Cancel / Watch-the-wreck dismissed the picker) has no
+      // R path at all — spectating is false, no respawn timer is
+      // running, and the stuck detector below excludes dying jets,
+      // so R fell through to the camera reset forever while W stayed
+      // dead (playerInput returns early for a dying jet, so the
+      // throttle never rises). R opens the picker for a dying jet
+      // outright: picking a target respawns at once (respawnPlayer
+      // allows a dying jet), exactly as the spectate-skip path does.
+      showRespawnPicker(false);
     } else {
       camOrbit = { yaw: 0, pitch: 0.32 };
       camDist = 30;
@@ -2203,29 +2241,13 @@ function playerInput(dt: number): void {
   }
   prevTrapped = p.trapped;
 
-  // Missile lock (G6): hold the target inside the 15 deg cone, < 2500 m.
-  // A dying (falling) jet is untargetable — the lock breaks.
-  let best: Aircraft | null = null;
-  let bd = 2500;
-  for (const e of enemies) {
-    if (!e.alive || e.dying) continue;
-    const to = e.pos.clone().sub(p.pos);
-    const d = to.length();
-    if (d < bd && p.fwd().angleTo(to.normalize()) * R2D < 15) {
-      bd = d;
-      best = e;
-    }
-  }
-  if (best) {
-    p.lockTarget = best;
-    p.lockT += dt;
-    weapons.setLockTone(true, clamp(p.lockT / 1.2, 0, 1));
-    if (p.lockT > 1.2) beep(1320, 0.05, 'sine', 0.03);
-  } else {
-    p.lockTarget = null;
-    p.lockT = Math.max(0, p.lockT - dt * 2);
-    weapons.setLockTone(false, 0);
-  }
+  // Missile lock (G6) - WeaponSystem.updateLock (pass 17, Worker B):
+  // hold the target inside the 15 deg cone, < 2500 m; a dying
+  // (falling) jet is untargetable. Same 1.2 s threshold, same 2x
+  // decay; the scan lives in the combat system so probes can call
+  // the production code instead of a copy.
+  const locked = weapons.updateLock(p, enemies, dt);
+  if (locked && p.lockT > 1.2) beep(1320, 0.05, 'sine', 0.03);
 }
 
 // ---- crash consequences (main owns these; Aircraft only flips alive) ----
@@ -2540,7 +2562,7 @@ function animate(): void {
   // exactly the beached signature. Gate it on being NEAR THE GROUND
   // (AGL < 10 m): a beached jet is on a slope at ground level, a
   // hovering jet is hundreds of metres up.
-  // Pass 15 (worker E, item 6): the FROZEN state — a live jet that
+  // Pass 17 (worker E, item 1): the FROZEN state — a live jet that
   // does not move at 100% throttle (v4.10 live: F-35A hanging mid-air
   // at 78 kt, 1,138 ft, surf=0, G 0.0, carrier receding; and once on
   // an Alpha spawn at 0 kt). The beached gate cannot catch it: its
@@ -2548,12 +2570,17 @@ function animate(): void {
   // `grounded` still true from respawn, so `vel < 1` never fires and
   // R does nothing — the only in-game recovery is dead. The second
   // gate below measures MOVEMENT, not velocity: alive, not dying,
-  // not on a surface, throttle commanded past half, and the position
-  // moved < 0.1 m in the frame. It deliberately does NOT read vel or
-  // grounded (both are stale in exactly this state), and it does NOT
-  // use the AGL gate (a frozen jet hangs hundreds of metres up).
-  // False positives are narrow: a healthy jet at > 50% throttle
-  // moves > 0.1 m/frame from the second frame on, a VTOL hover is
+  // not on a surface, and the position moved < 0.1 m in the frame.
+  // It deliberately does NOT read vel or grounded (both are stale in
+  // exactly this state), and it does NOT use the AGL gate (a frozen
+  // jet hangs hundreds of metres up). It also does NOT require the
+  // throttle to be up: in the frozen state W never reaches thrTarget
+  // — playerInput returns early while the jet is dying, and a
+  // throttle that never rose reads 0 — so a throttle term made the
+  // gate unreachable in exactly the state it guards (probe-pass17
+  // S4b: with thrTarget 0 the gate never fired in 60 s). Movement
+  // alone is the signal: a healthy jet at any throttle moves
+  // > 0.1 m/frame from the second frame on, a VTOL hover is
   // excluded by vector >= 70, and a parked/braked jet is on a
   // surface. Any movement resets the timer, so the 2 s R gate needs
   // 2 continuous sim-seconds of not moving.
@@ -2566,7 +2593,6 @@ function animate(): void {
       player.alive &&
       !player.dying &&
       !player.onSurface &&
-      player.thrTarget > 0.5 &&
       player.vector < 70 &&
       moved < 0.1;
     const beached =
@@ -2578,7 +2604,14 @@ function animate(): void {
         agl < 10) ||
       unresponsive;
     if (beached) {
-      stuckTime += dt;
+      // Pass 17 (worker E, item 1): accumulate the frame's TOTAL sim
+      // time, not one substep dt. The detector runs once per frame
+      // but the old code added `dt` (the substep dt, <= 0.05 s), so
+      // at 4 fps stuckTime advanced at 0.2x real time and R needed
+      // 40 frames / 10 real s (probe-pass17 S4c); simDt is the
+      // frame's sim advance (<= 0.10 s), so R is available after
+      // 20 frames / 5 real s at 4 fps.
+      stuckTime += simDt;
       if (stuckTime > 10 && !stuckToastShown) {
         stuckToastShown = true;
         stuckHintActive = true;

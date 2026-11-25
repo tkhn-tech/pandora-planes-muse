@@ -122,6 +122,16 @@ const ROTATION_RATE_MAX = 55 * D2R; // rad/s nose-up while the gear is on
  *  requires Vr, so a gentle pull below Vr still does nothing and
  *  a hands-off jet (pitchIn exactly 0) still cannot auto-lift. */
 const ROTATION_INTENT = 0.1;
+/** Short bank hold after a roll release (pass 17, coordinator —
+ *  item 1 rework of Worker A's deadband): the spring holds the
+ *  release bank, clamped to +/-BANK_HOLD_MAX_RAD, for
+ *  BANK_HOLD_SECONDS of sim time, so a tap's bank stays visible
+ *  to a live HUD read instead of being erased within 1-2 s.
+ *  Arms only on a release (active roll input -> centred) with
+ *  |bank| <= BANK_HOLD_ARM_RAD, player only. */
+const BANK_HOLD_MAX_RAD = (3 * Math.PI) / 180;
+const BANK_HOLD_ARM_RAD = (10 * Math.PI) / 180;
+const BANK_HOLD_SECONDS = 4;
 /** BET stall nose-drop rate, rad/s nose-down (probe-stall-respawn
  *  2a). The BET solver has no emergent nose-down departure past
  *  the peak-CL AoA (the wing AC sits near the CG), so a stalled
@@ -614,6 +624,27 @@ export class Aircraft {
   pitchIn = 0;
   rollIn = 0;
   yawIn = 0;
+  /** Short bank hold after a roll release (pass 17, coordinator,
+   *  item 1): the release bank clamped to +/-BANK_HOLD_MAX_RAD,
+   *  the sim seconds of hold left, and whether the last substep
+   *  saw active roll input (for release detection). Player only
+   *  (armed under isPlayer); AI jets never hold. Self-healing on
+   *  respawn: a stale prevRollActive arms a hold at the spawn
+   *  bank (~0 deg), which is the same as no hold. */
+  private bankHoldTargetRad = 0;
+  private bankHoldTimeLeft = 0;
+  private prevRollActive = false;
+  private peakRollActive = 0;
+  /** Peak |rollIn| during the current active roll bout (pass 17,
+   *  coordinator, item 1): the hold arms only for tap-like inputs
+   *  (peak < 0.85). A sustained full-deflection input (peak 1.0)
+   *  is a deliberate manoeuvre, not a tap — on release the jet
+   *  must level to 0, which probe-vtol's forward-flight check
+   *  (pass 7, item 2) requires: it banks with rollIn = -1 for 12
+   *  substeps and asserts |bank| drops by > 5 deg in 2 s hands-off.
+   *  A tap never reaches full deflection (slew 10/s x 0.12 s
+   *  tap-hold, speed-scaled: measured peak 0.68 max), so the gate
+   *  separates taps from holds with margin on both sides. */
   /** Throttle TARGET 0..1 (spooled into `throttle` at 0.55/s).
    *  A getter/setter (pass 6, item 8): the setter records the value
    *  as the PILOT's command (`pilotThr`), so the hover altitude-hold
@@ -2443,10 +2474,102 @@ export class Aircraft {
     // horizon-referenced measure — while a 111 deg bank still
     // commands the full 0.4 rad/s, as before. The exact-0 rollIn
     // gate and the other gates are unchanged.
+    // Pass 17 (worker E, item 2 — ground-roll veer): the exact-0
+    // gate does NOT cover the ground roll. A takeoff roll at
+    // 200+ kt is a BOUNCE, not a contact: onSurface holds only
+    // 42-64% of the roll (probe-auto-liftoff §D), and in the
+    // airborne half of each bounce the spring is the only thing
+    // holding the wings level — but a residual roll input below
+    // the 0.1 steering deadzone (a stick/yoke/tilt not quite
+    // centred, a keyboard return tail) reads rollIn = 0.08, not
+    // exactly 0, so the spring switches off and the bank builds
+    // unchecked: measured 7.4 deg on the ground (the v4.10 live
+    // veer: 090 -> 077 deg with Bank 7 deg), then 30 deg airborne
+    // and a crash at bank 40 deg. The ground roll spring cannot
+    // keep up (0.15 rad/s cap, contact only half the time).
+    // So the gate admits sub-threshold inputs (|rollIn| < 0.1,
+    // the same deadzone the ground steering uses) while LOW over
+    // the ground BELOW the jet right now (pos.y - floorY < 10 m):
+    // a jet that low with a sub-threshold input is rolling,
+    // bouncing or landing, and levelling is right. The band is
+    // measured against floorY — the terrain/deck directly below —
+    // NOT lastSurfaceY: the first version used lastSurfaceY and
+    // the A/B caught it reaching the AI return-leg hold, which
+    // circles at deck height (within 10 m of the deck it took off
+    // from) with tiny rollIn values, so the spring eroded the
+    // bank the hold turn needs and the jet never reached final
+    // (probe-deck-roll: 3 checks failed with lastSurfaceY, 2 with
+    // the gate reverted). Over the sea floorY is ~0, so the hold
+    // at 340 m is far above the band and untouched; the Alpha
+    // overrun still opens it (AGL 2-4 m over the falling terrain
+    // right below). The 200 m bank-hold / max-turn checks are
+    // untouched — up there the band is closed and only an
+    // exactly-0 rollIn gets the spring, exactly as before.
+    // Pass 17 (coordinator, item 1 rework): short bank hold after
+    // a roll release. Worker A's 3 deg deadband (spring to 0 with
+    // a dead zone) did NOT hold the tap bank live: below the edge
+    // the spring is silent and the airframe's own spiral stability
+    // levels the wings anyway (measured: S7 tap @295kt 28fps,
+    // bank@+2s 1.1 deg, not the predicted ~3 deg), and it broke
+    // two probe-roll return bars (5.3 / -6.4 deg at +0.5 s vs the
+    // 5 deg bar — the spring approaches the edge too slowly).
+    // So the spring now ACTIVELY holds a target for a few seconds
+    // after the pilot releases the stick: on the transition from
+    // active roll input (|rollIn| > 0.1) to centred, the target is
+    // the release bank clamped to +/-3 deg, held for 4 s of sim
+    // time, then the spring goes back to levelling to 0. A tap
+    // therefore settles at ~3 deg and stays visible (S7: >= 2.5
+    // deg at +2 s, >= 2 deg at +3 s), while the faster spring
+    // (gain 2 -> 3) still returns the bank inside 5 deg within
+    // 0.5 s of release (probe-roll D1/D3). The hold arms only on
+    // a release with |bank| <= 10 deg and a tap-like peak |rollIn|
+    // < 0.85 (see the field comment) — a hold-release from a
+    // steep bank, the 80 deg bank-hold's transient zero-PD frames,
+    // and the deck-roll autopilot's turns never arm it — and only
+    // for the player (isPlayer), so AI jets are untouched. A
+    // constant sub-threshold residual (0.08, the ground-veer case)
+    // never crosses 0.1, so it never arms either and Worker E's
+    // D2 fix is untouched. Hands-off from level never arms (no
+    // release ever happens), so the drift checks still read 0.
+    // NOTE: a worker's backup-restore wiped this block once
+    // (found by the coordinator when S7 re-failed pre-fix values);
+    // it was re-applied verbatim and re-verified below.
+    const rollActiveNow = Math.abs(rollIn) > 0.1;
+    if (rollActiveNow) {
+      this.prevRollActive = true;
+      this.peakRollActive = Math.max(this.peakRollActive, Math.abs(rollIn));
+      this.bankHoldTimeLeft = 0;
+    } else {
+      if (this.prevRollActive) {
+        this.prevRollActive = false;
+        const tapLike = this.peakRollActive < 0.85;
+        this.peakRollActive = 0;
+        // Tap-like release only (see the field comment): a
+        // sustained full-deflection hold (peak 1.0) must level to
+        // 0 on release, per probe-vtol pass 7 item 2.
+        if (this.isPlayer && tapLike) {
+          const wingY0 = new THREE.Vector3(1, 0, 0).applyQuaternion(
+            this.quat,
+          ).y;
+          const bankRel = Math.asin(clamp(wingY0, -1, 1));
+          if (Math.abs(bankRel) <= BANK_HOLD_ARM_RAD) {
+            this.bankHoldTargetRad = clamp(
+              bankRel,
+              -BANK_HOLD_MAX_RAD,
+              BANK_HOLD_MAX_RAD,
+            );
+            this.bankHoldTimeLeft = BANK_HOLD_SECONDS;
+          }
+        }
+      }
+      if (this.bankHoldTimeLeft > 0) this.bankHoldTimeLeft -= dt;
+    }
     if (
       !onSurface &&
       typeof this.solver.syncRates === 'function' &&
-      rollIn === 0 &&
+      (rollIn === 0 ||
+        (Math.abs(rollIn) < 0.1 &&
+          this.pos.y - this.floorY < 10)) &&
       !this.dying &&
       !this.stalled &&
       this.vectorDeg < 70
@@ -2455,7 +2578,15 @@ export class Aircraft {
         this.quat,
       ).y;
       const bankNow = Math.asin(clamp(wingY, -1, 1));
-      rates.rollRate += clamp(-bankNow * 2, -0.4, 0.4);
+      // Bank-hold target (see the arming block above): while the
+      // hold is armed the spring drives the bank to the release
+      // bank clamped to +/-3 deg instead of to 0, so a tap stays
+      // visible; otherwise it levels to 0 as before. Gain 2 -> 3
+      // so the bank is back inside 5 deg within 0.5 s of release
+      // (probe-roll D1/D3) despite the 3 deg hold floor.
+      const levelTarget =
+        this.bankHoldTimeLeft > 0 ? this.bankHoldTargetRad : 0;
+      rates.rollRate += clamp(-(bankNow - levelTarget) * 3, -0.4, 0.4);
     }
     this.solver.syncRates?.(rates);
     // BET stall / dying nose-drop (rate biases, AFTER the sync).
@@ -2981,7 +3112,7 @@ export class Aircraft {
             sm.userData.__origRoughness = sm.roughness;
           }
         }
-        sm.color.multiplyScalar(0.22);
+        sm.color.multiplyScalar(0.025); // Pass 17 (Worker D): 0.22 linear -> #818181 sRGB, read as an intact mid-grey jet; 0.025 linear -> sRGB ~0.17 -> #2b2b2b, near-black char (rendered-frame verified: spectate p90 8-11 vs 30-42 unpatched).
         if (typeof sm.roughness === 'number') sm.roughness = 1;
       }
     });
@@ -2997,6 +3128,16 @@ export class Aircraft {
       tilt,
     );
     this.group.quaternion.multiply(qTilt);
+    // Pass 17 (Worker D): nose-down pitch tilt, so the wreck reads
+    // as plowed-in from the side view too, where the roll tilt is
+    // invisible. Sign verified by rendered frame: -8 deg pitched
+    // the nose UP (the model's forward is -Z locally), so
+    // nose-down is +8.
+    const qPitch = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(1, 0, 0),
+      8 * D2R,
+    );
+    this.group.quaternion.multiply(qPitch);
   }
 
   /** Restore the model for a fresh life (pass 13): original colours

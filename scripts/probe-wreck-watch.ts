@@ -156,7 +156,7 @@ async function main(): Promise<void> {
   const animateBody = mainSrc.slice(mainSrc.indexOf('function animate()'));
   check('animate() never re-opens the picker on its own', !animateBody.includes('showRespawnPicker'), '');
   const showCalls = (mainSrc.match(/showRespawnPicker\(/g) ?? []).length;
-  check('only the expected showRespawnPicker sites exist (definition + timer, skipSpectate, stuck-R)', showCalls === 4, `matches=${showCalls}`);
+  check('only the expected showRespawnPicker sites exist (definition + timer, skipSpectate, stuck-R, dying-R)', showCalls === 5, `matches=${showCalls}`);
 
   // ---------- ITEM 4: debris field + fire glow (live crash path) ----------
   await RAPIER.init();
